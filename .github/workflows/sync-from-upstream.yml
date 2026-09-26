@@ -1,0 +1,56 @@
+name: Sync from upstream
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-from-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge upstream/dev into fork/dev
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          git remote add upstream "https://github.com/pewdiepie-archdaemon/odysseus.git"
+          git fetch upstream dev
+
+          UPSTREAM_SHA="$(git rev-parse --short upstream/dev)"
+
+          if git merge-base --is-ancestor upstream/dev dev; then
+            echo "fork/dev already contains upstream/dev (${UPSTREAM_SHA}); nothing to do."
+            exit 0
+          fi
+
+          echo "Upstream/dev advanced to ${UPSTREAM_SHA}. New commits:"
+          git log --oneline dev..upstream/dev
+          {
+            echo "### Synced upstream → fork"
+            echo
+            echo "upstream/dev: \`${UPSTREAM_SHA}\`"
+            echo
+            echo "\`\`\`"
+            git log --oneline dev..upstream/dev
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if ! git merge --no-edit upstream/dev; then
+            echo "::error::Merge conflicts between fork/dev and upstream/dev — resolve manually."
+            git diff --name-only --diff-filter=U || true
+            exit 1
+          fi
+
+          git push origin dev
