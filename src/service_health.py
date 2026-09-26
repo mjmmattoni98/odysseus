@@ -382,6 +382,146 @@ def providers_health(endpoints: List[Dict[str, Any]],
     return _rollup_items("providers", "endpoint(s)", per_endpoint, key="endpoints")
 
 
+# ── Local Ollama endpoints ──
+
+# Docs recommend >= 64k for agent/search workloads; a loaded model below this
+# while the checkpoint supports much more means OLLAMA_CONTEXT_LENGTH is at
+# Ollama's VRAM-tier default.
+_MIN_AGENT_CONTEXT = 65536
+
+
+def _is_cloud_ollama_root(root: str) -> bool:
+    """True for Ollama Cloud roots — local tuning probes don't apply there.
+
+    ``/api/ps`` on ollama.com requires credentials this probe doesn't carry,
+    so including cloud endpoints would report a working account as down.
+    """
+    try:
+        host = (urlparse(root or "").hostname or "").lower()
+    except Exception:
+        return False
+    return host == "ollama.com" or host.endswith(".ollama.com")
+
+
+def _probe_json_get(url: str) -> Optional[Dict[str, Any]]:
+    import httpx
+    try:
+        r = httpx.get(url, timeout=_PROBE_TIMEOUT)
+        if not r.is_success:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def _probe_json_post(url: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    import httpx
+    try:
+        r = httpx.post(url, json=payload, timeout=_PROBE_TIMEOUT)
+        if not r.is_success:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def local_models_health(endpoints: List[Dict[str, Any]], *,
+                        get_json: Optional[Callable] = None,
+                        post_json: Optional[Callable] = None) -> Dict[str, Any]:
+    """Tuning checks for local Ollama endpoints.
+
+    Reports the local-model failure modes that never show up as an outage:
+    CPU spill on a loaded model, a serving context far below the model's
+    advertised window (Ollama /v1 cannot carry ``num_ctx``), and native tool
+    calling explicitly disabled for a tools-capable model. Read-only probes;
+    ``meta`` carries no secrets.
+    """
+    if get_json is None:
+        get_json = _probe_json_get
+    if post_json is None:
+        post_json = _probe_json_post
+
+    # Shared with the capability oracle so URL classification can't drift.
+    from src.ollama_capabilities import ollama_api_root
+
+    local = []
+    for ep in (endpoints or []):
+        root = ollama_api_root(ep.get("base_url"))
+        if root and not _is_cloud_ollama_root(root):
+            local.append((ep, root))
+    if not local:
+        return _svc("local models", DISABLED, "No local Ollama endpoints configured.")
+
+    def _check(_i: int, item: tuple) -> Dict[str, Any]:
+        ep, root = item
+        label = ep.get("name") or _safe_url(ep.get("base_url")) or "endpoint"
+        ps = get_json(f"{root}/api/ps")
+        if ps is None:
+            return {"name": label, "ok": False, "error": "unreachable",
+                    "loaded_models": [], "issues": ["endpoint unreachable"]}
+        loaded = [m for m in ((ps or {}).get("models") or []) if isinstance(m, dict)]
+        issues: List[str] = []
+        for m in loaded:
+            size, vram = m.get("size"), m.get("size_vram")
+            if (isinstance(size, (int, float)) and isinstance(vram, (int, float))
+                    and size > 0 and vram < size * 0.9):
+                issues.append(
+                    f"{m.get('name') or 'model'} is spilling to CPU "
+                    f"({int(vram / size * 100)}% on GPU)"
+                )
+        for m in loaded:
+            model_id = str(m.get("name") or m.get("model") or "")
+            if not model_id:
+                continue
+            show = post_json(f"{root}/api/show", {"model": model_id})
+            if not isinstance(show, dict):
+                continue
+            caps = {str(c).strip().lower() for c in (show.get("capabilities") or [])}
+            if "tools" in caps and ep.get("supports_tools") is False:
+                issues.append(
+                    f"{model_id}: native tool calling is disabled on this endpoint "
+                    "(Tools: Off) but the model advertises it"
+                )
+            max_ctx = None
+            for key, val in (show.get("model_info") or {}).items():
+                if str(key).endswith(".context_length") and isinstance(val, int) and val > 0:
+                    max_ctx = max(max_ctx or 0, val)
+            serving = m.get("context_length")
+            if (isinstance(serving, int) and max_ctx
+                    and serving < _MIN_AGENT_CONTEXT and max_ctx >= serving * 2):
+                issues.append(
+                    f"{model_id}: serving {serving} tokens but supports {max_ctx} — "
+                    "raise OLLAMA_CONTEXT_LENGTH or set num_ctx"
+                )
+        return {
+            "name": label,
+            "ok": not issues,
+            "error": None,
+            "loaded_models": [str(m.get("name") or "") for m in loaded],
+            "issues": issues,
+        }
+
+    raw = _bounded_map([item for item in local], _check, budget=_FANOUT_BUDGET,
+                       concurrency=_PROBE_CONCURRENCY)
+    per_endpoint = [r if r is not None
+                    else {"name": _safe_url(local[i][0].get("base_url")),
+                          "ok": False, "error": "timeout",
+                          "loaded_models": [], "issues": ["probe timed out"]}
+                    for i, r in enumerate(raw)]
+    reachable = sum(1 for it in per_endpoint if it.get("error") != "unreachable")
+    issue_count = sum(1 for it in per_endpoint if it.get("issues"))
+    if reachable == 0:
+        status = DOWN
+    elif issue_count:
+        status = DEGRADED
+    else:
+        status = OK
+    noun = "local endpoint(s)"
+    detail = f"{reachable}/{len(per_endpoint)} {noun} reachable"
+    detail += f", {issue_count} with tuning issues." if issue_count else "."
+    return _svc("local models", status, detail, endpoints=per_endpoint)
+
+
 def _rollup_items(name: str, noun: str, items: List[Dict[str, Any]],
                   key: str = "accounts") -> Dict[str, Any]:
     """Shared ok/degraded/down rollup for a list of per-item probe results."""
@@ -439,7 +579,9 @@ def _gather_inputs() -> Dict[str, Any]:
             rows = db.query(ModelEndpoint).filter(
                 ModelEndpoint.is_enabled == True).all()  # noqa: E712
             endpoints = [{"name": r.name, "base_url": r.base_url,
-                          "api_key": r.api_key} for r in rows]
+                          "api_key": r.api_key,
+                          "supports_tools": r.supports_tools,
+                          "model_type": r.model_type or "llm"} for r in rows]
         finally:
             db.close()
     except Exception as e:
@@ -481,12 +623,13 @@ async def collect_service_health(rag_manager: Any = None,
     # ChromaDB is in-process and synchronous (just reads flags).
     chroma = chromadb_health(rag_manager, memory_vector)
 
-    names = ["searxng", "ntfy", "email", "providers"]
+    names = ["searxng", "ntfy", "email", "providers", "local models"]
     coros = [
         _run_subsystem("searxng", searxng_health, settings),
         _run_subsystem("ntfy", ntfy_health, inputs["integrations"], settings),
         _run_subsystem("email", email_health, inputs["accounts"]),
         _run_subsystem("providers", providers_health, inputs["endpoints"]),
+        _run_subsystem("local models", local_models_health, inputs["endpoints"]),
     ]
     try:
         results = await asyncio.wait_for(asyncio.gather(*coros),

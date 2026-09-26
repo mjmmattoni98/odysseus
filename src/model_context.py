@@ -7,6 +7,7 @@ Provides token estimation for context usage tracking.
 
 import ipaddress
 import logging
+import re
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -158,6 +159,15 @@ KNOWN_CONTEXT_WINDOWS = {
     'gemma-3': 128000,
     'gemma-2': 8192,
 
+    # --- Local / open-weight families (Ollama & friends). context_length from
+    # the published model cards; the live serving window is discovered from
+    # Ollama /api/ps when the model is loaded (see _ollama_ps_context).
+    'granite-4': 131072,
+    'lfm2.5': 128000,
+    'lfm2': 32768,
+    'ornith-1.5': 262144,
+    'laguna-xs': 262144,
+
     # --- Mistral ---
     'mistral-large': 128000,
     'mistral-medium': 32000,
@@ -297,22 +307,37 @@ def budget_context_for_model(endpoint_url: str, model: str, *, fallback: int = 0
         return fallback
 
 
+def _compact_model_name(value: str) -> str:
+    """Lowercase and drop punctuation so ''gemma4'' matches ''gemma-4''."""
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
 def _lookup_known(model: str) -> Optional[int]:
     """Check known context windows by substring match.
 
     Picks the LONGEST matching key so a short key never shadows a more specific
     one. Without this, 'o1' (200k) precedes 'o1-mini' (128k) in the table and a
     first-match return would report o1-mini's window as 200k.
+
+    Matching first tries the raw key, then a punctuation-insensitive form, so
+    Ollama-style ids ('gemma4:26b') resolve against hyphenated table keys
+    ('gemma-4') instead of falling through to the default window.
     """
-    name = model.lower()
+    name = (model or "").lower()
     basename = name.split("/")[-1] if "/" in name else name
     basename = basename.split(":")[0]  # strip :free, :extended etc.
+    compact_basename = _compact_model_name(basename)
     best_key: Optional[str] = None
     best_ctx: Optional[int] = None
     for key, ctx in KNOWN_CONTEXT_WINDOWS.items():
         if key in basename or key in name:
-            if best_key is None or len(key) > len(best_key):
-                best_key, best_ctx = key, ctx
+            pass
+        elif compact_basename and _compact_model_name(key) in compact_basename:
+            pass
+        else:
+            continue
+        if best_key is None or len(key) > len(best_key):
+            best_key, best_ctx = key, ctx
     return best_ctx
 
 
@@ -393,6 +418,49 @@ def _proxy_catalog_context(endpoint_url: str, model: str) -> Optional[int]:
     return None
 
 
+def _ollama_ps_context(endpoint_url: str, model: str) -> Optional[int]:
+    """Context window Ollama actually allocated for a loaded model.
+
+    Ollama's OpenAI-compatible ``/v1`` surface has no way to pass ``num_ctx``,
+    so the serving window is the server's own choice (VRAM-tier default or
+    ``OLLAMA_CONTEXT_LENGTH``). Reading it back from the native ``/api/ps``
+    query keeps agent budgeting honest instead of assuming the model's
+    advertised maximum. Returns ``None`` when the model isn't loaded or the
+    endpoint isn't a local Ollama.
+    """
+    try:
+        parsed = urlparse(endpoint_url or "")
+    except Exception:
+        return None
+    host = (parsed.hostname or "").lower()
+    if parsed.port != 11434 and host not in _LOCAL_HOSTS:
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    target = (model or "").strip().lower()
+    if not target:
+        return None
+    try:
+        r = httpx.get(f"{root}/api/ps", timeout=REQUEST_TIMEOUT)
+        if not r.is_success:
+            return None
+        for item in (r.json() or {}).get("models") or []:
+            if not isinstance(item, dict):
+                continue
+            names = {
+                str(item.get("name") or "").lower(),
+                str(item.get("model") or "").lower(),
+            }
+            if target in names:
+                ctx = item.get("context_length")
+                if isinstance(ctx, int) and ctx > 0:
+                    return ctx
+    except Exception:
+        return None
+    return None
+
+
 def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
     """Query the model API for context length. Returns (context_length, known) where
     ``known`` is False only for the bare DEFAULT_CONTEXT fallback."""
@@ -431,6 +499,14 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
                         return n_ctx, True
         except Exception:
             pass
+
+        # Ollama reports the window it actually allocated for a loaded model.
+        # Prefer it over the model's advertised maximum so budgeting matches
+        # what /v1 requests will really get (Ollama /v1 cannot carry num_ctx).
+        ollama_ctx = _ollama_ps_context(endpoint_url, model)
+        if ollama_ctx:
+            logger.info(f"Ollama /api/ps reports context_length={ollama_ctx} for {model}")
+            return ollama_ctx, True
 
     # GitHub Copilot's /models requires auth + X-GitHub-Api-Version headers that
     # aren't available here; an unauthenticated probe just 400s. All Copilot

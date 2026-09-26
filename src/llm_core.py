@@ -728,6 +728,91 @@ def _ollama_normalize_messages(messages: List[Dict]) -> List[Dict]:
 _ollama_normalize_tool_messages = _ollama_normalize_messages
 
 
+def _ollama_keep_alive():
+    """Operator-configured Ollama keep_alive (env ``ODYSSEUS_OLLAMA_KEEP_ALIVE``).
+
+    Returns ``None`` when unset (Ollama's own default applies), an ``int`` for
+    numeric values (seconds; ``-1`` means forever), or the duration string
+    (``30m``) otherwise. Numeric values must be sent as JSON numbers — Ollama
+    rejects the string ``"-1"`` with `time: missing unit in duration`.
+    """
+    raw = (os.getenv("ODYSSEUS_OLLAMA_KEEP_ALIVE") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _apply_ollama_keep_alive(payload: Dict, url: str) -> None:
+    """Attach keep_alive to *native* Ollama payloads.
+
+    Ollama's OpenAI-compatible ``/v1`` adapter discards the field during
+    request conversion, so sending it there would be a no-op that looks like a
+    working setting. For ``/v1`` endpoints residency is controlled server-side
+    (``OLLAMA_KEEP_ALIVE``) instead.
+    """
+    value = _ollama_keep_alive()
+    if value is None:
+        return
+    if _is_ollama_native_url(url or "") and not _host_match(url or "", "ollama.com"):
+        payload["keep_alive"] = value
+
+
+_OLLAMA_THINK_EFFORT_CHOICES = ("auto", "off", "low", "medium", "high")
+
+
+def _ollama_thinking_effort() -> str:
+    """Selected thinking effort for local Ollama models (Settings-backed).
+
+    ``auto`` means "leave the payload alone" so the existing per-family
+    suppression keeps working; anything else is an explicit operator choice.
+    """
+    try:
+        from src.settings import load_settings
+
+        raw = str(load_settings().get("local_thinking_effort") or "auto").strip().lower()
+    except Exception:
+        return "auto"
+    return raw if raw in _OLLAMA_THINK_EFFORT_CHOICES else "auto"
+
+
+def _ollama_think_value(url: str, model: str):
+    """Payload value for the selected effort, or ``None`` to send nothing.
+
+    ``None`` covers three cases: the setting is ``auto``, the route is not
+    Ollama, or the model does not advertise thinking support — Ollama rejects
+    thinking controls for unsupported models, so switching to a non-thinking
+    model must never carry the setting over.
+    """
+    effort = _ollama_thinking_effort()
+    if effort == "auto":
+        return None
+    if not (_is_ollama_native_url(url or "") or _is_ollama_openai_compat_url(url or "")):
+        return None
+    if not _route_supports_thinking(url, model):
+        return None
+    return False if effort == "off" else effort
+
+
+def _apply_ollama_thinking_effort(payload: Dict, url: str, model: str, *, compat: bool = False) -> None:
+    """Attach the selected thinking effort to an Ollama payload.
+
+    On the OpenAI-compatible surface the effective off switch is
+    ``reasoning_effort: "none"`` — ``think: false`` is ignored by current
+    Ollama builds there. On the native surface ``think`` carries the value.
+    Non-Ollama endpoints and non-thinking models are never touched.
+    """
+    value = _ollama_think_value(url, model)
+    if value is None:
+        return
+    if compat:
+        payload["reasoning_effort"] = "none" if value is False else value
+    else:
+        payload["think"] = value
+
+
 def _build_ollama_payload(
     model: str,
     messages: List[Dict],
@@ -736,6 +821,7 @@ def _build_ollama_payload(
     stream: bool = False,
     tools: Optional[List[Dict]] = None,
     num_ctx: Optional[int] = None,
+    url: Optional[str] = None,
 ) -> Dict:
     """Build the JSON payload for Ollama's /api/chat endpoint.
 
@@ -764,6 +850,11 @@ def _build_ollama_payload(
         payload["options"] = options
     if tools:
         payload["tools"] = _alias_harmony_tools(tools, model)
+    if url:
+        _apply_ollama_keep_alive(payload, url)
+        think_value = _ollama_think_value(url, model)
+        if think_value is not None:
+            payload["think"] = think_value
     return payload
 
 
@@ -1439,7 +1530,7 @@ _MISTRAL_REASONING_EFFORT = os.getenv("ODYSSEUS_MISTRAL_REASONING_EFFORT", "high
 _THINKING_MODEL_PATTERNS = (
     "qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "deepseek-v4",
     "minimax", "m2-reap", "gemma", "stepfun", "step-3", "step3",
-    "magistral", "mistral-small", "mistral-medium",
+    "magistral", "mistral-small", "mistral-medium", "ornith",
 )
 
 def _supports_thinking(model: str) -> bool:
@@ -1448,6 +1539,26 @@ def _supports_thinking(model: str) -> bool:
         return False
     m = model.lower()
     return any(p in m for p in _THINKING_MODEL_PATTERNS)
+
+
+def _route_supports_thinking(url: str, model: str) -> bool:
+    """Thinking support for a route: Ollama capability report first, names second.
+
+    Ollama's native ``/api/show`` reports a ``thinking`` capability that covers
+    every model family, including the ones the name list has never heard of
+    (lfm, ornith, granite, laguna, ...). When the probe returns a definitive
+    answer we trust it; otherwise we keep the legacy name heuristics.
+    """
+    if _is_ollama_openai_compat_url(url or "") or _is_ollama_native_url(url or ""):
+        try:
+            from src.ollama_capabilities import supports_thinking as _cap_thinking
+
+            capable = _cap_thinking(url, model)
+        except Exception:
+            capable = None
+        if capable is not None:
+            return capable
+    return _supports_thinking(model)
 
 def _normalize_mistral_content(content):
     """Mistral returns content as a structured array when reasoning is on:
@@ -2014,7 +2125,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         target_url = _normalize_ollama_url(url)
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
-            stream=False, num_ctx=get_context_length(url, model),
+            stream=False, num_ctx=get_context_length(url, model), url=url,
         )
     else:
         target_url = _normalize_openai_chat_url(url)
@@ -2031,6 +2142,8 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+        _apply_ollama_thinking_effort(payload, url, model, compat=True)
+        _apply_ollama_keep_alive(payload, url)
         _apply_local_generation_stability(payload, target_url, model)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
@@ -2374,7 +2487,7 @@ async def llm_call_async(
             h.update(headers)
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
-            stream=False, num_ctx=get_context_length(url, model),
+            stream=False, num_ctx=get_context_length(url, model), url=url,
         )
     else:
         target_url = _normalize_openai_chat_url(url)
@@ -2393,8 +2506,13 @@ async def llm_call_async(
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
         # Suppress thinking for qwen3/gemma4 on Ollama /v1 — same as stream_llm.
-        if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
+        # Skipped when the operator selected an explicit thinking effort below.
+        if (_ollama_thinking_effort() == "auto"
+                and _is_ollama_openai_compat_url(url)
+                and _route_supports_thinking(url, model)):
             payload["think"] = False
+        _apply_ollama_thinking_effort(payload, url, model, compat=True)
+        _apply_ollama_keep_alive(payload, url)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         _apply_local_cache_affinity(payload, url, session_id)
@@ -2620,7 +2738,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             h.update(headers)
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
-            stream=True, tools=tools, num_ctx=get_context_length(url, model),
+            stream=True, tools=tools, num_ctx=get_context_length(url, model), url=url,
         )
     elif provider == "chatgpt-subscription":
         target_url = _normalize_chatgpt_subscription_url(url)
@@ -2654,8 +2772,12 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         # For Ollama's OpenAI-compat /v1 endpoint with thinking models (qwen3,
         # gemma4, etc.), suppress thinking so tool calls aren't swallowed inside
         # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
-        if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
+        if (_ollama_thinking_effort() == "auto"
+                and _is_ollama_openai_compat_url(url)
+                and _route_supports_thinking(url, model)):
             payload["think"] = False
+        _apply_ollama_thinking_effort(payload, url, model, compat=True)
+        _apply_ollama_keep_alive(payload, url)
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
         _scrub_openai_chat_tool_reasoning(payload, target_url, model)
@@ -3052,7 +3174,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     _tc_last_idx = [-1]  # most-recently-touched slot, for providers that omit `index`
     # For thinking models: prepend <think> to first content delta so frontend
     # can detect thinking-in-progress (some models output </think> but no <think>)
-    _thinking_model = _supports_thinking(model)
+    _thinking_model = _route_supports_thinking(url, model)
     _first_content_sent = False
     _in_think_tag = False        # True while consuming <think>…</think> content
     _think_open_stripped = False  # opening <think> tag already removed

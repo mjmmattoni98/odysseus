@@ -1367,9 +1367,53 @@ def _repair_document_function_args(tool_type: str, arguments: str) -> Optional[d
     return None
 
 
+_NATIVE_TOOL_NAME_PREFIXES = ("functions.", "function.", "tools.", "tool.")
+
+# Namespaced MCP tools must survive normalization untouched.
+_MCP_TOOL_PREFIXES = ("mcp__", "mcp_")
+
+
+def normalize_native_tool_name(name: str) -> str:
+    """Return the canonical tool name for a model-emitted function name.
+
+    Local models sometimes decorate the tool name — most commonly with a
+    ``:`` suffix (Ollama + gemma4 emits ``web_search:search``), but also with
+    provider-style ``functions.``/``tools.`` prefixes. The lookup below tries
+    the raw name first, then the namespace halves/prefix-stripped forms, so a
+    decorated *known* tool still resolves while MCP names (``mcp__server__tool``)
+    and genuinely unknown names pass through unchanged.
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return raw
+    for prefix in _MCP_TOOL_PREFIXES:
+        if raw.startswith(prefix):
+            return raw
+    # Only the head of a `namespace:name` pair is trusted. The tail is not a
+    # candidate on purpose: generic aliases (run/execute -> bash, search ->
+    # web_search) would turn an unknown decorated name into a *wrong* tool
+    # call, which is worse than letting it fail closed.
+    candidates = [raw]
+    if ":" in raw:
+        head, _, _tail = raw.partition(":")
+        candidates.append(head.strip())
+    for prefix in _NATIVE_TOOL_NAME_PREFIXES:
+        if raw.lower().startswith(prefix):
+            candidates.append(raw[len(prefix):].strip())
+            break
+    for candidate in candidates:
+        if candidate and candidate in _TOOL_NAME_MAP:
+            return _TOOL_NAME_MAP[candidate]
+    for candidate in candidates:
+        if candidate and candidate in TOOL_TAGS:
+            return candidate
+    return raw
+
+
 def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock]:
     """Convert a native function call into a ToolBlock for the existing execution pipeline."""
-    tool_type = _TOOL_NAME_MAP.get(name, name)
+    normalized_name = normalize_native_tool_name(name)
+    tool_type = _TOOL_NAME_MAP.get(normalized_name, normalized_name)
     try:
         if not arguments or (isinstance(arguments, str) and not arguments.strip()):
             args = {}
@@ -1390,7 +1434,11 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
     # Uses the shared BUILTIN_EMAIL_TOOLS (single source of truth) so the
     # fail-closed set can't drift from the dispatch/blocklist sets.
     if not isinstance(args, dict):
-        if tool_type.startswith("mcp__email__") or name in BUILTIN_EMAIL_TOOLS:
+        if (
+            tool_type.startswith("mcp__email__")
+            or name in BUILTIN_EMAIL_TOOLS
+            or normalized_name in BUILTIN_EMAIL_TOOLS
+        ):
             logger.warning(f"Non-object email function call arguments for {name}: {args!r}; rejecting")
             return None
         logger.warning(f"Non-object function call arguments for {name}: {args!r}; treating as empty")
@@ -1406,8 +1454,9 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         content = json.dumps(args) if args else "{}"
         return ToolBlock(tool_type, content)
     # Email tools are implemented as MCP — route them to email
-    if name in BUILTIN_EMAIL_TOOLS:
-        return ToolBlock(f"mcp__email__{name}", json.dumps(args) if args else "{}")
+    if name in BUILTIN_EMAIL_TOOLS or normalized_name in BUILTIN_EMAIL_TOOLS:
+        email_name = normalized_name if normalized_name in BUILTIN_EMAIL_TOOLS else name
+        return ToolBlock(f"mcp__email__{email_name}", json.dumps(args) if args else "{}")
     if tool_type not in TOOL_TAGS:
         logger.warning(f"Unknown function call: {name}")
         return None

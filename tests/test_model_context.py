@@ -190,6 +190,24 @@ class TestLookupKnown:
     def test_gpt4_base(self):
         assert _lookup_known("gpt-4") == 8192
 
+    def test_ollama_style_id_matches_hyphenated_key(self):
+        """gemma4:26b must resolve against the 'gemma-4' table entry."""
+        assert _lookup_known("gemma4:26b") == 262144
+        assert _lookup_known("gemma4:12b") == 262144
+
+    def test_local_family_windows(self):
+        assert _lookup_known("granite4.2:8b") == 131072
+        assert _lookup_known("lfm2.5:8b") == 128000
+        assert _lookup_known("ornith-1.5:9b") == 262144
+        assert _lookup_known("laguna-xs-2.1:q4_K_M") == 262144
+
+    def test_lfm2_tag_does_not_shadow_lfm2_5(self):
+        assert _lookup_known("lfm2.5:8b") == 128000
+        assert _lookup_known("lfm2:8b") == 32768
+
+    def test_hyphenated_model_still_matches_known_key(self):
+        assert _lookup_known("gemma-4-31b") == 262144
+
 
 class _FakeResp:
     def __init__(self, payload, ok=True):
@@ -312,3 +330,70 @@ class TestGetContextLength:
 
         endpoint = "http://100.117.136.97:34521/v1/chat/completions"
         assert model_context.get_context_length(endpoint, "unknown-proxy-model") == model_context.DEFAULT_CONTEXT
+
+
+class TestOllamaServingContext:
+    """Ollama /api/ps reports the window actually allocated for a loaded model."""
+
+    def setup_method(self):
+        model_context._context_cache.clear()
+        model_context._catalog_ctx_cache.clear()
+
+    def test_loaded_model_uses_ollama_serving_window(self, monkeypatch):
+        def fake_get(url, *args, **kwargs):
+            if url.endswith("/api/ps"):
+                return _FakeResp({"models": [
+                    {"name": "qwen3.8:27b", "model": "qwen3.8:27b", "context_length": 32768},
+                ]})
+            return _FakeResp({}, ok=False)
+
+        monkeypatch.setattr(model_context.httpx, "get", fake_get)
+
+        ctx, known = model_context._query_context_length(
+            "http://127.0.0.1:11434/v1/chat/completions", "qwen3.8:27b"
+        )
+        assert (ctx, known) == (32768, True)
+
+    def test_loaded_model_matches_by_model_field(self, monkeypatch):
+        def fake_get(url, *args, **kwargs):
+            if url.endswith("/api/ps"):
+                return _FakeResp({"models": [
+                    {"name": "alias", "model": "gemma4:12b", "context_length": 65536},
+                ]})
+            return _FakeResp({}, ok=False)
+
+        monkeypatch.setattr(model_context.httpx, "get", fake_get)
+
+        ctx, _ = model_context._query_context_length(
+            "http://127.0.0.1:11434/v1", "gemma4:12b"
+        )
+        assert ctx == 65536
+
+    def test_unloaded_model_falls_through_to_known_window(self, monkeypatch):
+        def fake_get(url, *args, **kwargs):
+            return _FakeResp({"models": []})
+
+        monkeypatch.setattr(model_context.httpx, "get", fake_get)
+
+        ctx, known = model_context._query_context_length(
+            "http://127.0.0.1:11434/v1/chat/completions", "qwen3.8:27b"
+        )
+        assert ctx == 131072
+        assert known is True
+
+    def test_ps_probe_is_direct_and_tolerant(self, monkeypatch):
+        calls = []
+
+        def fake_get(url, *args, **kwargs):
+            calls.append(url)
+            if url.endswith("/api/ps"):
+                raise RuntimeError("connection refused")
+            return _FakeResp({}, ok=False)
+
+        monkeypatch.setattr(model_context.httpx, "get", fake_get)
+
+        ctx, known = model_context._query_context_length(
+            "http://127.0.0.1:11434/v1", "gemma4:26b"
+        )
+        assert ctx == 262144
+        assert any(url.endswith("/api/ps") for url in calls)

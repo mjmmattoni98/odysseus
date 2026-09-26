@@ -225,3 +225,90 @@ def test_route_tool_mode_matches_credential_distinct_endpoint(monkeypatch):
         "custom-model",
         headers={"Authorization": "Bearer key-two"},
     )[0] is False
+
+
+class TestOllamaCapabilityAutoDetection:
+    """Production routing: a tools-capable model opts into native schemas.
+
+    These call ``_agent_route_tool_mode`` itself with a controlled endpoint
+    table and capability probe, so the assertions exercise the same code the
+    agent loop runs instead of a copied heuristic.
+    """
+
+    def _route(self, monkeypatch, model, url, *, endpoint_supports=None, capability=None):
+        from core import database
+        from src import endpoint_resolver
+
+        rows = []
+        if endpoint_supports is not None:
+            rows = [SimpleNamespace(
+                id="ep", base_url=url, api_key=None,
+                provider_auth_id=None, supports_tools=endpoint_supports,
+            )]
+
+        class Query:
+            def filter(self, *args, **kwargs):
+                return self
+
+            def all(self):
+                return rows
+
+        class Db:
+            def query(self, *args, **kwargs):
+                return Query()
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(database, "SessionLocal", lambda: Db())
+        monkeypatch.setattr(
+            endpoint_resolver,
+            "resolve_endpoint_runtime",
+            lambda endpoint, owner=None: (endpoint.base_url, endpoint.api_key),
+        )
+        monkeypatch.setattr(
+            "src.ollama_capabilities.supports_tool_calls",
+            lambda u, m: capability,
+        )
+        return _agent_route_tool_mode(url, model)[0]
+
+    def test_capability_tools_enables_native_schemas(self, monkeypatch):
+        assert self._route(
+            monkeypatch, "lfm2.5:8b",
+            "http://localhost:11434/v1/chat/completions", capability=True,
+        ) is True
+
+    def test_capability_without_tools_stays_fenced(self, monkeypatch):
+        assert self._route(
+            monkeypatch, "lfm2.5:8b", "http://localhost:11434/v1", capability=False,
+        ) is False
+
+    def test_unknown_capability_stays_fenced(self, monkeypatch):
+        assert self._route(
+            monkeypatch, "lfm2.5:8b", "http://localhost:11434/v1", capability=None,
+        ) is False
+
+    def test_no_tools_model_ignores_capability(self, monkeypatch):
+        # deepseek-r1 is on the hard no-tools list even when the probe says
+        # otherwise (Ollama returns 400 for this family).
+        assert self._route(
+            monkeypatch, "deepseek-r1:7b", "http://localhost:11434/v1", capability=True,
+        ) is False
+
+    def test_explicit_endpoint_disable_wins(self, monkeypatch):
+        assert self._route(
+            monkeypatch, "qwen3.8:27b", "http://localhost:11434/v1",
+            endpoint_supports=False, capability=True,
+        ) is False
+
+    def test_explicit_endpoint_enable_wins(self, monkeypatch):
+        assert self._route(
+            monkeypatch, "lfm2.5:8b", "http://localhost:11434/v1",
+            endpoint_supports=True, capability=None,
+        ) is True
+
+    def test_native_ollama_uses_capability(self, monkeypatch):
+        assert self._route(
+            monkeypatch, "qwen3.8:27b", "http://localhost:11434/api/chat",
+            capability=True,
+        ) is True

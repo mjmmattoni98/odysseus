@@ -649,6 +649,27 @@ async function initImageSettings() {
   if (enabledToggle) enabledToggle.addEventListener('change', function() { syncImgDisabled(); saveSettings(); });
 }
 
+/* ── Local model thinking effort ── */
+async function initThinkingEffortSettings() {
+  const sel = el('set-thinkingEffort');
+  if (!sel) return;
+  const msg = el('set-thinkingEffortMsg');
+  try {
+    const res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    const settings = await res.json();
+    if (settings.local_thinking_effort) sel.value = settings.local_thinking_effort;
+  } catch (e) { console.warn('Failed to load thinking effort', e); }
+  sel.addEventListener('change', async () => {
+    try {
+      const res = await _postSettings({ local_thinking_effort: sel.value });
+      if (!res.ok) throw new Error(await res.text().catch(() => `HTTP ${res.status}`));
+      if (msg) { msg.textContent = 'Saved'; msg.style.color = 'var(--fg)'; setTimeout(() => { msg.textContent = ''; }, 2000); }
+    } catch (e) {
+      if (msg) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
+    }
+  });
+}
+
 /* ── Vision ── */
 async function initVisionSettings() {
   const vlSel = el('set-vlModelSelect');
@@ -2176,6 +2197,7 @@ function initAll() {
   initOpacityToggle();
   initialized = true;
   initDefaultChat();
+  initThinkingEffortSettings();
   initTeacherModel();
   initUtilityModel();
   initImageSettings();

@@ -644,7 +644,7 @@ async function loadEndpoints() {
         // Don't let interactions inside the expanded panel re-fire the
         // expand/collapse handler — the search box was getting closed
         // because clicking it bubbled up to here.
-        if (e.target.closest('.admin-btn-sm, .admin-btn-delete, .mcp-tools-list, .mcp-tools-header, .mcp-tools-search, input, label')) return;
+        if (e.target.closest('.admin-btn-sm, .admin-btn-delete, .mcp-tools-list, .mcp-tools-header, .mcp-tools-search, select, input, label')) return;
         const epId = header.dataset.admEpHeader;
         const panel = row.querySelector(`[data-adm-ep-models-panel="${epId}"]`);
         if (!panel) return;
@@ -657,6 +657,33 @@ async function loadEndpoints() {
         }
         if (!_modelsLoaded && isOpen) {
           _modelsLoaded = true;
+          // Per-endpoint native tool-calling mode. Auto (default) lets the
+          // Ollama /api/show capability report decide; On/Off override it.
+          const _epMeta = data.find(x => String(x.id) === String(epId)) || {};
+          const _toolsMode = _epMeta.supports_tools === true ? 'on'
+            : _epMeta.supports_tools === false ? 'off' : 'auto';
+          const _toolsSelect = `<select data-ep-tools-mode="${epId}" title="Native tool calling — Auto asks the endpoint's model capabilities" style="font-size:11px;background:transparent;color:inherit;border:1px solid color-mix(in srgb, currentColor 25%, transparent);border-radius:4px;padding:1px 3px;">
+            <option value="auto"${_toolsMode === 'auto' ? ' selected' : ''}>Tools: Auto</option>
+            <option value="on"${_toolsMode === 'on' ? ' selected' : ''}>Tools: On</option>
+            <option value="off"${_toolsMode === 'off' ? ' selected' : ''}>Tools: Off</option>
+          </select>`;
+          const attachToolsMode = () => {
+            panel.querySelector(`[data-ep-tools-mode="${epId}"]`)?.addEventListener('change', async (e) => {
+              const mode = e.target.value;
+              try {
+                const res = await fetch(`/api/model-endpoints/${epId}`, {
+                  method: 'PATCH',
+                  credentials: 'same-origin',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ supports_tools: mode === 'on' ? true : mode === 'off' ? false : null }),
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                uiModule?.showToast?.('Tool calling updated', 2500);
+              } catch (_) {
+                uiModule?.showToast?.('Failed to update tool calling', 3000);
+              }
+            });
+          };
           // Our shared whirlpool spinner (consistent with the rest of the app).
           panel.innerHTML = '';
           let _modelsSpin = null;
@@ -698,9 +725,11 @@ async function loadEndpoints() {
               panel.innerHTML = `<div class="mcp-tools-header">
                 <span>Models</span>
                 <span style="display:flex;gap:8px;align-items:center;">
+                  ${_toolsSelect}
                   <a href="#" data-ep-refresh-models="${epId}">Refresh</a>
                 </span>
               </div>${warningHtml}<span style="opacity:0.5;font-size:11px;">No models</span>`;
+              attachToolsMode();
               attachRefresh();
               return;
             }
@@ -711,6 +740,7 @@ async function loadEndpoints() {
             panel.innerHTML = `<div class="mcp-tools-header">
               <span>Models</span>
               <span style="display:flex;gap:8px;align-items:center;">
+                ${_toolsSelect}
                 <a href="#" data-ep-refresh-models="${epId}">Refresh</a>
                 <a href="#" data-ep-select-all="${epId}">All</a>
                 <a href="#" data-ep-select-none="${epId}">None</a>
@@ -729,6 +759,7 @@ async function loadEndpoints() {
               });
             };
             attachRefresh();
+            attachToolsMode();
             panel.querySelector(`[data-ep-search="${epId}"]`)?.addEventListener('input', (e) => filterRows(e.target.value));
             panel.querySelector(`[data-ep-select-all="${epId}"]`)?.addEventListener('click', (e) => {
               e.preventDefault();

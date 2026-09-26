@@ -450,6 +450,8 @@ export function _detectReasoningParser(modelName) {
   if (n.includes('glm-4') || n.includes('glm-5')) return 'glm45';
   // OpenAI gpt-oss family.
   if (n.includes('gpt-oss')) return 'gpt_oss';
+  // Ornith-1.5 (Qwen3.5/Gemma4-derived) emits Qwen-style <think> blocks.
+  if (n.includes('ornith')) return 'qwen3';
   // Hunyuan A13B reasoning.
   if (n.includes('hunyuan') && n.includes('a13b')) return 'hunyuan_a13b';
   // IBM Granite reasoning.
@@ -487,6 +489,8 @@ export function _detectToolParser(modelName) {
   if (n.includes('glm-4')) return 'glm45';
   if (n.includes('internlm')) return 'internlm';
   if (n.includes('granite')) return 'granite';
+  // Ornith-1.5 serves with the Qwen3 XML tool-call format (vLLM: qwen3_xml).
+  if (n.includes('ornith')) return 'qwen3_xml';
   return 'hermes'; // default fallback
 }
 

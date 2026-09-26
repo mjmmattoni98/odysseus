@@ -1054,15 +1054,28 @@ def _agent_route_tool_mode(
     ))
     is_ollama_native = _is_ollama_native_url(endpoint_url or "")
     ollama_openai_compat = _is_ollama_openai_compat_url(endpoint_url or "")
+    ollama_route = is_ollama_native or ollama_openai_compat
+
+    # Ollama reports per-model capabilities on /api/show. When the endpoint has
+    # no explicit supports_tools choice, let a model that advertises `tools`
+    # opt itself into native schemas instead of requiring a manual endpoint
+    # edit (the old behavior: every Ollama route stayed on the conservative
+    # prompted/text path, which small and thinking models handle poorly).
+    capability_tools: Optional[bool] = None
+    if endpoint_supports is None and ollama_route and not model_no_tools:
+        try:
+            from src.ollama_capabilities import supports_tool_calls
+
+            capability_tools = supports_tool_calls(endpoint_url or "", model)
+        except Exception:
+            capability_tools = None
+
     if endpoint_supports is True:
         is_api_model = True
-    elif (
-        endpoint_supports is False
-        or model_no_tools
-        or is_ollama_native
-        or ollama_openai_compat
-    ):
+    elif endpoint_supports is False or model_no_tools:
         is_api_model = False
+    elif ollama_route:
+        is_api_model = capability_tools is True
     else:
         is_api_model = any(host in endpoint_url for host in _API_HOSTS) or model_supports_tools
     return is_api_model, is_ollama_native, ollama_openai_compat
@@ -3415,6 +3428,27 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
+_OLLAMA_NATIVE_TOOL_SCHEMA_LIMIT = 24
+
+
+def _cap_ollama_tool_schemas(schemas, relevant_tools=None):
+    """Trim the native schema set for Ollama routes.
+
+    Ollama renders every schema into the model context, and small/local models
+    degrade — or stall after a token — when handed the full catalog. Keep the
+    curated head of the list plus anything explicitly relevant; cloud routes
+    are never capped.
+    """
+    if not schemas or len(schemas) <= _OLLAMA_NATIVE_TOOL_SCHEMA_LIMIT:
+        return schemas
+    relevant = {str(name) for name in (relevant_tools or ())}
+    if relevant:
+        keep = [s for s in schemas if s.get("function", {}).get("name") in relevant]
+        rest = [s for s in schemas if s.get("function", {}).get("name") not in relevant]
+        schemas = keep + rest
+    return schemas[:_OLLAMA_NATIVE_TOOL_SCHEMA_LIMIT]
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -4441,6 +4475,11 @@ async def stream_agent_loop(
     # lets a legit batch (e.g. 18 calendar events at once) through.
     _call_freq: collections.Counter = collections.Counter()
     _force_answer = False  # set by loop-breaker → next round runs with NO tools
+    # One-shot recovery for issue #1567: some local models answer with a single
+    # token when tool schemas are present. When a native round produces no tool
+    # calls and no usable text, retry that round with schemas off so the model
+    # falls back to the fenced tool channel instead of ending the turn empty.
+    _native_schema_fallback_used = False
     # Supervisor: how many times we've nudged the model after it announced
     # an action without emitting the tool call. Capped to prevent a model
     # that *can't* call the tool from looping forever.
@@ -4486,6 +4525,11 @@ async def stream_agent_loop(
         route_relevant_tools = route_state["relevant_tools"]
         if _force_answer:
             return []
+        # The native-tool salvage (#1567) retries in fenced mode. That round
+        # must send no schemas at all — built-in or MCP — because the retry
+        # prompt teaches the textual fenced channel instead.
+        if route_state.get("suppress_tool_schemas"):
+            return []
         if route_state["is_api_model"]:
             if route_relevant_tools:
                 schema_names = set(route_relevant_tools)
@@ -4514,7 +4558,10 @@ async def stream_agent_loop(
                     if schema.get("function", {}).get("name") not in disabled_tools
                     and schema.get("name") not in disabled_tools
                 ]
-            return _filter_route_tool_schemas(schemas)
+            schemas = _filter_route_tool_schemas(schemas)
+            if route_state.get("is_ollama_native") or route_state.get("ollama_openai_compat"):
+                schemas = _cap_ollama_tool_schemas(schemas, route_relevant_tools)
+            return schemas
 
         wants_mcp = any(keyword in _last_user.lower() for keyword in _MCP_KEYWORDS)
         schemas = route_mcp_schemas if wants_mcp and route_mcp_schemas else []
@@ -5250,6 +5297,27 @@ async def stream_agent_loop(
             is_api_model=(_is_api_model and not guide_only),
             allow_fenced_for_api=_ody_doc_finetune_mode,
         )
+        # Surface native calls the converter rejected (unknown/decorated name,
+        # empty required args, bad JSON) instead of leaving them in the logs
+        # only — the frontend renders this as an "[Agent guard: ...]" note.
+        if native_tool_calls and not guide_only:
+            _converted_ids = {id(tc) for tc in converted_calls}
+            _rejected_names = sorted({
+                str(tc.get("name") or "").strip()
+                for tc in native_tool_calls
+                if id(tc) not in _converted_ids and str(tc.get("name") or "").strip()
+            })
+            if _rejected_names:
+                _rejected_label = ", ".join(_rejected_names[:3])
+                logger.info("[agent] rejected native tool call(s): %s", _rejected_label)
+                yield (
+                    'data: '
+                    + json.dumps({
+                        "type": "tool_call_rejected",
+                        "message": f"Tool call not recognized: {_rejected_label}",
+                    })
+                    + '\n\n'
+                )
         if _ody_doc_stream_create_mode and tool_blocks:
             create_idx = next(
                 (idx for idx, block in enumerate(tool_blocks) if block.tool_type == "create_document"),
@@ -5429,6 +5497,56 @@ async def stream_agent_loop(
             yield f'data: {json.dumps({"delta": cleaned_round})}\n\n'
 
         if not tool_blocks:
+            # ── Degenerate native-tool round salvage (#1567) ───────────────
+            # Some local models stop after a token when tool schemas are
+            # present. Retry once with schemas off so the model can use the
+            # fenced channel, rather than ending the turn with an empty answer.
+            if (
+                _is_api_model
+                and not _native_schema_fallback_used
+                and bool(all_tool_schemas)
+                and round_num < max_rounds
+                and not _strip_think_blocks(strip_tool_blocks(round_response)).strip()
+            ):
+                _native_schema_fallback_used = True
+                _is_api_model = False
+                _active_route_state["is_api_model"] = False
+                # Suppress every schema (built-in and MCP) for the retry, and
+                # replace the native-call prompt with textual fenced-tool
+                # instructions — the system prompt still in context forbids
+                # fenced syntax and would otherwise leave the model with no
+                # usable tool channel at all.
+                _active_route_state["suppress_tool_schemas"] = True
+                _salvage_tool_names = []
+                for _schema in (all_tool_schemas or []):
+                    _name = (_schema.get("function") or {}).get("name")
+                    if _name and _name not in _salvage_tool_names:
+                        _salvage_tool_names.append(str(_name))
+                _salvage_example = (
+                    "web_search" if "web_search" in _salvage_tool_names
+                    else (_salvage_tool_names[0] if _salvage_tool_names else "web_search")
+                )
+                _salvage_args = '{"query": "your search"}' if _salvage_example == "web_search" else "{}"
+                logger.info(
+                    "[agent] native tool round %s produced no content; retrying without schemas",
+                    round_num,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "TOOL MODE CHANGE — tool schemas are no longer available in this "
+                        "request. Your previous reply was empty. Retry the task now: to use "
+                        "a tool, emit a fenced code block with the tool name as the language "
+                        "tag:\n\n"
+                        f"```{_salvage_example}\n{_salvage_args}\n```\n\n"
+                        "The block executes automatically and you see the output. Do not "
+                        "call tools any other way. Available tools: "
+                        + (", ".join(_salvage_tool_names) if _salvage_tool_names else "(none)")
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+
             # ── Completion verifier (mechanism 3a) ────────────────────
             # The model is finishing. If this was an effectful agentic turn,
             # have a fresh-context verifier independently check the work

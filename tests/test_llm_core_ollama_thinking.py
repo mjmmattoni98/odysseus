@@ -8,7 +8,18 @@ Covers:
 import asyncio
 import json
 
+import pytest
+
 from src import llm_core
+
+
+@pytest.fixture(autouse=True)
+def _no_real_capability_probes(monkeypatch):
+    """Keep payload tests hermetic: the Ollama capability probe falls back to
+    the name heuristics instead of hitting a real server on port 11434, and the
+    thinking effort defaults to "auto" regardless of the local settings file."""
+    monkeypatch.setattr("src.ollama_capabilities.supports_thinking", lambda url, model: None)
+    monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "auto")
 
 
 # ---------------------------------------------------------------------------
@@ -163,3 +174,183 @@ class TestThinkSuppression:
             monkeypatch, "http://127.0.0.1:11435/v1/chat/completions", "qwen3:14b"
         )
         assert payload.get("think") is False
+
+
+class TestOllamaKeepAlive:
+    """ODYSSEUS_OLLAMA_KEEP_ALIVE is a native-Ollama setting only.
+
+    Ollama's /v1 adapter discards the field, so sending it on the compat
+    surface would be a silent no-op; cloud is excluded too (the residency
+    concern is local, and cloud rejects/normalizes request options).
+    """
+
+    def test_compat_surface_does_not_send_keep_alive(self, monkeypatch):
+        monkeypatch.setenv("ODYSSEUS_OLLAMA_KEEP_ALIVE", "30m")
+        payload = _capture_payload(
+            monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "qwen3:14b"
+        )
+        assert "keep_alive" not in payload
+
+    def test_native_absent_by_default(self, monkeypatch):
+        monkeypatch.delenv("ODYSSEUS_OLLAMA_KEEP_ALIVE", raising=False)
+        payload = llm_core._build_ollama_payload(
+            "qwen3:14b", [{"role": "user", "content": "hi"}], 0.7, 100,
+            stream=False, url="http://localhost:11434/api/chat",
+        )
+        assert "keep_alive" not in payload
+
+    def test_native_duration_string(self, monkeypatch):
+        monkeypatch.setenv("ODYSSEUS_OLLAMA_KEEP_ALIVE", "1h")
+        payload = llm_core._build_ollama_payload(
+            "qwen3:14b", [{"role": "user", "content": "hi"}], 0.7, 100,
+            stream=False, url="http://localhost:11434/api/chat",
+        )
+        assert payload.get("keep_alive") == "1h"
+
+    def test_native_numeric_values_are_ints(self, monkeypatch):
+        # "-1" as a string makes Ollama return
+        # `time: missing unit in duration "-1"`; it must be a JSON number.
+        monkeypatch.setenv("ODYSSEUS_OLLAMA_KEEP_ALIVE", "-1")
+        payload = llm_core._build_ollama_payload(
+            "qwen3:14b", [{"role": "user", "content": "hi"}], 0.7, 100,
+            stream=False, url="http://localhost:11434/api/chat",
+        )
+        assert payload.get("keep_alive") == -1
+        assert isinstance(payload.get("keep_alive"), int)
+
+    def test_apply_helper_numeric_is_int(self, monkeypatch):
+        monkeypatch.setenv("ODYSSEUS_OLLAMA_KEEP_ALIVE", "0")
+        payload = {}
+        llm_core._apply_ollama_keep_alive(payload, "http://localhost:11434/api/chat")
+        assert payload.get("keep_alive") == 0
+
+    def test_cloud_native_does_not_send_keep_alive(self, monkeypatch):
+        monkeypatch.setenv("ODYSSEUS_OLLAMA_KEEP_ALIVE", "30m")
+        payload = llm_core._build_ollama_payload(
+            "gpt-oss:120b", [{"role": "user", "content": "hi"}], 0.7, 100,
+            stream=False, url="https://ollama.com/api/chat",
+        )
+        assert "keep_alive" not in payload
+
+    def test_cloud_apply_helper_is_a_noop(self, monkeypatch):
+        monkeypatch.setenv("ODYSSEUS_OLLAMA_KEEP_ALIVE", "30m")
+        payload = {}
+        llm_core._apply_ollama_keep_alive(payload, "https://ollama.com/api")
+        assert "keep_alive" not in payload
+
+
+class TestOllamaThinkingEffort:
+    """Settings-selected thinking effort maps per transport surface."""
+
+    def test_auto_keeps_existing_suppression(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "auto")
+        payload = _capture_payload(
+            monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "qwen3:14b"
+        )
+        assert payload.get("think") is False
+        assert "reasoning_effort" not in payload
+
+    def test_off_uses_reasoning_effort_none_on_v1(self, monkeypatch):
+        # think:false is ignored by current Ollama /v1 builds; "none" is the
+        # effective off switch and must not be pre-empted by think:false.
+        monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "off")
+        payload = _capture_payload(
+            monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "qwen3:14b"
+        )
+        assert payload.get("reasoning_effort") == "none"
+        assert "think" not in payload
+
+    def test_level_is_sent_on_v1(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "low")
+        payload = _capture_payload(
+            monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "gemma4:12b"
+        )
+        assert payload.get("reasoning_effort") == "low"
+        assert "think" not in payload
+
+    def test_effort_never_leaks_to_cloud(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "high")
+        payload = _capture_payload(
+            monkeypatch, "https://api.openai.com/v1/chat/completions", "gpt-4o"
+        )
+        assert "reasoning_effort" not in payload
+        assert "think" not in payload
+
+    def test_native_payload_level(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "high")
+        payload = llm_core._build_ollama_payload(
+            "qwen3:14b", [{"role": "user", "content": "hi"}], 0.7, 100,
+            stream=False, url="http://localhost:11434/api/chat",
+        )
+        assert payload.get("think") == "high"
+
+    def test_native_payload_off(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "off")
+        payload = llm_core._build_ollama_payload(
+            "qwen3:14b", [{"role": "user", "content": "hi"}], 0.7, 100,
+            stream=False, url="http://localhost:11434/api/chat",
+        )
+        assert payload.get("think") is False
+
+    def test_unsupported_model_gets_no_effort_compat(self, monkeypatch):
+        # Switching to a non-thinking model must not carry the setting over —
+        # Ollama rejects thinking controls for unsupported models.
+        monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "low")
+        monkeypatch.setattr(llm_core, "_route_supports_thinking", lambda url, model: False)
+        payload = _capture_payload(
+            monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "some-text-model"
+        )
+        assert "reasoning_effort" not in payload
+        assert "think" not in payload
+
+    def test_unsupported_model_gets_no_effort_native(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "high")
+        monkeypatch.setattr(llm_core, "_route_supports_thinking", lambda url, model: False)
+        payload = llm_core._build_ollama_payload(
+            "some-text-model", [{"role": "user", "content": "hi"}], 0.7, 100,
+            stream=False, url="http://localhost:11434/api/chat",
+        )
+        assert "think" not in payload
+
+    def test_native_payload_auto_omits_think(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "auto")
+        payload = llm_core._build_ollama_payload(
+            "qwen3:14b", [{"role": "user", "content": "hi"}], 0.7, 100,
+            stream=False, url="http://localhost:11434/api/chat",
+        )
+        assert "think" not in payload
+
+
+# Captured before the autouse fixture patches it, so the settings tests can
+# exercise the real accessor.
+_real_thinking_effort = llm_core._ollama_thinking_effort
+
+
+class TestOllamaThinkingEffortSetting:
+    def _set(self, monkeypatch, raw):
+        import src.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "load_settings", lambda: {"local_thinking_effort": raw})
+
+    def test_normalizes_case_and_whitespace(self, monkeypatch):
+        self._set(monkeypatch, " LOW ")
+        assert _real_thinking_effort() == "low"
+
+    def test_rejects_unknown_values(self, monkeypatch):
+        self._set(monkeypatch, "banana")
+        assert _real_thinking_effort() == "auto"
+
+    def test_missing_key_is_auto(self, monkeypatch):
+        import src.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "load_settings", lambda: {})
+        assert _real_thinking_effort() == "auto"
+
+    def test_settings_failure_is_auto(self, monkeypatch):
+        import src.settings as settings_mod
+
+        def boom():
+            raise RuntimeError("settings unavailable")
+
+        monkeypatch.setattr(settings_mod, "load_settings", boom)
+        assert _real_thinking_effort() == "auto"

@@ -2868,7 +2868,7 @@ import { loadPanel } from './panels.js';
                 if (spinner && spinner.element) spinner.destroy();
                 break;
               }
-              if (json.delta || json.type === 'agent_prep' || json.type === 'tool_approval_resolved' || json.type === 'generated_image' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
+              if (json.delta || json.type === 'agent_prep' || json.type === 'tool_approval_resolved' || json.type === 'generated_image' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted' || json.type === 'tool_call_rejected' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
                 clearResponseTimeout();
                 clearProcessingProbe();
                 clearFirstTokenWaitTimers();
@@ -3899,7 +3899,7 @@ import { loadPanel } from './panels.js';
                 const chatBox = document.getElementById('chat-history');
                 chatBox.appendChild(budgetDiv);
 
-              } else if (json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted') {
+              } else if (json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted' || json.type === 'tool_call_rejected') {
                 if (_isBg) continue;
                 _cancelThinkingTimer();
                 _removeThinkingSpinner();
