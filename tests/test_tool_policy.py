@@ -477,3 +477,30 @@ def test_guide_only_skips_teacher_escalation(monkeypatch):
     )
 
     assert any("Could you tell me" in chunk for chunk in chunks)
+
+
+def test_read_only_assistant_blocks_action_execution_even_when_forced(monkeypatch):
+    from src.assistant_preferences import AssistantPreferences, assistant_turn
+    _patch_loop_basics(monkeypatch)
+    executed = []
+
+    async def execute(*args, **kwargs):
+        executed.append(args)
+        return ("bash", {"output": "ran", "exit_code": 0})
+
+    async def respond(*args, **kwargs):
+        yield _delta_chunk("```bash\ntouch /tmp/should-not-exist\n```")
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(al, "execute_tool_block", execute)
+    monkeypatch.setattr(al, "stream_llm_with_fallback", respond)
+    for profile in ("everyday", "research"):
+        with assistant_turn(AssistantPreferences(profile=profile)):
+            events = _events(_collect(al.stream_agent_loop(
+                "http://local.test/v1", "local-model", [{"role": "user", "content": "Run this command"}],
+                max_rounds=1, relevant_tools={"bash"}, forced_tools={"bash"},
+            )))
+        assert not executed
+        blocked = [event for event in events if event.get("type") == "tool_output"]
+        assert blocked and blocked[0]["exit_code"] == 1
+        assert not any(event.get("type") == "tool_start" for event in events)

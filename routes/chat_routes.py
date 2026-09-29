@@ -24,6 +24,9 @@ from src.llm_core import (
 )
 from src.agent_loop import stream_agent_loop
 from src import agent_runs
+from src.assistant_preferences import (
+    load_preferences, assistant_turn, web_enabled, merge_sources, SourceRegistry,
+)
 from src.model_context import estimate_tokens
 from src.context_compactor import (
     apply_compaction_state,
@@ -812,9 +815,15 @@ def setup_chat_routes(
         tool_policy = build_effective_tool_policy(last_user_message=message)
         allow_tool_preprocessing = not tool_policy.block_all_tool_calls
 
+        assistant_options = load_preferences(session)
+        turn_reports = []
+        turn_sources = SourceRegistry()
+        if assistant_options.profile != "legacy":
+            use_web = web_enabled(assistant_options, message)
+
         # Inline memory command
         memory_response = None
-        if not tool_policy.blocks("manage_memory"):
+        if not assistant_options.read_only and not tool_policy.blocks("manage_memory"):
             memory_response = await chat_handler.handle_memory_command(sess, message)
         if memory_response:
             return {"response": memory_response}
@@ -825,25 +834,26 @@ def setup_chat_routes(
         )
 
         # Build shared context (preset, preprocess, preface, compact)
-        ctx = await build_chat_context(
-            sess, request, chat_handler, chat_processor,
-            message=message,
-            session_id=session,
-            preset_id=preset_id,
-            att_ids=att_ids,
-            use_web=use_web,
-            time_filter=time_filter,
-            webhook_manager=webhook_manager,
-            allow_tool_preprocessing=allow_tool_preprocessing,
-            defer_context_shaping=foreground_policy.enabled,
-        )
+        with assistant_turn(assistant_options, sess.endpoint_url, turn_reports, turn_sources):
+            ctx = await build_chat_context(
+                sess, request, chat_handler, chat_processor,
+                message=message,
+                session_id=session,
+                preset_id=preset_id,
+                att_ids=att_ids,
+                use_web=use_web,
+                time_filter=time_filter,
+                webhook_manager=webhook_manager,
+                allow_tool_preprocessing=allow_tool_preprocessing,
+                defer_context_shaping=foreground_policy.enabled,
+            )
 
         # Research injection
         research_blocked_by_policy = (
             tool_policy.blocks("trigger_research")
             or tool_policy.blocks("manage_research")
         )
-        if use_research and not research_blocked_by_policy:
+        if use_research and not research_blocked_by_policy and assistant_options.web_mode != "off":
             try:
                 _r_ep, _r_model, _r_headers = _resolve_research_endpoint(sess)
                 research_ctx = await research_handler.call_research_service(
@@ -891,16 +901,17 @@ def setup_chat_routes(
                 owner=owner,
             )
         requested_model = sess.model
-        reply, actual_candidate, actual_model = await llm_call_async_with_route_fallback(
-            foreground_candidates,
-            request_messages,
-            fallback_statuses=foreground_policy.eligible_statuses,
-            candidate_request_factory=candidate_request_factory,
-            temperature=ctx.preset.temperature,
-            max_tokens=ctx.preset.max_tokens,
-            prompt_type=preset_id,
-            session_id=session,
-        )
+        with assistant_turn(assistant_options, sess.endpoint_url, turn_reports, turn_sources):
+            reply, actual_candidate, actual_model = await llm_call_async_with_route_fallback(
+                foreground_candidates,
+                request_messages,
+                fallback_statuses=foreground_policy.eligible_statuses,
+                candidate_request_factory=candidate_request_factory,
+                temperature=ctx.preset.temperature,
+                max_tokens=ctx.preset.max_tokens,
+                prompt_type=preset_id,
+                session_id=session,
+            )
         actual_index = _candidate_index(foreground_candidates, actual_candidate)
         apply_compaction_state(
             sess,
@@ -931,6 +942,10 @@ def setup_chat_routes(
                 ),
             },
         )
+        if turn_reports:
+            _clean_md["search_reports"] = turn_reports
+        if ctx.web_sources:
+            _clean_md["web_sources"] = ctx.web_sources
         sess.add_message(ChatMessage("assistant", _clean_reply, metadata=_clean_md))
 
         from core.database import update_session_last_accessed
@@ -1299,6 +1314,27 @@ def setup_chat_routes(
         except (ValueError, ValidationError):
             raise HTTPException(400, "Invalid request parameters")
 
+        assistant_options = load_preferences(session)
+        turn_reports = []
+        turn_sources = SourceRegistry()
+        if assistant_options.profile != "legacy":
+            # Read the original explicit toggle, before legacy auto-escalation altered it.
+            original_web = form_data.get("allow_web_search", (body or {}).get("allow_web_search"))
+            denied = is_web_search_explicitly_denied(original_web)
+            if denied:
+                assistant_options = assistant_options.model_copy(update={"web_mode": "off"})
+            should_search = web_enabled(assistant_options, message, explicitly_denied=denied)
+            _search_enabled = assistant_options.web_mode != "off" and not denied
+            allow_web_search = "true" if _search_enabled else "false"
+            use_web = "true" if should_search else None
+            if assistant_options.read_only:
+                allow_bash = "false"
+                workspace = None
+                _workspace_agent_intent = False
+                chat_mode = "agent" if _search_enabled else "chat"
+            elif assistant_options.profile == "actions":
+                chat_mode = "agent"
+
         # ------------------------------------------------------------------ #
         # Privilege gates that must fire BEFORE any LLM work / token spend.
         #   1. allowed_models — reject if session.model isn't in the user's
@@ -1324,6 +1360,8 @@ def setup_chat_routes(
             if get_session_mode(session) == 'research_pending':
                 do_research = True
                 logger.info(f"Session {session} in research_pending — auto-triggering research")
+        if assistant_options.profile != "legacy" and assistant_options.web_mode == "off":
+            do_research = False
 
         att_ids = []
         if tool_approval_continuation:
@@ -1354,36 +1392,37 @@ def setup_chat_routes(
         )
 
         # Build shared context (stream path uses enhanced_message for context preface)
-        ctx = await build_chat_context(
-            sess, request, chat_handler, chat_processor,
-            message=message,
-            session_id=session,
-            preset_id=preset_id,
-            att_ids=att_ids,
-            use_web=use_web,
-            use_rag=use_rag,
-            time_filter=time_filter,
-            incognito=incognito,
-            no_memory=no_memory,
-            search_context=search_context,
-            compare_mode=compare_mode,
-            webhook_manager=webhook_manager,
-            use_enhanced_message=True,
-            # Skills index only ships when the model can actually call
-            # manage_skills (agent mode). In plain chat or incognito the
-            # index would be useless / unwanted noise.
-            agent_mode=(chat_mode == "agent"),
-            allow_tool_preprocessing=allow_tool_preprocessing,
-            defer_context_shaping=foreground_policy.enabled,
-            continuation_context_message=(
-                pending_tool_approval.continuation_query
-                if exact_tool_approval
-                and pending_tool_approval
-                and pending_tool_approval.continuation_query
-                else None
-            ),
-            persist_user_message=not tool_approval_continuation,
-        )
+        with assistant_turn(assistant_options, sess.endpoint_url, turn_reports, turn_sources):
+            ctx = await build_chat_context(
+                sess, request, chat_handler, chat_processor,
+                message=message,
+                session_id=session,
+                preset_id=preset_id,
+                att_ids=att_ids,
+                use_web=use_web,
+                use_rag=use_rag,
+                time_filter=time_filter,
+                incognito=incognito,
+                no_memory=no_memory,
+                search_context=search_context,
+                compare_mode=compare_mode,
+                webhook_manager=webhook_manager,
+                use_enhanced_message=True,
+                # Skills index only ships when the model can actually call
+                # manage_skills (agent mode). In plain chat or incognito the
+                # index would be useless / unwanted noise.
+                agent_mode=(chat_mode == "agent"),
+                allow_tool_preprocessing=allow_tool_preprocessing,
+                defer_context_shaping=foreground_policy.enabled,
+                continuation_context_message=(
+                    pending_tool_approval.continuation_query
+                    if exact_tool_approval
+                    and pending_tool_approval
+                    and pending_tool_approval.continuation_query
+                    else None
+                ),
+                persist_user_message=not tool_approval_continuation,
+            )
 
         _research_flags = {"do": do_research}  # Mutable container for generator scope
 
@@ -1656,6 +1695,8 @@ def setup_chat_routes(
             if ctx.rag_sources:
                 yield f"data: {json.dumps({'type': 'rag_sources', 'data': ctx.rag_sources})}\n\n"
 
+            for report in turn_reports:
+                yield f"data: {json.dumps({'type': 'search_status', 'data': report})}\n\n"
             if web_sources:
                 yield f"data: {json.dumps({'type': 'web_sources', 'data': web_sources})}\n\n"
 
@@ -2185,6 +2226,7 @@ def setup_chat_routes(
                                     session,
                                     _terminal_content,
                                     _terminal_metrics,
+                                    web_sources=web_sources,
                                     character_name=ctx.preset.character_name,
                                     incognito=incognito,
                                 )
@@ -2288,6 +2330,7 @@ def setup_chat_routes(
                                 "requested_endpoint_label": _requested_route.get("endpoint_label"),
                             },
                         )
+                        _stopped_md.update(web_sources=web_sources, search_reports=turn_reports)
                         sess.add_message(ChatMessage("assistant", _stopped_content, metadata=_stopped_md))
                         session_manager.save_sessions()
                     raise
@@ -2386,7 +2429,9 @@ def setup_chat_routes(
                                         _stream_set(session, partial=full_response)
                                     yield chunk
                                 elif data.get("type") == "web_sources":
-                                    web_sources = data.get("data", [])
+                                    web_sources = merge_sources(web_sources, data.get("data", []))
+                                    yield f"data: {json.dumps({'type': 'web_sources', 'data': web_sources})}\n\n"
+                                elif data.get("type") == "search_status":
                                     yield chunk
                                 elif data.get("type") in (
                                     "tool_start", "tool_output", "agent_step",
@@ -2582,6 +2627,7 @@ def setup_chat_routes(
                                     ],
                                 },
                             )
+                            _stopped_md2.update(web_sources=web_sources, search_reports=turn_reports)
                             sess.add_message(ChatMessage("assistant", _stopped_content2, metadata=_stopped_md2))
                             session_manager.save_sessions()
                     except Exception:
@@ -2594,8 +2640,9 @@ def setup_chat_routes(
             """Wrapper that guarantees _active_streams cleanup even if stream_with_save
             raises before reaching a mode-specific finally block."""
             try:
-                async for chunk in stream_with_save():
-                    yield chunk
+                with assistant_turn(assistant_options, sess.endpoint_url, turn_reports, turn_sources):
+                    async for chunk in stream_with_save():
+                        yield chunk
             finally:
                 _active_streams.pop(session, None)
 

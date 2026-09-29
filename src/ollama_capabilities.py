@@ -32,6 +32,7 @@ _THINKING_TOKENS: FrozenSet[str] = frozenset({"thinking", "reasoning"})
 
 _cache: dict[tuple[str, str], tuple[float, Optional[FrozenSet[str]]]] = {}
 _lock = threading.Lock()
+_context_windows: dict[tuple[str, str], int] = {}
 
 
 def ollama_api_root(url: str) -> str:
@@ -75,6 +76,7 @@ def capability_tokens(url: str, model: str, *, timeout: float = _PROBE_TIMEOUT_S
             return tokens
 
     tokens: Optional[FrozenSet[str]] = None
+    window = None
     try:
         response = httpx.post(
             f"{root}/api/show",
@@ -83,6 +85,10 @@ def capability_tokens(url: str, model: str, *, timeout: float = _PROBE_TIMEOUT_S
         )
         if response.is_success:
             payload = response.json() or {}
+            windows = [v for k, v in (payload.get("model_info") or {}).items()
+                       if (k == "context_length" or k.endswith(".context_length"))
+                       and isinstance(v, int) and not isinstance(v, bool) and v > 0]
+            window = min(windows) if windows else None
             raw = payload.get("capabilities")
             if isinstance(raw, list):
                 tokens = frozenset(
@@ -93,6 +99,10 @@ def capability_tokens(url: str, model: str, *, timeout: float = _PROBE_TIMEOUT_S
 
     with _lock:
         _cache[key] = (now, tokens)
+        if window:
+            _context_windows[key] = window
+        else:
+            _context_windows.pop(key, None)
     return tokens
 
 
@@ -102,6 +112,13 @@ def supports_tool_calls(url: str, model: str) -> Optional[bool]:
     if tokens is None:
         return None
     return bool(tokens & _TOOL_TOKENS)
+
+
+def model_context_window(url: str, model: str) -> Optional[int]:
+    """Advertised maximum, distinct from the running allocation in /api/ps."""
+    capability_tokens(url, model)
+    with _lock:
+        return _context_windows.get((ollama_api_root(url), str(model or "").strip()))
 
 
 def supports_thinking(url: str, model: str) -> Optional[bool]:
@@ -116,3 +133,4 @@ def reset_cache() -> None:
     """Drop the cache (tests and endpoint reconfiguration)."""
     with _lock:
         _cache.clear()
+        _context_windows.clear()

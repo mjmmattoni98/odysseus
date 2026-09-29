@@ -2,6 +2,7 @@
 // Extracted from chat.js — message rendering, sources, images, metrics
 
 import uiModule from './ui.js';
+import { sourceStatusLabel, searchStatusText } from './searchEvidence.js';
 import markdownModule from './markdown.js';
 import { svgifyEmoji } from './markdown.js';
 import { addAITTSButton } from './tts-ai.js';
@@ -1133,9 +1134,9 @@ export function buildSourcesBox(sources, type, expanded) {
     var title = esc(s.title || domain || '');
     var safeUrl = _safeHref(s.url);
     lines += '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer" class="source-link">'
-      + '<span class="source-num">' + (i + 1) + '</span>'
+      + '<span class="source-num">' + (Number.isInteger(s.citation) ? s.citation : i + 1) + '</span>'
       + '<span class="source-title">' + title + '</span>'
-      + '<span class="source-domain">' + esc(domain) + '</span>'
+      + '<span class="source-domain">' + esc(domain) + (sourceStatusLabel(s) ? '<br>' + esc(sourceStatusLabel(s)) : '') + '</span>'
       + '</a>';
   }
   var arrow = expanded ? 'down' : 'right';
@@ -1148,6 +1149,23 @@ export function buildSourcesBox(sources, type, expanded) {
     + '<div class="sources-content' + expandedClass + '" id="' + id + '">'
     + '<div class="sources-content-inner">' + lines + '</div>'
     + '</div></div>';
+}
+
+export function updateSearchStatus(holder, reports) {
+  if (!holder || !reports?.length) return;
+  let status = holder.querySelector(':scope > .search-status');
+  if (!status) {
+    status = document.createElement('div');
+    status.className = 'search-status sources-section';
+    status.setAttribute('role', 'status');
+    holder.appendChild(status);
+  }
+  status.replaceChildren(...reports.map(report => {
+    const row = document.createElement('div');
+    row.className = 'sources-header';
+    row.textContent = searchStatusText(report);
+    return row;
+  }));
 }
 
 /**
@@ -3075,6 +3093,7 @@ export function addMessage(role, content, modelName, metadata) {
       wrap.appendChild(createUserMsgFooter(wrap));
     }
 
+    if (role === 'assistant' && metadata?.search_reports?.length) updateSearchStatus(wrap, metadata.search_reports);
     box.appendChild(wrap);
 
     // TTS is now part of the msg-actions system
@@ -3111,6 +3130,7 @@ const chatRenderer = {
   removeAskUserCards,
   renderAskUserCard,
   buildSourcesBox,
+  updateSearchStatus,
   buildFindingsBox,
   appendReportButton,
   buildImageBubble,

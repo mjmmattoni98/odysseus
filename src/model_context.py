@@ -278,7 +278,7 @@ def get_context_length(endpoint_url: str, model: str) -> int:
     or context_window fields. Caches result per (endpoint, model).
     Falls back to DEFAULT_CONTEXT if unavailable.
     """
-    return _get_context_length_cached(endpoint_url, model)[0]
+    return get_context_length_known(endpoint_url, model)[0]
 
 
 def get_context_length_known(endpoint_url: str, model: str) -> Tuple[int, bool]:
@@ -287,7 +287,14 @@ def get_context_length_known(endpoint_url: str, model: str) -> Tuple[int, bool]:
     DEFAULT_CONTEXT fallback. Callers that *scale* a budget off the window must not
     trust an unknown value — a fallback 128K isn't proof the model holds 128K
     (review on #4122)."""
-    return _get_context_length_cached(endpoint_url, model)
+    ctx, known = _get_context_length_cached(endpoint_url, model)
+    from src.ollama_capabilities import ollama_api_root
+    from urllib.parse import urlparse
+    if ollama_api_root(endpoint_url) and is_local_endpoint(endpoint_url) and "/v1" not in urlparse(endpoint_url).path:
+        from src.assistant_preferences import context_limit
+        limit = context_limit(endpoint_url, model)
+        return (min(ctx, limit) if known else limit), True
+    return ctx, known
 
 
 def budget_context_for_model(endpoint_url: str, model: str, *, fallback: int = 0) -> int:
@@ -503,9 +510,11 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
         # Ollama reports the window it actually allocated for a loaded model.
         # Prefer it over the model's advertised maximum so budgeting matches
         # what /v1 requests will really get (Ollama /v1 cannot carry num_ctx).
-        ollama_ctx = _ollama_ps_context(endpoint_url, model)
+        from src.ollama_capabilities import ollama_api_root, model_context_window
+        native_ollama = bool(ollama_api_root(endpoint_url) and "/v1" not in urlparse(endpoint_url).path)
+        ollama_ctx = model_context_window(endpoint_url, model) if native_ollama else _ollama_ps_context(endpoint_url, model)
         if ollama_ctx:
-            logger.info(f"Ollama /api/ps reports context_length={ollama_ctx} for {model}")
+            logger.info("Ollama %s context_length=%s for %s", "maximum" if native_ollama else "loaded", ollama_ctx, model)
             return ollama_ctx, True
 
     # GitHub Copilot's /models requires auth + X-GitHub-Api-Version headers that

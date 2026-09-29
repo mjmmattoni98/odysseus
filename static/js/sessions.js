@@ -2,6 +2,7 @@
 // This module handles all session-related operations
 
 import Storage from './storage.js';
+import assistantControls from './assistantControls.js';
 import uiModule, { autoResize, styledPrompt } from './ui.js';
 import chatRenderer from './chatRenderer.js?v=20260815toolapproval4';
 import { providerLogo } from './providers.js';
@@ -285,6 +286,7 @@ let _sessionListFocused = false;
 function _deselectCurrentSession(sid) {
   if (currentSessionId !== sid) return;
   currentSessionId = null;
+  assistantControls.loadSession(null);
   uiModule.el('chat-history').innerHTML = '';
   uiModule.el('current-meta').textContent = 'Odysseus Chat';
   Storage.remove('lastSessionId');
@@ -1856,6 +1858,7 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
       try { window.documentModule.clearSelection(); } catch {}
     }
     currentSessionId = id;
+    assistantControls.loadSession(id);
     try { window.__odysseusLastSelectedSessionId = id; } catch (_) {}
     // Identify Assistant / task-output sessions so we don't "trap" the user
     // there on return. Skipped from both `lastSessionId` persistence and the
@@ -2225,6 +2228,7 @@ export function createDirectChat(url, modelId, endpointId, opts = {}) {
   _skipAutoSelect = true;
   _suppressNextSessionLoading = true;
   currentSessionId = null;
+  assistantControls.loadSession(null);
   try { window.__odysseusLastSelectedSessionId = ''; } catch (_) {}
   Storage.remove('lastSessionId');
   history.replaceState(null, '', window.location.pathname);
@@ -2405,6 +2409,7 @@ export function getCurrentEndpointUrl() {
 export function setCurrentSessionId(id) {
   _sessionNavToken++;
   currentSessionId = id;
+  assistantControls.loadSession(id);
   try { window.__odysseusLastSelectedSessionId = id || ''; } catch (_) {}
   if (!id) {
     _suppressNextSessionLoading = true;
@@ -2915,6 +2920,7 @@ async function _arcPeekOpen(sid) {
 
     // Set as current session so chat renders
     currentSessionId = sid;
+    assistantControls.loadSession(sid);
 
     // Find the archived session metadata
     const meta = _arc.data.find(s => s.id === sid);

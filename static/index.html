@@ -1143,6 +1143,7 @@
             </div>
           </div>
           <!-- Web search (magnifying glass) -->
+          <button type="button" class="input-icon-btn" id="assistant-settings-btn" aria-label="Conversation settings">Everyday</button>
           <button type="button" class="input-icon-btn" title="Web search" id="web-toggle-btn" data-mode-tool="true" aria-label="Web search" aria-pressed="false">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -1211,6 +1212,39 @@
       <input type="checkbox" id="plan-toggle" style="display:none;">
     </div>
     <form id="chat-form" autocomplete="off" action="javascript:void(0);" style="display:none;"></form>
+
+    <div id="assistant-settings-modal" class="modal hidden">
+      <div class="modal-content preset-modal-content" role="dialog" aria-modal="true" aria-labelledby="assistant-settings-title">
+        <div class="modal-header">
+          <h4 id="assistant-settings-title">Conversation settings</h4>
+          <button type="button" class="close-btn" id="assistant-close" aria-label="Close conversation settings">Close</button>
+        </div>
+        <div class="modal-body preset-modal-body">
+          <label for="assistant-profile">Profile</label>
+          <select id="assistant-profile">
+            <option value="everyday">Everyday assistant</option>
+            <option value="research">Research and decisions</option>
+            <option value="actions">Actions and tools</option>
+            <option value="legacy">Existing settings</option>
+          </select>
+          <p>Everyday and Research can look things up and read reference material. Choose Actions when you want to change files or use other tools.</p>
+          <label for="assistant-web">Web access</label>
+          <select id="assistant-web"><option value="off">Off</option><option value="auto">Auto: search when needed</option><option value="on">On: search before answering</option></select>
+          <div id="assistant-thinking-row">
+            <label for="assistant-thinking">Thinking for this conversation</label>
+            <select id="assistant-thinking"><option value="auto">Model default</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select>
+          </div>
+          <div id="assistant-context-row" hidden>
+            <label for="assistant-context">Context limit for this model</label>
+            <input id="assistant-context" type="number" min="1024" max="262144" step="1" value="32768" required>
+          </div>
+          <p id="assistant-runtime"></p>
+          <label for="assistant-instructions">Your instructions</label>
+          <textarea id="assistant-instructions" rows="5" maxlength="10000" placeholder="Your preferences, constraints, and how you want answers presented"></textarea>
+        </div>
+        <div class="modal-footer"><button type="button" class="btn-primary" id="assistant-save">Save for this conversation</button></div>
+      </div>
+    </div>
 
     <!-- Character (custom preset) modal -->
     <div id="custom-preset-modal" class="modal hidden">

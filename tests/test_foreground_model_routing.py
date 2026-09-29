@@ -1130,6 +1130,7 @@ def _chat_endpoint(
             {"role": "user", "content": "hello"},
         ],
         context_length=100,
+        web_sources=[],
         uprefs={},
         preset=SimpleNamespace(
             temperature=0.2,

@@ -6,6 +6,7 @@
 // ES6 module — IIFE removed
 
 import Storage from './storage.js';
+import assistantControls from './assistantControls.js';
 import uiModule from './ui.js';
 import sessionModule from './sessions.js';
 import chatRenderer from './chatRenderer.js?v=20260819approvalcontrol1';
@@ -1915,6 +1916,16 @@ import { loadPanel } from './panels.js';
 	      }
       fd.append('allow_bash', el('bash-toggle').checked ? 'true' : 'false');
       if (workspaceAgentIntent) fd.set('allow_bash', 'true');
+      if (!approvalForSend) {
+        const assistantOptions = await assistantControls.prepareTurn(streamSessionId);
+        if (assistantOptions.profile !== 'legacy') {
+          fd.delete('use_web');
+          fd.set('allow_web_search', assistantOptions.web_mode === 'off' ? 'false' : 'true');
+          fd.set('mode', assistantOptions.profile === 'actions' ? 'agent' : 'chat');
+          if (assistantOptions.profile !== 'actions') fd.set('allow_bash', 'false');
+        }
+      }
+
       const ragChk = el('rag-toggle');
       if (ragChk && !ragChk.checked) {
         fd.append('use_rag', 'false');
@@ -2161,6 +2172,7 @@ import { loadPanel } from './panels.js';
       let roundFinalization = null;   // Terminal owner/result for the current round
       let lastContentRoundHolder = null; // Last non-empty round for an empty continuation Stop
       let _sourcesHtml = '';          // Sources box HTML to prepend to body
+      const _searchReports = [];
       let _sourcesExpanded = false;   // Track if user expanded sources during stream
       let _sourcesData = null;        // Raw sources data for rebuilding
       let _sourcesType = '';          // 'web' or 'research'
@@ -3211,6 +3223,9 @@ import { loadPanel } from './panels.js';
                   }
                 }, 500);
                 continue;
+              } else if (json.type === 'search_status') {
+                _searchReports.push(json.data);
+                if (!_isBg) chatRenderer.updateSearchStatus(holder, _searchReports);
               } else if (json.type === 'web_sources') {
                 if (_isBg) {
                   if (json.data && json.data.length > 0) {
@@ -5124,7 +5139,7 @@ import { loadPanel } from './panels.js';
             if (metricsData) displayMetrics(holder, metricsData);
           } else if (json.type === 'tool_start' || json.type === 'tool_output' ||
                      json.type === 'tool_progress' || json.type === 'agent_step' ||
-                     json.type === 'web_sources' || json.type === 'rag_sources' ||
+                     json.type === 'web_sources' || json.type === 'search_status' || json.type === 'rag_sources' ||
                      json.type === 'research_progress' || json.type === 'research_sources' ||
                      json.type === 'research_findings' || json.type === 'research_done') {
             rich = true;

@@ -1,5 +1,7 @@
 # Search
 
+Conversation web access, persisted retrieval evidence, and stable citation numbers are described in [Everyday assistant](everyday-assistant.md).
+
 Last updated: dev@e71f8ce | 2026-08-25
 
 ## Scope

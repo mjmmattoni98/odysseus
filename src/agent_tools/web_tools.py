@@ -44,6 +44,9 @@ class WebSearchTool:
                 "elapsed_s": 0,
                 "tail": f"Searching web for: {query[:160]}",
             })
+        search_status = {}
+        from src.assistant_preferences import source_registry
+        registry = source_registry()
         try:
             text, sources = await asyncio.wait_for(
                 loop.run_in_executor(
@@ -53,6 +56,8 @@ class WebSearchTool:
                         max_pages=max_pages,
                         time_filter=time_filter,
                         return_sources=True,
+                        status=search_status,
+                        citation_registry=registry,
                     ),
                 ),
                 timeout=30,
@@ -61,12 +66,14 @@ class WebSearchTool:
             return {
                 "error": f"web_search timed out after 30s: {query[:200]}",
                 "exit_code": 1,
+                "search_status": {"state": "failed", "reason": "timeout", "results": 0, "pages_read": 0},
             }
         except Exception as e:
             return {
                 "error": f"web_search failed: {type(e).__name__}: {str(e) or 'no details'}",
                 "exit_code": 1,
                 "untrusted_content": True,
+                "search_status": {"state": "failed", "results": 0, "pages_read": 0},
             }
         if progress_cb:
             await progress_cb({
@@ -76,7 +83,7 @@ class WebSearchTool:
         output = text[:MAX_OUTPUT_CHARS] if len(text) > MAX_OUTPUT_CHARS else text
         if sources:
             output += "\n\n<!-- SOURCES:" + json.dumps(sources) + " -->"
-        return {"output": output, "exit_code": 0}
+        return {"output": output, "exit_code": 0, "search_status": search_status}
 
 class WebFetchTool:
     async def execute(self, content: str, ctx: dict) -> dict:
@@ -109,6 +116,11 @@ class WebFetchTool:
             return {"error": f"web_fetch: unsupported URL scheme (only http/https): {url[:80]}", "exit_code": 1}
         if not low.startswith(("http://", "https://")):
             url = "https://" + url
+        from src.assistant_preferences import source_registry
+        registry = source_registry()
+        source = {"url": url, "title": url, "read_status": "failed", "snippet_available": False}
+        if registry:
+            source["citation"] = registry.number(url)
         loop = asyncio.get_running_loop()
         try:
             def _fetch():
@@ -128,9 +140,9 @@ class WebFetchTool:
                 timeout=30,
             )
         except asyncio.TimeoutError:
-            return {"error": f"web_fetch: timed out fetching {url}", "exit_code": 1}
+            return {"error": f"web_fetch: timed out fetching {url}", "exit_code": 1, "web_sources": [source]}
         except Exception as e:
-            return {"error": f"web_fetch: {url}: {e}", "exit_code": 1}
+            return {"error": f"web_fetch: {url}: {e}", "exit_code": 1, "web_sources": [source]}
         err = result.get("error")
         text = (result.get("content") or "").strip()
         title = result.get("title") or ""
@@ -141,8 +153,9 @@ class WebFetchTool:
                     "error": f"web_fetch: {url}: {err}",
                     "exit_code": 1,
                     "untrusted_content": True,
+                    "web_sources": [source],
                 }
-            return {"error": f"web_fetch: {url}: no readable text content (not HTML, or the page needs JS/login)", "exit_code": 1}
+            return {"error": f"web_fetch: {url}: no readable text content (not HTML, or the page needs JS/login)", "exit_code": 1, "web_sources": [source]}
 
         # Tell the model when the download budget cut the body short and how
         # to get the rest, instead of silently presenting a partial page as
@@ -164,8 +177,12 @@ class WebFetchTool:
         # notice first and cap the title as a second guard.
         if len(title) > 300:
             title = title[:300] + "..."
-        header = (f"# {title}\n" if title else "") + f"Source: {url}\n\n"
+        citation = f"[{source['citation']}] " if source.get("citation") else ""
+        header = (f"# {title}\n" if title else "") + f"Source: {citation}{url}\n\n"
         output = size_note + header + text
         if len(output) > MAX_OUTPUT_CHARS:
             output = output[:MAX_OUTPUT_CHARS] + "\n\n[...truncated]"
-        return {"output": output, "exit_code": 0}
+        return {"output": output, "exit_code": 0, "web_sources": [{
+            **source, "title": title or url, "read_status": "read",
+            "partial": bool(result.get("truncated") or len(size_note + header + text) > MAX_OUTPUT_CHARS),
+        }]}

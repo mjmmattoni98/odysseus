@@ -1,5 +1,7 @@
 # LLM Models And Endpoints
 
+Conversation thinking controls, local context caps, and foreground inference priority are described in [Everyday assistant](everyday-assistant.md).
+
 Last updated: dev@e71f8ce | 2026-08-25
 
 ## Scope

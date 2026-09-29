@@ -3512,6 +3512,12 @@ async def stream_agent_loop(
     mcp_mgr = get_mcp_manager()
     prep_timings: Dict[str, float] = {}
     disabled_tools = set(disabled_tools or [])
+    from src.assistant_preferences import current_preferences, READ_ONLY_TOOLS
+    assistant_read_only = current_preferences().read_only
+    if assistant_read_only:
+        from src.agent_tools import TOOL_TAGS
+        disabled_tools.update(TOOL_TAGS - READ_ONLY_TOOLS)
+        mcp_mgr = None
     route_descriptors = list(route_descriptors or [])
     while len(route_descriptors) < 1 + len(fallbacks or []):
         route_descriptors.append({})
@@ -4185,7 +4191,7 @@ async def stream_agent_loop(
     _relevant_tools = _route_relevant_tools(model)
     if _ody_doc_finetune_mode and _relevant_tools is not None:
         logger.info("[agent-intent] odysseus doc finetune tool clamp=%s", sorted(_relevant_tools))
-    elif _ody_notes_finetune_mode and _relevant_tools is not None:
+    elif _ody_notes_finetune_mode and _relevant_tools is not None and not assistant_read_only:
         disabled_tools.difference_update({
             "manage_notes", "manage_calendar", "manage_tasks",
         })
@@ -5191,7 +5197,7 @@ async def stream_agent_loop(
                             _ody_doc_finetune_mode = answering_state["ody_doc_finetune_mode"]
                             _ody_notes_finetune_mode = answering_state["ody_notes_finetune_mode"]
                             _ody_doc_stream_create_mode = answering_state["ody_doc_stream_create_mode"]
-                            if _ody_notes_finetune_mode:
+                            if _ody_notes_finetune_mode and not assistant_read_only:
                                 # Mirror the primary-route clamp: the answering
                                 # candidate's notes mode must re-enable the
                                 # personal managers in the shared execution
@@ -5767,6 +5773,7 @@ async def stream_agent_loop(
             )
             _ody_clamped_tool_allowed = (
                 _ody_notes_finetune_mode
+                and not assistant_read_only
                 and block.tool_type in {"manage_notes", "manage_calendar", "manage_tasks"}
             )
             policy_names = email_tool_policy_names(block.tool_type)
@@ -5778,7 +5785,8 @@ async def stream_agent_loop(
                 disabled_tools and not policy_names.isdisjoint(disabled_tools)
             )
             if (
-                (blocked_by_tool_policy or blocked_by_disabled_tools)
+                (blocked_by_tool_policy or blocked_by_disabled_tools
+                 or (assistant_read_only and block.tool_type not in READ_ONLY_TOOLS))
                 and not _ody_clamped_tool_allowed
             ):
                 if blocked_by_tool_policy:
@@ -5992,7 +6000,14 @@ async def stream_agent_loop(
                     except Exception as _e:
                         logger.debug(f"skill requires_toolsets unlock skipped: {_e}")
 
+            if block.tool_type == "web_fetch" and result.get("web_sources"):
+                yield f'data: {json.dumps({"type": "web_sources", "data": result["web_sources"]})}\n\n'
+
             # Extract structured web sources from web_search tool output.
+            if block.tool_type == "web_search" and result.get("search_status"):
+                from src.assistant_preferences import record_search_report
+                record_search_report(result["search_status"])
+                yield f'data: {json.dumps({"type": "search_status", "data": result["search_status"]})}\n\n'
             # web_search returns {"output": ..., "exit_code": 0}; check "output"
             # first so the <!-- SOURCES:…--> marker is found and stripped even
             # when the result doesn't carry a "results" or "stdout" key.

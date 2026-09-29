@@ -1367,6 +1367,46 @@ def setup_session_routes(
             "unfiled_remaining": unfiled_remaining_after,
         }
 
+    @router.get("/session/{sid}/assistant")
+    async def get_assistant_preferences(request: Request, sid: str):
+        _verify_session_owner(request, sid)
+        from src.assistant_preferences import load_preferences, DEFAULT_LOCAL_CONTEXT_LIMIT
+        from src.ollama_capabilities import supports_thinking, ollama_api_root, model_context_window
+        from src.model_context import _ollama_ps_context, is_local_endpoint
+        from src.llm_core import _is_ollama_native_url
+        from starlette.concurrency import run_in_threadpool
+
+        session = session_manager.get_session(sid)
+        options = load_preferences(sid)
+        local_ollama = bool(ollama_api_root(session.endpoint_url) and is_local_endpoint(session.endpoint_url))
+        runtime = {"model": session.model, "local_ollama": local_ollama}
+        if local_ollama:
+            native = _is_ollama_native_url(session.endpoint_url)
+            runtime.update({
+                "native": native,
+                "supports_thinking": await run_in_threadpool(supports_thinking, session.endpoint_url, session.model),
+                "loaded_context": await run_in_threadpool(_ollama_ps_context, session.endpoint_url, session.model),
+                "maximum_context": await run_in_threadpool(model_context_window, session.endpoint_url, session.model),
+                "context_limit": options.context_limits.get(session.model, DEFAULT_LOCAL_CONTEXT_LIMIT) if native else None,
+            })
+        return {"preferences": options.model_dump(), "runtime": runtime}
+
+    @router.put("/session/{sid}/assistant")
+    async def save_assistant_preferences(request: Request, sid: str):
+        _verify_session_owner(request, sid)
+        from src.assistant_preferences import parse_preferences
+        try:
+            options = parse_preferences(await request.json())
+        except (ValueError, TypeError):
+            raise HTTPException(422, "Invalid assistant preferences")
+        with SessionLocal() as db:
+            row = db.query(DbSession).filter(DbSession.id == sid).first()
+            if row is None:
+                raise HTTPException(404, "Session not found")
+            row.assistant_preferences = options.model_dump()
+            db.commit()
+        return {"preferences": options.model_dump()}
+
     @router.get("/session/{session_id}/context_info")
     async def get_context_info(request: Request, session_id: str):
         """Get the real context length for a session's model from the endpoint."""
@@ -1378,7 +1418,9 @@ def setup_session_routes(
             return {"context_length": None}
         try:
             from src.model_context import get_context_length
-            ctx = get_context_length(session.endpoint_url, session.model)
+            from src.assistant_preferences import load_preferences, assistant_turn
+            with assistant_turn(load_preferences(session_id), session.endpoint_url):
+                ctx = get_context_length(session.endpoint_url, session.model)
             return {"context_length": ctx, "model": session.model}
         except Exception:
             return {"context_length": None}

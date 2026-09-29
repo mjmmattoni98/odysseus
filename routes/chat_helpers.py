@@ -639,6 +639,14 @@ async def build_chat_context(
     # auto_opened_docs collector captures any docs created server-side
     # (e.g. fillable PDF → markdown editor doc) so the chat route can
     # announce them to the frontend before streaming.
+    from src.assistant_preferences import current_preferences, assistant_prompt
+    assistant_options = current_preferences()
+    if assistant_options.profile != "legacy" and assistant_options.web_mode == "off":
+        allow_tool_preprocessing = False
+        use_web = False
+    personal_prompt = assistant_prompt(assistant_options)
+    if personal_prompt:
+        preset.system_prompt = "\n\n".join(p for p in (preset.system_prompt, personal_prompt) if p)
     auto_opened_docs: list = []
     preprocessed = await preprocess(
         chat_handler, message, att_ids or [], sess,
@@ -1060,6 +1068,9 @@ def save_assistant_response(
         md["character_name"] = character_name
     if web_sources:
         md["web_sources"] = web_sources
+    from src.assistant_preferences import search_reports
+    if search_reports():
+        md["search_reports"] = search_reports()
     if rag_sources:
         md["rag_sources"] = rag_sources
     if research_sources:

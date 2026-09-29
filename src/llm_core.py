@@ -75,7 +75,8 @@ def _local_model_gate_enabled() -> bool:
 
 
 def _gate_workload(workload: Optional[str]) -> str:
-    return "background" if str(workload or "").lower() == "background" else "foreground"
+    value = str(workload or "").lower()
+    return value if value in {"background", "research"} else "foreground"
 
 
 @asynccontextmanager
@@ -112,15 +113,22 @@ async def _local_model_slot(target_url: str, model: str, workload: Optional[str]
             from src.interactive_gate import has_foreground_activity
         except Exception:
             has_foreground_activity = lambda: False  # type: ignore
-        while _LOCAL_MODEL_WAITING_FOREGROUND > 0 or has_foreground_activity():
+        while _LOCAL_MODEL_WAITING_FOREGROUND > 0 or (kind == "background" and has_foreground_activity()):
             await asyncio.sleep(0.25)
 
     acquired = False
+    waiting_foreground = kind == "foreground"
     try:
-        await _LOCAL_MODEL_LOCK.acquire()
-        acquired = True
+        while not acquired:
+            await _LOCAL_MODEL_LOCK.acquire()
+            if kind != "foreground" and _LOCAL_MODEL_WAITING_FOREGROUND > 0:
+                _LOCAL_MODEL_LOCK.release()
+                await asyncio.sleep(0)
+            else:
+                acquired = True
         if kind == "foreground":
             _LOCAL_MODEL_WAITING_FOREGROUND = max(0, _LOCAL_MODEL_WAITING_FOREGROUND - 1)
+            waiting_foreground = False
         _LOCAL_MODEL_CURRENT.clear()
         _LOCAL_MODEL_CURRENT.update({
             "task": current_task,
@@ -131,7 +139,7 @@ async def _local_model_slot(target_url: str, model: str, workload: Optional[str]
         })
         yield
     finally:
-        if kind == "foreground":
+        if waiting_foreground:
             _LOCAL_MODEL_WAITING_FOREGROUND = max(0, _LOCAL_MODEL_WAITING_FOREGROUND - 1)
         if acquired and _LOCAL_MODEL_LOCK.locked():
             owner = _LOCAL_MODEL_CURRENT.get("task")
@@ -196,6 +204,8 @@ def _cache_header_identity(headers) -> str:
 def _get_cache_key(url: str, model: str, messages: List[Dict],
                    temperature: float, max_tokens: int, headers=None) -> str:
     """Generate a cache key partitioned by endpoint and credential identity."""
+    from src.assistant_preferences import current_preferences, context_limit
+    preferences = current_preferences()
     hashable_messages = []
     for msg in messages:
         sorted_items = tuple(sorted(msg.items()))
@@ -207,6 +217,8 @@ def _get_cache_key(url: str, model: str, messages: List[Dict],
         'messages': hashable_messages,
         'temp': temperature,
         'max_tokens': max_tokens,
+        'thinking': preferences.thinking if preferences.profile != "legacy" else _ollama_thinking_effort(),
+        'context_limit': context_limit(url, model),
         # Never put credentials in a cache key or loggable cache payload.  The
         # digest only prevents responses from one configured account/route
         # being returned under another route with the same URL and model.
@@ -769,6 +781,10 @@ def _ollama_thinking_effort() -> str:
     ``auto`` means "leave the payload alone" so the existing per-family
     suppression keeps working; anything else is an explicit operator choice.
     """
+    from src.assistant_preferences import current_preferences
+    preferences = current_preferences()
+    if preferences.profile != "legacy":
+        return preferences.thinking
     try:
         from src.settings import load_settings
 
@@ -825,14 +841,9 @@ def _build_ollama_payload(
 ) -> Dict:
     """Build the JSON payload for Ollama's /api/chat endpoint.
 
-    ``num_ctx`` sets the input context window. Ollama defaults to 2048
-    when the option is omitted, so a model with a larger advertised
-    window is silently truncated there, and a model with a smaller one
-    gets an oversized window it can't service. Pass the discovered
-    context length through ``num_ctx``; this builder only emits it when
-    the value is trusted (not the ``DEFAULT_CONTEXT`` fallback), so we
-    don't guess for unknown models but do tell Ollama the real window
-    when we know it — even if it's smaller than 2048.
+    Local requests allocate at most the conversation's per-model context cap
+    (32K by default), bounded by a discovered model maximum when available.
+    Cloud requests retain discovery-only context behavior.
     """
     payload: Dict = {
         "model": model,
@@ -844,7 +855,11 @@ def _build_ollama_payload(
         options["temperature"] = temperature
     if max_tokens and max_tokens > 0:
         options["num_predict"] = max_tokens
-    if num_ctx is not None and num_ctx > 0 and num_ctx != DEFAULT_CONTEXT:
+    from src.assistant_preferences import context_limit
+    if url and is_local_endpoint(url):
+        limit = context_limit(url, model)
+        options["num_ctx"] = min(num_ctx, limit) if num_ctx and num_ctx > 0 else limit
+    elif num_ctx is not None and num_ctx > 0 and num_ctx != DEFAULT_CONTEXT:
         options["num_ctx"] = num_ctx
     if options:
         payload["options"] = options

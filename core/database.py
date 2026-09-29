@@ -197,6 +197,7 @@ class Session(TimestampMixin, Base):
     
     # Headers stored as JSON
     headers = Column(JSON, default=dict)
+    assistant_preferences = Column(JSON, nullable=True)
     
     # Timestamps are provided by TimestampMixin
     last_accessed = Column(DateTime, default=func.now(), onupdate=func.now())
@@ -2058,6 +2059,15 @@ def _migrate_seed_email_account():
 # Any future migrations or schema changes that temporarily violate foreign-key
 # constraints will fail. To perform such operations, foreign_keys must be
 # temporarily disabled around the migration workflow.
+def _migrate_assistant_preferences():
+    """Add conversation options without changing existing conversations."""
+    from sqlalchemy import inspect, text
+    with engine.begin() as connection:
+        columns = {c["name"] for c in inspect(connection).get_columns("sessions")}
+        if "assistant_preferences" not in columns:
+            connection.execute(text("ALTER TABLE sessions ADD COLUMN assistant_preferences JSON"))
+
+
 def init_db():
     """
     Initialize the database by creating all tables.
@@ -2065,6 +2075,7 @@ def init_db():
     """
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
+    _migrate_assistant_preferences()
     # Lock the DB file (and any SQLite sidecars) to 0o600 — it holds bearer-token
     # + bcrypt hashes and encrypted provider keys. POSIX only; safe_chmod no-ops
     # on Windows (ACL-restricted profile dir) and the path helper returns None for

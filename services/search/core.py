@@ -258,6 +258,8 @@ def comprehensive_web_search(
     language: Optional[str] = None,
     min_content_length: int = 0,
     return_sources: bool = False,
+    status: Optional[dict] = None,
+    citation_registry=None,
 ):
     """Perform comprehensive web search with content fetching and advanced filtering."""
     logger.info(f"Starting comprehensive search for: {query}")
@@ -267,11 +269,22 @@ def comprehensive_web_search(
     settings = _get_search_settings()
     search_provider = settings.get("search_provider", "searxng")
     result_count = _get_result_count()
+    report = status if status is not None else {}
+    report.update(state="empty", provider=search_provider, fallback=False, attempts=[], results=0, pages_read=0, pages_failed=0)
+
+    def finish(context, sources, state):
+        report["state"] = state
+        report["results"] = len(sources)
+        report["pages_read"] = sum(s.get("read_status") == "read" for s in sources)
+        report["pages_failed"] = sum(s.get("read_status") == "failed" for s in sources)
+        from src.assistant_preferences import record_search_report
+        record_search_report(report)
+        return (context, sources) if return_sources else context
 
     if search_provider == "disabled":
         logger.info("Search is disabled via admin settings")
         msg = "Web search is disabled by the administrator."
-        return (msg, []) if return_sources else msg
+        return finish(msg, [], "disabled")
 
     # Use configured result count (at least max_pages for content fetching)
     fetch_count = max(result_count, max_pages)
@@ -287,6 +300,8 @@ def comprehensive_web_search(
             try:
                 search_results = _call_provider(provider_name, query, fetch_count, time_filter)
                 if search_results:
+                    report["provider"] = provider_name
+                    report["fallback"] = provider_name != provider_chain[0]
                     provider_attempts[provider_name] = f"ok ({len(search_results)})"
                     logger.info(f"Comprehensive search: {provider_name} returned {len(search_results)} results")
                     break
@@ -301,6 +316,7 @@ def comprehensive_web_search(
         elif empty:
             provider_attempts[provider_name] = "empty"
 
+    report["attempts"] = [{"provider": name, "state": "ok" if value.startswith("ok") else "failed"} for name, value in provider_attempts.items()]
     if not search_results:
         tally = ", ".join(f"{p}:{r}" for p, r in provider_attempts.items()) or "no providers configured"
         any_errors = any(r.startswith("error") for r in provider_attempts.values())
@@ -313,7 +329,7 @@ def comprehensive_web_search(
                 "rephrasing or using the browser tool for a specific URL may help."
             )
         logger.warning(msg)
-        return (msg, []) if return_sources else msg
+        return finish(msg, [], "failed" if any_errors else "empty")
 
     search_results = rank_search_results(query, search_results)
 
@@ -348,22 +364,26 @@ def comprehensive_web_search(
     if not filtered_urls:
         logger.warning("All URLs filtered out by advanced criteria")
         msg = "No suitable results after applying filters."
-        return (msg, []) if return_sources else msg
+        return finish(msg, [], "empty")
 
     # Build sources list for the frontend (before content fetching)
     _source_list = [
-        {"url": r.get("url", ""), "title": r.get("title", "")}
+        {"url": r.get("url", ""), "title": r.get("title", ""), "read_status": "snippet"}
         for r in search_results if r.get("url")
     ]
 
     # Map each URL to its [i] number in the sources list so fetched content
     # blocks can be labeled with the SAME index the model cites.
-    _url_index = {
-        r["url"]: i for i, r in enumerate(search_results, 1) if r.get("url")
-    }
+    from src.assistant_preferences import source_registry
+    registry = citation_registry or source_registry()
+    _url_index = {r["url"]: registry.number(r["url"]) if registry else i
+                  for i, r in enumerate(search_results, 1) if r.get("url")}
+    for source in _source_list:
+        source["citation"] = _url_index[source["url"]]
 
     # Fetch content in parallel
     fetched_content = []
+    source_by_url = {s["url"]: s for s in _source_list}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_url = {
             executor.submit(fetch_webpage_content, url, 8, retry_attempt=0): url
@@ -371,6 +391,7 @@ def comprehensive_web_search(
         }
         for future in as_completed(future_to_url):
             url = future_to_url[future]
+            source_by_url[url]["read_status"] = "failed"
             try:
                 result = future.result()
                 if result["success"] and result["content"] and len(result["content"]) >= min_content_length:
@@ -379,6 +400,8 @@ def comprehensive_web_search(
                     # arbitrary, so the block label cannot be recomputed later.
                     result["source_index"] = _url_index.get(url)
                     fetched_content.append(result)
+                    source_by_url[url]["read_status"] = "read"
+                    source_by_url[url]["partial"] = bool(result.get("truncated") or len(result["content"]) > 3000)
             except Exception as e:
                 logger.error(f"Exception while fetching {url}: {str(e)}")
 
@@ -390,6 +413,7 @@ def comprehensive_web_search(
     if search_results:
         output_parts.append("```sources")
         for i, result in enumerate(search_results, 1):
+            i = _url_index.get(result.get("url"), i)
             output_parts.append(f"[{i}] {result['title']}")
             output_parts.append(f"    {result['url']}")
             if result.get("age"):
@@ -407,6 +431,7 @@ def comprehensive_web_search(
     output_parts.append("SEARCH RESULTS SUMMARY:")
     output_parts.append("-" * 50)
     for i, result in enumerate(search_results, 1):
+        i = _url_index.get(result.get("url"), i)
         output_parts.append(f"\n[{i}] {result['title']}")
         output_parts.append(f"    URL: {result['url']}")
         output_parts.append(f"    Snippet: {result['snippet'][:200]}...")
@@ -475,4 +500,4 @@ def comprehensive_web_search(
     output_parts.append(instructions)
 
     result = "\n".join(output_parts)
-    return (result, _source_list) if return_sources else result
+    return finish(result, _source_list, "ok")

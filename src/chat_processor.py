@@ -400,35 +400,39 @@ class ChatProcessor:
                 fallback_query = next((line.strip() for line in message.split("\n") if line.strip()), "")
                 search_query = fallback_query
 
-                try:
-                    generated_query = llm_call(
-                        t_url,
-                        t_model,
-                        [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "Extract a concise search query from the user's message. "
-                                    "Reply ONLY with the query."
-                                ),
-                            },
-                            {"role": "user", "content": message},
-                        ],
-                        headers=t_headers,
-                        temperature=0.1,
-                        max_tokens=50,
-                        timeout=15,
-                    ).strip()
+                from src.assistant_preferences import current_preferences
+                # Everyday/research avoid an extra blocking local inference just
+                # to rewrite a query; tool follow-ups can refine it if needed.
+                if current_preferences().profile == "legacy":
+                    try:
+                        generated_query = llm_call(
+                            t_url,
+                            t_model,
+                            [
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "Extract a concise search query from the user's message. "
+                                        "Reply ONLY with the query."
+                                    ),
+                                },
+                                {"role": "user", "content": message},
+                            ],
+                            headers=t_headers,
+                            temperature=0.1,
+                            max_tokens=50,
+                            timeout=15,
+                        ).strip()
 
-                    if generated_query:
-                        # LLM successfully generated a non-empty query -> use the generated query
-                        search_query = generated_query
-                    else:
-                        # LLM returned an empty or whitespace-only query -> fall back to original query
-                        logger.warning("LLM generated an empty search query, using fallback.")
-                except Exception as e:
-                    # LLM failed (exception/error) -> fall back to original user query
-                    logger.warning(f"Failed to generate search query via LLM, using fallback: {e}")
+                        if generated_query:
+                            # LLM successfully generated a non-empty query -> use the generated query
+                            search_query = generated_query
+                        else:
+                            # LLM returned an empty or whitespace-only query -> fall back to original query
+                            logger.warning("LLM generated an empty search query, using fallback.")
+                    except Exception as e:
+                        # LLM failed (exception/error) -> fall back to original user query
+                        logger.warning(f"Failed to generate search query via LLM, using fallback: {e}")
 
                 search_query = " ".join(search_query.split())
                 if len(search_query) > 150:
@@ -449,6 +453,8 @@ class ChatProcessor:
                     preface.append(untrusted_context_message("web search results", web_context))
             except Exception as e:
                 logger.error(f"Web search failed: {e}")
+                from src.assistant_preferences import record_search_report
+                record_search_report({"state": "failed", "results": 0, "pages_read": 0})
                 preface.append({"role": "system", "content": "Web search encountered an error and could not retrieve results."})
 
         # Process non-YouTube URLs in message (YouTube handled by preprocess_message)
@@ -457,7 +463,9 @@ class ChatProcessor:
         # hundreds of KB of duplicate page HTML and confuses the model) or for
         # link-heavy pastes (>3 URLs typically means it's a boilerplate-laden
         # blog post, not a "summarize this URL" request).
-        urls = extract_urls(message)
+        from src.assistant_preferences import current_preferences
+        preferences = current_preferences()
+        urls = [] if preferences.profile != "legacy" and preferences.web_mode == "off" else extract_urls(message)
         non_yt_urls = [u for u in urls if not is_youtube_url(u)]
         skip_url_fetch = len(message) > 2000 or len(non_yt_urls) > 3
         if not skip_url_fetch:
@@ -470,6 +478,14 @@ class ChatProcessor:
                     # diagnostic stable as well as the model-facing context.
                     logger.warning("Automatic URL fetch failed while building context")
                     result = {"success": False, "error": ""}
+                from src.assistant_preferences import source_registry, merge_sources
+                registry = source_registry()
+                source = {"url": url, "title": result.get("title") or url, "snippet_available": False,
+                          "read_status": "read" if result.get("success") and result.get("content") else "failed",
+                          "partial": bool(result.get("truncated") or len(result.get("content") or "") > 10000)}
+                if registry:
+                    source["citation"] = registry.number(url)
+                web_sources = merge_sources(web_sources, [source])
                 if result.get('success'):
                     content = result.get('content', '')[:10000]
                     preface.append(untrusted_context_message(
