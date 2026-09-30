@@ -75,8 +75,15 @@ def _local_model_gate_enabled() -> bool:
 
 
 def _gate_workload(workload: Optional[str]) -> str:
+    """Normalize a local-model workload.
+
+    ``utility`` covers short internal calls made on behalf of the current user
+    (titles, memory/skill extraction). Like ``research`` it yields to queued
+    foreground requests and is never cancelled by them, but unlike
+    ``background`` it does not wait for the browser to go idle.
+    """
     value = str(workload or "").lower()
-    return value if value in {"background", "research"} else "foreground"
+    return value if value in {"background", "research", "utility"} else "foreground"
 
 
 @asynccontextmanager
@@ -202,7 +209,8 @@ def _cache_header_identity(headers) -> str:
 
 
 def _get_cache_key(url: str, model: str, messages: List[Dict],
-                   temperature: float, max_tokens: int, headers=None) -> str:
+                   temperature: float, max_tokens: int, headers=None,
+                   think=None, response_schema: Optional[Dict] = None) -> str:
     """Generate a cache key partitioned by endpoint and credential identity."""
     from src.assistant_preferences import current_preferences, context_limit
     preferences = current_preferences()
@@ -219,6 +227,8 @@ def _get_cache_key(url: str, model: str, messages: List[Dict],
         'max_tokens': max_tokens,
         'thinking': preferences.thinking if preferences.profile != "legacy" else _ollama_thinking_effort(),
         'context_limit': context_limit(url, model),
+        'think_override': _normalize_think_override(think),
+        'response_schema': response_schema if isinstance(response_schema, dict) else None,
         # Never put credentials in a cache key or loggable cache payload.  The
         # digest only prevents responses from one configured account/route
         # being returned under another route with the same URL and model.
@@ -794,15 +804,31 @@ def _ollama_thinking_effort() -> str:
     return raw if raw in _OLLAMA_THINK_EFFORT_CHOICES else "auto"
 
 
-def _ollama_think_value(url: str, model: str):
+def _normalize_think_override(value) -> Optional[str]:
+    """Map a per-call ``think`` argument to an effort choice.
+
+    ``None``/``True`` keep the conversation/settings effort; ``False`` or
+    ``"off"`` disable thinking; ``"low"|"medium"|"high"`` select a level.
+    """
+    if value is None or value is True:
+        return None
+    if value is False:
+        return "off"
+    text = str(value).strip().lower()
+    return text if text in _OLLAMA_THINK_EFFORT_CHOICES and text != "auto" else None
+
+
+def _ollama_think_value(url: str, model: str, override=None):
     """Payload value for the selected effort, or ``None`` to send nothing.
 
     ``None`` covers three cases: the setting is ``auto``, the route is not
     Ollama, or the model does not advertise thinking support — Ollama rejects
     thinking controls for unsupported models, so switching to a non-thinking
-    model must never carry the setting over.
+    model must never carry the setting over. ``override`` is a per-call
+    ``think`` argument (see ``_normalize_think_override``) that takes
+    precedence over the conversation/settings effort.
     """
-    effort = _ollama_thinking_effort()
+    effort = _normalize_think_override(override) or _ollama_thinking_effort()
     if effort == "auto":
         return None
     if not (_is_ollama_native_url(url or "") or _is_ollama_openai_compat_url(url or "")):
@@ -812,7 +838,7 @@ def _ollama_think_value(url: str, model: str):
     return False if effort == "off" else effort
 
 
-def _apply_ollama_thinking_effort(payload: Dict, url: str, model: str, *, compat: bool = False) -> None:
+def _apply_ollama_thinking_effort(payload: Dict, url: str, model: str, *, compat: bool = False, override=None) -> None:
     """Attach the selected thinking effort to an Ollama payload.
 
     On the OpenAI-compatible surface the effective off switch is
@@ -820,13 +846,30 @@ def _apply_ollama_thinking_effort(payload: Dict, url: str, model: str, *, compat
     Ollama builds there. On the native surface ``think`` carries the value.
     Non-Ollama endpoints and non-thinking models are never touched.
     """
-    value = _ollama_think_value(url, model)
+    value = _ollama_think_value(url, model, override)
     if value is None:
         return
     if compat:
         payload["reasoning_effort"] = "none" if value is False else value
     else:
         payload["think"] = value
+
+
+def _apply_openai_compat_response_schema(payload: Dict, url: str, response_schema: Optional[Dict]) -> None:
+    """Constrain a local OpenAI-compatible response to ``response_schema``.
+
+    Ollama ``/v1``, llama.cpp, vLLM and LM Studio accept the OpenAI
+    ``json_schema`` response format. Cloud providers differ in how strictly
+    they validate schemas, so they keep prompt-only JSON instructions.
+    """
+    if not isinstance(response_schema, dict) or not response_schema:
+        return
+    if not (_is_ollama_openai_compat_url(url or "") or _is_self_hosted_openai_compatible(url or "")):
+        return
+    payload["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {"name": "response", "schema": response_schema},
+    }
 
 
 def _build_ollama_payload(
@@ -838,6 +881,8 @@ def _build_ollama_payload(
     tools: Optional[List[Dict]] = None,
     num_ctx: Optional[int] = None,
     url: Optional[str] = None,
+    think=None,
+    response_schema: Optional[Dict] = None,
 ) -> Dict:
     """Build the JSON payload for Ollama's /api/chat endpoint.
 
@@ -865,9 +910,12 @@ def _build_ollama_payload(
         payload["options"] = options
     if tools:
         payload["tools"] = _alias_harmony_tools(tools, model)
+    if isinstance(response_schema, dict) and response_schema:
+        # Native structured outputs: Ollama constrains decoding to the schema.
+        payload["format"] = response_schema
     if url:
         _apply_ollama_keep_alive(payload, url)
-        think_value = _ollama_think_value(url, model)
+        think_value = _ollama_think_value(url, model, think)
         if think_value is not None:
             payload["think"] = think_value
     return payload
@@ -2094,8 +2142,15 @@ def normalize_model_id(
 
 def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
              max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
-             timeout: int = LLMConfig.DEFAULT_TIMEOUT, prompt_type: Optional[str] = None) -> str:
-    """Synchronous LLM call with optional prompt type enhancement."""
+             timeout: int = LLMConfig.DEFAULT_TIMEOUT, prompt_type: Optional[str] = None,
+             think=None, response_schema: Optional[Dict] = None) -> str:
+    """Synchronous LLM call with optional prompt type enhancement.
+
+    ``think`` overrides the thinking effort for this call on Ollama routes
+    (``False`` disables thinking). ``response_schema`` is a JSON Schema that
+    local Ollama/OpenAI-compatible servers use to constrain the reply; other
+    providers ignore it, so callers must still parse defensively.
+    """
     h = _provider_headers(_detect_provider(url))
     # Tolerate headers that arrive as a JSON string (some sessions stored them
     # double-encoded) — otherwise h.update() throws "dictionary update sequence
@@ -2126,6 +2181,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
     provider = _detect_provider(url)
     cache_key = _get_cache_key(
         url, model, messages_copy, temperature, max_tokens, headers=headers,
+        think=think, response_schema=response_schema,
     )
     cached_response = _get_cached_response(cache_key)
     if cached_response:
@@ -2141,6 +2197,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
             stream=False, num_ctx=get_context_length(url, model), url=url,
+            think=think, response_schema=response_schema,
         )
     else:
         target_url = _normalize_openai_chat_url(url)
@@ -2157,8 +2214,9 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
-        _apply_ollama_thinking_effort(payload, url, model, compat=True)
+        _apply_ollama_thinking_effort(payload, url, model, compat=True, override=think)
         _apply_ollama_keep_alive(payload, url)
+        _apply_openai_compat_response_schema(payload, url, response_schema)
         _apply_local_generation_stability(payload, target_url, model)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
@@ -2401,8 +2459,13 @@ async def llm_call_async(
     workload: str = "foreground",
     availability_only_transport: bool = False,
     return_model_metadata: bool = False,
+    think=None,
+    response_schema: Optional[Dict] = None,
 ) -> str | tuple[str, str]:
-    """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
+    """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging.
+
+    ``think`` and ``response_schema`` behave as documented on ``llm_call``.
+    """
     provider = _detect_provider(url)
     messages_copy = _sanitize_llm_messages(messages)
 
@@ -2421,6 +2484,7 @@ async def llm_call_async(
 
     cache_key = _get_cache_key(
         url, model, messages_copy, temperature, max_tokens, headers=headers,
+        think=think, response_schema=response_schema,
     )
     cached_response = _get_cached_response(cache_key)
     if cached_response:
@@ -2503,6 +2567,7 @@ async def llm_call_async(
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
             stream=False, num_ctx=get_context_length(url, model), url=url,
+            think=think, response_schema=response_schema,
         )
     else:
         target_url = _normalize_openai_chat_url(url)
@@ -2523,11 +2588,13 @@ async def llm_call_async(
         # Suppress thinking for qwen3/gemma4 on Ollama /v1 — same as stream_llm.
         # Skipped when the operator selected an explicit thinking effort below.
         if (_ollama_thinking_effort() == "auto"
+                and _normalize_think_override(think) is None
                 and _is_ollama_openai_compat_url(url)
                 and _route_supports_thinking(url, model)):
             payload["think"] = False
-        _apply_ollama_thinking_effort(payload, url, model, compat=True)
+        _apply_ollama_thinking_effort(payload, url, model, compat=True, override=think)
         _apply_ollama_keep_alive(payload, url)
+        _apply_openai_compat_response_schema(payload, url, response_schema)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         _apply_local_cache_affinity(payload, url, session_id)
