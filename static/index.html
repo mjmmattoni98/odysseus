@@ -1860,8 +1860,19 @@
                 </select>
               </div>
               <div class="settings-row">
+                <label class="settings-label" title="Sizes rounds, queries, page length and token budgets to the research model's hardware">Preset</label>
+                <select id="set-researchPreset" class="settings-select" style="width:382.5px;flex:0 0 auto;margin-left:auto;">
+                  <option value="auto">Auto</option>
+                  <option value="small">Small</option>
+                  <option value="medium">Medium</option>
+                  <option value="large">Large</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </div>
+              <div id="set-researchPresetHint" class="admin-toggle-sub" style="margin-top:-2px;"></div>
+              <div class="settings-row">
                 <label class="settings-label">Max Tokens</label>
-                <input id="set-researchMaxTokens" type="text" inputmode="numeric" placeholder="8192 (default)" class="settings-select" style="width:382.5px;flex:0 0 auto;margin-left:auto;">
+                <input id="set-researchMaxTokens" type="text" inputmode="numeric" placeholder="16384 (default)" class="settings-select" style="width:382.5px;flex:0 0 auto;margin-left:auto;">
               </div>
               <div class="settings-row">
                 <label class="settings-label">Extract Timeout</label>

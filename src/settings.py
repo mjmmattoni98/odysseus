@@ -97,6 +97,11 @@ DEFAULT_SETTINGS = {
     "research_model": "",
     "research_search_provider": "",
     "research_max_tokens": 16384,
+    # Deep Research hardware preset: "auto" | "small" | "medium" | "large" |
+    # "custom" (see src/research_presets.py). Empty = never chosen: installs
+    # with a non-default research_max_tokens resolve to "custom", others to
+    # "auto".
+    "research_preset": "",
     "research_extraction_timeout_seconds": 90,
     # Lightweight planning/query LLM calls happen before any search starts.
     # Keep them separately tunable so slow local backends are not capped by

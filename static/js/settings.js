@@ -1430,8 +1430,35 @@ async function initResearchSettings() {
   var extractTimeoutInput = el('set-researchExtractTimeout');
   var extractConcurrencyInput = el('set-researchExtractConcurrency');
   var runTimeoutInput = el('set-researchRunTimeout');
+  var presetSel = el('set-researchPreset');
+  var presetHint = el('set-researchPresetHint');
   var msg = el('set-researchMsg');
   var endpoints = [];
+
+  // Preset hint: one-line description of the selection plus what Auto picked
+  // for the current research model (GET /api/research/preset).
+  async function refreshPresetHint() {
+    if (!presetSel || !presetHint) return;
+    try {
+      var r = await fetch('/api/research/preset', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      var info = await r.json();
+      if (!presetSel.dataset.loaded) {
+        presetSel.value = info.configured || 'auto';
+        presetSel.dataset.loaded = '1';
+      }
+      var row = (info.presets || []).find(function(p) { return p.name === presetSel.value; });
+      var text = row ? row.description : '';
+      if (presetSel.value === 'auto' && info.resolved) {
+        text += ' Now: ' + info.reason + (info.model ? ' (' + info.model.split('/').pop() + ')' : '') + '.';
+      }
+      presetHint.textContent = text;
+    } catch (e) {
+      presetHint.textContent = '';
+    }
+    tokensInput.disabled = presetSel.value !== 'custom';
+    tokensInput.title = tokensInput.disabled ? 'Set by the preset; choose Custom to edit' : '';
+  }
 
   try {
     endpoints = await _fetchModelEndpoints();
@@ -1512,6 +1539,7 @@ async function initResearchSettings() {
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(showStatus, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
+    refreshPresetHint();
   }
 
   epSel.addEventListener('change', async function() {
@@ -1520,6 +1548,17 @@ async function initResearchSettings() {
   });
   modelSel.addEventListener('change', saveResearch);
   tokensInput.addEventListener('change', saveResearch);
+  if (presetSel) {
+    presetSel.addEventListener('change', async function() {
+      try {
+        await _postSettings({ research_preset: presetSel.value });
+        msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
+        setTimeout(showStatus, 2000);
+      } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
+      refreshPresetHint();
+    });
+    refreshPresetHint();
+  }
   extractTimeoutInput.addEventListener('change', saveResearch);
   extractConcurrencyInput.addEventListener('change', saveResearch);
   runTimeoutInput.addEventListener('change', saveResearch);

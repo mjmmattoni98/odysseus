@@ -175,7 +175,7 @@ class ResearchHandler:
     ) -> Optional[dict]:
         """Generate a research plan for user review before starting research."""
         try:
-            from src.deep_research import RESEARCH_PLAN_PROMPT, current_date_context
+            from src.deep_research import RESEARCH_PLAN_PROMPT, RESEARCH_PLAN_SCHEMA, current_date_context
             from src.llm_core import llm_call_async
 
             prompt = current_date_context() + RESEARCH_PLAN_PROMPT.format(question=query)
@@ -188,6 +188,7 @@ class ResearchHandler:
                 headers=llm_headers,
                 timeout=30,
                 max_retries=1,
+                response_schema=RESEARCH_PLAN_SCHEMA,
             )
             response = strip_thinking(response)
 
@@ -250,7 +251,7 @@ class ResearchHandler:
         prior_report: str = "",
         prior_findings: list = None,
         prior_urls: set = None,
-        max_rounds: int = 20,
+        max_rounds: int = 0,
         search_provider: str = None,
         category: str = None,
         extraction_timeout: int = None,
@@ -259,8 +260,9 @@ class ResearchHandler:
     ) -> dict:
         """Start research as a background task. Returns task info dict.
 
-        max_rounds is the safety cap; the AI's _should_stop decision (after
-        min_rounds) terminates the loop earlier in normal operation.
+        max_rounds=0 is Auto: the research preset caps the run and the AI's
+        _should_stop decision (after the preset's small minimum) ends it
+        earlier. An explicit count means roughly that many rounds.
         """
         if _research_json_path(session_id) is None:
             raise ValueError("Invalid research session_id")
@@ -737,6 +739,23 @@ class ResearchHandler:
             logger.error(f"Probe failed for {model}: {e}")
             raise RuntimeError(_format_probe_failure(model, e)) from e
 
+    @staticmethod
+    async def _resolve_profile(llm_endpoint: str, llm_model: str, max_report_tokens: int):
+        """Resolve the research preset off the event loop (it may probe the
+        endpoint). Any failure degrades to Custom with an unknown window."""
+        from src.research_presets import PRESETS, ResearchProfile, resolve_research_profile
+        try:
+            return await asyncio.to_thread(
+                resolve_research_profile, llm_endpoint, llm_model,
+                max_report_tokens=max_report_tokens,
+            )
+        except Exception as e:
+            logger.warning(f"Research preset resolution failed: {e}")
+            from dataclasses import replace
+            preset = replace(PRESETS["custom"], synthesis_max_tokens=max_report_tokens,
+                             report_max_tokens=max_report_tokens)
+            return ResearchProfile("custom", preset, None, None, "preset resolution failed")
+
     async def call_research_service(
         self,
         query: str,
@@ -749,7 +768,7 @@ class ResearchHandler:
         prior_report: str = "",
         prior_findings: list = None,
         prior_urls: set = None,
-        max_rounds: int = 20,
+        max_rounds: int = 0,
         search_provider: str = None,
         category: str = None,
         extraction_timeout: int = None,
@@ -767,6 +786,7 @@ class ResearchHandler:
             prior_report: Previous report to continue from.
             prior_findings: Previous findings to build on.
             prior_urls: URLs already visited (won't re-fetch).
+            max_rounds: Round count; 0 = Auto (preset cap + AI stop decision).
 
         Returns:
             Formatted research report with expandable section and summary
@@ -814,14 +834,38 @@ class ResearchHandler:
                 maximum=3600,
             )
 
+            profile = await self._resolve_profile(llm_endpoint, llm_model, _max_report_tokens)
+            preset = profile.preset
+            from src.research_presets import research_round_limits
+            _max_rounds, _min_rounds, _auto_rounds = research_round_limits(max_rounds, preset)
+            _preset_label = preset.label + (" (auto)" if profile.requested == "auto" else "")
+            logger.info(
+                f"Research preset: {_preset_label} — {profile.reason}; "
+                f"rounds {_min_rounds}..{_max_rounds}{' (auto)' if _auto_rounds else ''}"
+            )
+
             researcher = DeepResearcher(
                 llm_endpoint=llm_endpoint,
                 llm_model=llm_model,
                 llm_headers=llm_headers,
-                max_rounds=max_rounds,
-                min_rounds=max(2, max_rounds - 2),
+                max_rounds=_max_rounds,
+                min_rounds=_min_rounds,
+                auto_rounds=_auto_rounds,
                 max_time=max_time,
-                max_report_tokens=_max_report_tokens,
+                max_urls_per_round=preset.urls_per_query,
+                max_content_chars=preset.page_chars,
+                max_report_tokens=preset.report_max_tokens,
+                synthesis_max_tokens=preset.synthesis_max_tokens,
+                synthesis_window=preset.synthesis_findings,
+                queries_first_round=preset.queries_first_round,
+                queries_per_round=preset.queries_per_round,
+                extraction_max_tokens=preset.extraction_max_tokens,
+                query_max_tokens=preset.query_max_tokens,
+                report_min_words=preset.report_min_words,
+                expand_below_words=preset.expand_below_words,
+                mechanical_think=preset.mechanical_think,
+                context_window=profile.context_window,
+                preset_label=_preset_label,
                 extraction_timeout=_extraction_timeout,
                 planning_timeout=_planning_timeout,
                 query_timeout=_query_timeout,

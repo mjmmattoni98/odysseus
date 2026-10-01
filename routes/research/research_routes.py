@@ -558,8 +558,8 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             if body.model:
                 ep_model = body.model
 
-        # max_rounds=0 → "Auto", let AI decide; pass 20 as the safety cap.
-        effective_max_rounds = body.max_rounds if body.max_rounds > 0 else 20
+        # max_rounds=0 → "Auto": the research preset caps the run and the AI's
+        # stop decision ends it (ResearchHandler resolves the preset).
         research_handler.start_research(
             session_id=session_id,
             query=body.query,
@@ -567,7 +567,7 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             llm_model=ep_model,
             max_time=body.max_time,
             llm_headers=ep_headers,
-            max_rounds=effective_max_rounds,
+            max_rounds=body.max_rounds,
             search_provider=body.search_provider or None,
             category=body.category or None,
             extraction_timeout=body.extraction_timeout,
@@ -575,6 +575,51 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             owner=user,
         )
         return {"session_id": session_id, "status": "running", "query": body.query}
+
+    @router.get("/api/research/preset")
+    async def research_preset_info(request: Request):
+        """Configured Deep Research preset, what Auto resolves to for the
+        research model, and the preset table (settings UI)."""
+        user = _require_user(request)
+        from src.research_presets import (
+            configured_preset, preset_table, resolve_research_profile,
+        )
+        from src.settings import get_setting
+        configured = configured_preset()
+        info = {
+            "setting": str(get_setting("research_preset", "") or ""),
+            "configured": configured,
+            "presets": preset_table(),
+            "model": "",
+            "resolved": None,
+            "reason": "",
+            "context_window": None,
+            "parameter_size_b": None,
+        }
+        url = model = ""
+        for purpose in ("research", "utility", "default", "chat"):
+            url, model, _headers = resolve_endpoint(purpose, owner=user)
+            if url:
+                break
+        if not url or not model:
+            info["reason"] = "No research model configured"
+            return info
+        try:
+            profile = await asyncio.to_thread(
+                resolve_research_profile, url, model, requested=configured,
+            )
+        except Exception as e:
+            logger.warning("Research preset preview failed: %s", e)
+            info["reason"] = "Could not inspect the research model"
+            return info
+        info.update(
+            model=model,
+            resolved=profile.preset.name,
+            reason=profile.reason,
+            context_window=profile.context_window,
+            parameter_size_b=profile.parameter_size_b,
+        )
+        return info
 
     @router.get("/api/research/stream/{session_id}")
     async def research_stream(session_id: str, request: Request):

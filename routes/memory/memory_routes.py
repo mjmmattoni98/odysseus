@@ -21,6 +21,58 @@ def _strip_list_prefix(text: str) -> str:
         return text
     return _LIST_PREFIX_RE.sub("", text, count=1).strip()
 
+# Structured-output schemas (``response_schema``) for the suggestion calls.
+# Local Ollama/OpenAI-compatible servers constrain decoding to them; cloud
+# providers ignore them, so prompts and the tolerant parsing below stay.
+_MEMORY_SUGGESTIONS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    },
+}
+_MEMORY_IMPORT_CATEGORIES = ["identity", "preference", "fact", "contact", "project", "goal"]
+_MEMORY_IMPORT_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "category": {"type": "string", "enum": _MEMORY_IMPORT_CATEGORIES},
+        },
+        "required": ["text", "category"],
+    },
+}
+
+
+def _parse_json_list(text: str) -> Optional[list]:
+    """Return the JSON array in a model reply, or ``None``.
+
+    Tolerates thinking tags, markdown fences and prose around the array
+    (providers that ignore ``response_schema``); prefers the last parseable
+    array so an echoed example earlier in the reply is not used.
+    """
+    from src.research_utils import strip_thinking
+    cleaned = (strip_thinking(text or "") or "").strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.MULTILINE).strip()
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, list) else None
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    found = None
+    for match in re.finditer(r"\[", cleaned):
+        try:
+            parsed, _end = decoder.raw_decode(cleaned[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, list):
+            found = parsed
+    return found
+
+
 from services.memory import MemoryManager, MemoryStoreUnreadable
 from core.session_manager import SessionManager
 from src.request_models import MemoryAddRequest
@@ -250,8 +302,9 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             "content": (
                 "You are a helpful assistant. Analyze the entire conversation history provided and extract any "
                 "useful factual statements, contacts, addresses, phone numbers, or other information that the user "
-                "might want to remember for future interactions. Return each piece of information as a JSON object "
-                "with a 'text' field. For example: [{'text': 'Alice lives at 123 Main St'}, {'text': 'Bob works at Acme Corp'}]. "
+                "might want to remember for future interactions. Return a JSON array where each piece of information "
+                "is an object with a \"text\" field. For example: "
+                "[{\"text\": \"Alice lives at 123 Main St\"}, {\"text\": \"Bob works at Acme Corp\"}]. "
                 "Only include information that is specific and likely to be useful later."
             ),
         }
@@ -269,14 +322,17 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
                 temperature=0.2,
                 max_tokens=500,
                 headers=t_headers,
+                # Short extraction call: a reasoning trace would eat the budget.
+                think=False,
+                response_schema=_MEMORY_SUGGESTIONS_SCHEMA,
             )
-            try:
-                suggestions = json.loads(suggestion_text)
-                if isinstance(suggestions, list):
-                    suggestions = [s if isinstance(s, str) else s.get("text", "") for s in suggestions]
-                else:
-                    suggestions = []
-            except json.JSONDecodeError:
+            parsed = _parse_json_list(suggestion_text)
+            if parsed is not None:
+                suggestions = [
+                    s if isinstance(s, str) else (s.get("text", "") if isinstance(s, dict) else "")
+                    for s in parsed
+                ]
+            else:
                 suggestions = [line.strip() for line in suggestion_text.splitlines() if line.strip()]
 
             return {"suggestions": [s for s in suggestions if s]}
@@ -464,6 +520,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
                 temperature=0.2,
                 max_tokens=2000,
                 headers=headers,
+                response_schema=_MEMORY_IMPORT_SCHEMA,
             )
 
             # Parse JSON
@@ -471,7 +528,9 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
-            suggestions = json.loads(raw)
+            suggestions = _parse_json_list(raw)
+            if suggestions is None:
+                raise json.JSONDecodeError("no JSON array in reply", raw, 0)
             if isinstance(suggestions, list):
                 normalized = []
                 for s in suggestions:

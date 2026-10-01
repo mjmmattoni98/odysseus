@@ -57,6 +57,49 @@ _CAL_ACTION_ARRAY_RE = re.compile(
 )
 
 
+# Structured-output schemas (``response_schema``) for the JSON calls below.
+# Local Ollama/OpenAI-compatible servers constrain decoding to them; cloud
+# providers ignore them, so the prompts and the tolerant parsers stay.
+_CAL_OPS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["create", "update", "cancel", "noop"]},
+            "uid": {"type": "string"},
+            "title": {"type": "string"},
+            "date": {"type": "string"},
+            "end_date": {"type": "string"},
+            "location": {"type": "string"},
+            "description": {"type": "string"},
+        },
+        "required": ["action"],
+    },
+}
+_URGENCY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "urgency": {"type": "string", "enum": ["critical", "high", "medium", "low", "none"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["urgency", "reason"],
+}
+_EMAIL_CLASS_TAGS = [
+    "work", "personal", "urgent", "action-needed", "finance", "bills",
+    "receipt", "legal", "travel", "newsletter", "promo", "notification",
+    "security", "social", "shopping", "calendar", "support",
+]
+_EMAIL_CLASS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tags": {"type": "array", "items": {"type": "string", "enum": _EMAIL_CLASS_TAGS}},
+        "spam": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["tags", "spam", "reason"],
+}
+
+
 def _extract_json_array_from_text(text: str):
     """Return the last valid JSON array embedded in model output, if any."""
     if not text:
@@ -938,6 +981,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             fallback_url=url, fallback_model=model, fallback_headers=headers,
                             owner=account_owner or None,
                             temperature=0.1, max_tokens=16384, timeout=75,
+                            response_schema=_CAL_OPS_SCHEMA,
                         )
                         _raw_original = cal_extract or ""
                         cal_extract = _strip_think(_raw_original)
@@ -1135,6 +1179,9 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             fallback_url=url, fallback_model=model, fallback_headers=headers,
                             owner=account_owner or None,
                             temperature=0, max_tokens=200, timeout=60,
+                            # 200 tokens leave no room for a reasoning trace.
+                            think=False,
+                            response_schema=_URGENCY_SCHEMA,
                         )
                         urg_raw = _strip_think(urg_raw or "")
                         urg_raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", urg_raw, flags=re.MULTILINE).strip()
@@ -1266,6 +1313,9 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             fallback_url=url, fallback_model=model, fallback_headers=headers,
                             owner=account_owner or None,
                             temperature=0.1, max_tokens=512, timeout=120,
+                            # Short label call: a reasoning trace would eat the budget.
+                            think=False,
+                            response_schema=_EMAIL_CLASS_SCHEMA,
                         )
                         raw_out = _strip_think((raw_out or "").strip())
                         raw_out = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_out, flags=re.MULTILINE).strip()

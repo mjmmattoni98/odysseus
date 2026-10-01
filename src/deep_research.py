@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set
 
 from src.research_utils import strip_thinking, is_low_quality
+from src.model_context import estimate_tokens
 
 from src.goal_based_extractor import EXTRACTOR_SYSTEM
 from src.prompt_security import untrusted_context_message
@@ -108,7 +109,7 @@ You are deciding whether a research report is comprehensive enough.
 **Current report:**
 {report}
 
-**Rounds completed:** {round_num} of {max_rounds}
+{rounds_line}
 
 Based on the report so far, do we have enough information to answer the question \
 comprehensively?  Consider:
@@ -116,8 +117,7 @@ comprehensively?  Consider:
 - Are there obvious gaps or unanswered sub-questions?
 - Is the evidence sufficient and from multiple sources?
 
-If rounds completed is well below the target, prefer continuing unless the \
-report is already exhaustive.
+{rounds_guidance}
 
 Reply with ONLY "YES" or "NO" followed by a brief one-sentence reason.
 Example: "YES — The report covers all major aspects with evidence from multiple sources."
@@ -133,7 +133,7 @@ Write a **long, detailed, comprehensive** research report answering this questio
 {report}
 
 Requirements:
-- Write at MINIMUM 1500 words — this should be a thorough, magazine-quality article
+- Write at MINIMUM {min_words} words — this should be a thorough, magazine-quality article
 - Use clear ## headings and ### subheadings to organize into logical sections
 - Each section should have multiple detailed paragraphs, not just bullet points
 - Synthesize and analyze the information — explain WHY things matter, draw comparisons, provide context
@@ -178,6 +178,67 @@ CATEGORY_PROMPTS = {
 - Be balanced and cite sources for every claim""",
 }
 
+_ROUNDS_EXPLICIT = "**Rounds completed:** {round_num} of {max_rounds}"
+_ROUNDS_EXPLICIT_GUIDANCE = (
+    "If rounds completed is well below the target, prefer continuing unless the "
+    "report is already exhaustive."
+)
+_ROUNDS_AUTO = "**Rounds completed:** {round_num} (automatic mode, at most {max_rounds})"
+_ROUNDS_AUTO_GUIDANCE = (
+    "There is no fixed round target: answer YES as soon as the key aspects are "
+    "covered with evidence, NO only when a concrete gap remains."
+)
+
+# ---------------------------------------------------------------------------
+# Structured-output schemas (response_schema). Local Ollama/OpenAI-compatible
+# servers constrain decoding to these; cloud providers ignore them, so every
+# caller keeps its prompt instructions and defensive parsing. Keep them to
+# plain objects/arrays/strings/enums so llama.cpp-style grammars accept them.
+# ---------------------------------------------------------------------------
+_STRING_LIST_SCHEMA = {"type": "array", "items": {"type": "string"}}
+
+RESEARCH_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sub_questions": _STRING_LIST_SCHEMA,
+        "key_topics": _STRING_LIST_SCHEMA,
+        "success_criteria": {"type": "string"},
+    },
+    "required": ["sub_questions", "key_topics", "success_criteria"],
+}
+
+QUERY_LIST_SCHEMA = _STRING_LIST_SCHEMA
+
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rational": {"type": "string"},
+        "evidence": {"type": "string"},
+        "summary": {"type": "string"},
+    },
+    "required": ["rational", "evidence", "summary"],
+}
+
+CATEGORY_SCHEMA = {"type": "string", "enum": [*CATEGORY_PROMPTS, "general"]}
+
+STOP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string", "enum": ["YES", "NO"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["answer", "reason"],
+}
+
+# Prompt scaffolding (instructions, question, headings) reserved on top of the
+# embedded report/findings when fitting a prompt into the context window.
+_PROMPT_OVERHEAD_TOKENS = 800
+# Embedded report + findings never take more than this share of the window.
+_EMBED_WINDOW_FRACTION = 0.6
+# Findings get at most this share of the embed budget; the report gets the rest.
+_FINDINGS_BUDGET_FRACTION = 0.5
+_CONDENSED_MARKER = "[Condensed to fit the model's context window — section details are shortened.]\n\n"
+
 # ---------------------------------------------------------------------------
 # DeepResearcher
 # ---------------------------------------------------------------------------
@@ -188,6 +249,21 @@ class DeepResearcher:
     Each round: LLM generates queries → SearXNG search → LLM extracts from
     top pages → LLM synthesizes into evolving report → LLM decides continue/stop.
     """
+
+    # Preset-controlled knobs (see src/research_presets.py). Class-level
+    # defaults reproduce the pre-preset behavior for callers that build the
+    # researcher without them.
+    queries_first_round: int = 4
+    queries_per_round: int = 3
+    extraction_max_tokens: int = 2048
+    query_max_tokens: int = 4096
+    synthesis_max_tokens: Optional[int] = None  # None → max_report_tokens
+    report_min_words: int = 1500
+    expand_below_words: int = 400
+    mechanical_think: Optional[bool] = None
+    context_window: Optional[int] = None  # known window; None = don't bound
+    auto_rounds: bool = False
+    preset_label: str = ""
 
     def __init__(
         self,
@@ -209,6 +285,17 @@ class DeepResearcher:
         progress_callback: Optional[Callable] = None,
         search_provider: Optional[str] = None,
         category: Optional[str] = None,
+        queries_first_round: int = 4,
+        queries_per_round: int = 3,
+        extraction_max_tokens: int = 2048,
+        query_max_tokens: int = 4096,
+        synthesis_max_tokens: Optional[int] = None,
+        report_min_words: int = 1500,
+        expand_below_words: int = 400,
+        mechanical_think: Optional[bool] = None,
+        context_window: Optional[int] = None,
+        auto_rounds: bool = False,
+        preset_label: str = "",
     ):
         self.llm_endpoint = llm_endpoint
         self.llm_model = llm_model
@@ -227,6 +314,17 @@ class DeepResearcher:
         self.min_rounds = min_rounds
         self.max_empty_rounds = max_empty_rounds
         self.synthesis_window = synthesis_window
+        self.queries_first_round = max(1, int(queries_first_round or 4))
+        self.queries_per_round = max(1, int(queries_per_round or 3))
+        self.extraction_max_tokens = max(256, int(extraction_max_tokens or 2048))
+        self.query_max_tokens = max(128, int(query_max_tokens or 4096))
+        self.synthesis_max_tokens = synthesis_max_tokens
+        self.report_min_words = max(100, int(report_min_words or 1500))
+        self.expand_below_words = max(0, int(expand_below_words or 0))
+        self.mechanical_think = mechanical_think
+        self.context_window = int(context_window) if context_window else None
+        self.auto_rounds = bool(auto_rounds)
+        self.preset_label = preset_label or ""
         self._progress = progress_callback
         self._cancelled = False
         self._start_time: float = 0
@@ -379,8 +477,13 @@ class DeepResearcher:
     # LLM helper
     # ------------------------------------------------------------------
     async def _llm(self, messages: List[Dict], temperature: float = 0.3,
-                   max_tokens: int = 4096, timeout: int = 60) -> str:
-        """Call the LLM asynchronously and strip thinking tags."""
+                   max_tokens: int = 4096, timeout: int = 60,
+                   think=None, response_schema: Optional[Dict] = None) -> str:
+        """Call the LLM asynchronously and strip thinking tags.
+
+        ``think``/``response_schema`` are forwarded to ``llm_call_async``
+        (thinking override and structured output for local servers).
+        """
         from src.llm_core import llm_call_async
         response = await llm_call_async(
             url=self.llm_endpoint,
@@ -391,8 +494,87 @@ class DeepResearcher:
             headers=self.llm_headers,
             timeout=timeout,
             workload="research",
+            think=think,
+            response_schema=response_schema,
         )
         return strip_thinking(response)
+
+    # ------------------------------------------------------------------
+    # Context-window fitting
+    # ------------------------------------------------------------------
+    def _output_budget(self, max_tokens: int) -> int:
+        """Clamp a generation budget to half the known window."""
+        window = self.context_window
+        if not window:
+            return max_tokens
+        return max(256, min(max_tokens, window // 2))
+
+    def _embed_budget_chars(self, max_tokens: int) -> Optional[int]:
+        """Chars of report/findings/page text that fit next to ``max_tokens``
+        of output, or ``None`` when the window is unknown (no bounding)."""
+        window = self.context_window
+        if not window:
+            return None
+        from src.research_presets import chars_for_tokens
+        tokens = min(int(window * _EMBED_WINDOW_FRACTION),
+                     window - max_tokens - _PROMPT_OVERHEAD_TOKENS)
+        return max(chars_for_tokens(256), chars_for_tokens(tokens))
+
+    @staticmethod
+    def _cut(text: str, limit: int) -> str:
+        """Cut ``text`` to ``limit`` chars at a paragraph/sentence boundary."""
+        if len(text) <= limit:
+            return text
+        cut = text[:limit]
+        for sep in ("\n\n", "\n", ". "):
+            pos = cut.rfind(sep)
+            if pos > limit * 0.6:
+                return cut[:pos + (1 if sep == ". " else 0)].rstrip()
+        return cut.rstrip()
+
+    def _condense_report(self, report: str, max_chars: Optional[int]) -> str:
+        """Fit an evolving report into ``max_chars``.
+
+        Keeps every section heading and shortens the bodies of the longest
+        sections first (water-filling), so synthesis still sees the whole
+        structure instead of losing the report's head or tail.
+        """
+        if not report or max_chars is None or len(report) <= max_chars:
+            return report
+        sections = re.split(r'\n(?=#{1,6} )', report)
+        allowance = max(0, max_chars - len(_CONDENSED_MARKER)) - len(sections)
+        # Water-fill: short sections keep their text, long ones share the rest.
+        shares = {}
+        remaining = allowance
+        pending = sorted(range(len(sections)), key=lambda i: len(sections[i]))
+        while pending:
+            fair = remaining // len(pending)
+            i = pending[0]
+            if len(sections[i]) <= fair:
+                shares[i] = len(sections[i])
+                remaining -= shares[i]
+                pending.pop(0)
+                continue
+            for j in pending:
+                shares[j] = fair
+            break
+        parts = []
+        for i, section in enumerate(sections):
+            share = shares.get(i, 0)
+            if len(section) <= share:
+                parts.append(section)
+                continue
+            heading, _, body = section.partition("\n")
+            if not heading.lstrip().startswith("#"):
+                heading, body = "", section
+            body_limit = max(0, share - len(heading) - 3)
+            short = self._cut(body, body_limit) if body_limit else ""
+            parts.append("\n".join(p for p in (heading, short + " …" if short else "") if p))
+        condensed = "\n".join(parts)
+        if len(condensed) > max_chars:
+            condensed = condensed[:max(0, max_chars - len(_CONDENSED_MARKER))]
+        logger.info(f"Condensed report from {len(report)} to {len(condensed)} chars for the context window")
+        return _CONDENSED_MARKER + condensed
 
     # ------------------------------------------------------------------
     # PLAN: create research strategy
@@ -406,6 +588,8 @@ class DeepResearcher:
                 temperature=0.3,
                 max_tokens=1024,
                 timeout=getattr(self, "planning_timeout", 90),
+                think=self.mechanical_think,
+                response_schema=RESEARCH_PLAN_SCHEMA,
             )
             # Try to parse as JSON for structured plan
             parsed = self._parse_json_object(response)
@@ -438,6 +622,8 @@ class DeepResearcher:
             result = await self._llm(
                 [{"role": "user", "content": prompt}],
                 temperature=0, max_tokens=20, timeout=15,
+                think=self.mechanical_think,
+                response_schema=CATEGORY_SCHEMA,
             )
             cat = (result or "").strip().lower()
             # Clean one-word answer first.
@@ -462,23 +648,24 @@ class DeepResearcher:
     async def _generate_queries(self, question: str, report: str,
                                 round_num: int) -> List[str]:
         if round_num == 1:
-            num_queries = 4
+            num_queries = self.queries_first_round
             round_instruction = (
                 "This is the first round — generate broad, diverse queries "
                 "that explore the key facets of the question."
             )
         else:
-            num_queries = 3
+            num_queries = self.queries_per_round
             round_instruction = (
                 "We already have partial findings.  Generate targeted follow-up "
                 "queries to fill gaps, verify claims, or explore specific aspects "
                 "that the report doesn't yet cover well."
             )
 
+        query_tokens = self._output_budget(self.query_max_tokens)
         prompt = current_date_context() + QUERY_GEN_PROMPT.format(
             question=question,
             research_plan=self.research_plan or "(No plan — search broadly.)",
-            report=report or "(No findings yet.)",
+            report=self._condense_report(report, self._embed_budget_chars(query_tokens)) or "(No findings yet.)",
             round_num=round_num,
             num_queries=num_queries,
             round_instruction=round_instruction,
@@ -488,12 +675,15 @@ class DeepResearcher:
             response = await self._llm(
                 [{"role": "user", "content": prompt}],
                 temperature=0.5,
-                max_tokens=4096,
+                max_tokens=query_tokens,
                 timeout=getattr(self, "query_timeout", 120),
+                think=self.mechanical_think,
+                response_schema=QUERY_LIST_SCHEMA,
             )
             queries = self._parse_json_array(response)
-            # Deduplicate
-            new_queries = [q for q in queries if q not in self.queries_used]
+            # Deduplicate, then cap at the requested count so a chatty model
+            # can't multiply the round's extraction calls.
+            new_queries = [q for q in queries if q.strip() and q not in self.queries_used][:num_queries]
             self.queries_used.update(new_queries)
             logger.info(f"Round {round_num} queries: {new_queries}")
             return new_queries
@@ -624,11 +814,16 @@ class DeepResearcher:
             return None
 
         content = page["content"]
+        extraction_tokens = self._output_budget(self.extraction_max_tokens)
+        max_chars = self.max_content_chars
+        fit = self._embed_budget_chars(extraction_tokens)
+        if fit is not None:
+            max_chars = min(max_chars, fit)
         # Truncate to avoid blowing up context, preferring paragraph boundary
-        if len(content) > self.max_content_chars:
-            truncated = content[:self.max_content_chars]
+        if len(content) > max_chars:
+            truncated = content[:max_chars]
             last_para = truncated.rfind('\n\n')
-            if last_para > self.max_content_chars * 0.8:
+            if last_para > max_chars * 0.8:
                 content = truncated[:last_para]
             else:
                 content = truncated
@@ -640,10 +835,12 @@ class DeepResearcher:
                     untrusted_context_message("webpage", content),
                 ],
                 temperature=0.2,
-                max_tokens=2048,
+                max_tokens=extraction_tokens,
                 timeout=self.extraction_timeout,
+                think=self.mechanical_think,
+                response_schema=EXTRACTION_SCHEMA,
             )
-            parsed = self._parse_json_object(response)
+            parsed = self._parse_json_object(response) or self._salvage_extraction(response)
             if parsed:
                 parsed["url"] = url
                 parsed["title"] = title or page.get("title", "")
@@ -676,11 +873,17 @@ class DeepResearcher:
         window = findings[-self.synthesis_window:]
         if len(findings) > self.synthesis_window:
             logger.info(f"Synthesis using last {self.synthesis_window} of {len(findings)} findings")
-        findings_text = self._format_findings(window)
+        max_tokens = self._output_budget(self.synthesis_max_tokens or self.max_report_tokens)
+        budget = self._embed_budget_chars(max_tokens)
+        findings_text = self._format_findings(
+            window,
+            max_chars=None if budget is None else int(budget * _FINDINGS_BUDGET_FRACTION),
+        )
+        report_budget = None if budget is None else max(0, budget - len(findings_text))
 
         prompt = SYNTHESIZE_PROMPT.format(
             question=question,
-            report=current_report or "(First round — no report yet.)",
+            report=self._condense_report(current_report, report_budget) or "(First round — no report yet.)",
             new_findings=findings_text,
         )
 
@@ -688,7 +891,7 @@ class DeepResearcher:
             return await self._llm(
                 [{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=self.max_report_tokens,
+                max_tokens=max_tokens,
                 # Synthesis is a heavy generation call like the final report
                 # (which gets 180s); a slow local model (e.g. a 20B served from
                 # LM Studio) routinely needs >60s for it. The old 60s cap timed
@@ -706,11 +909,15 @@ class DeepResearcher:
     async def _should_stop(self, question: str, report: str,
                            round_num: int) -> bool:
         """Let the LLM decide whether the report is comprehensive enough."""
+        rounds_line, guidance = (
+            (_ROUNDS_AUTO, _ROUNDS_AUTO_GUIDANCE) if self.auto_rounds
+            else (_ROUNDS_EXPLICIT, _ROUNDS_EXPLICIT_GUIDANCE)
+        )
         prompt = STOP_PROMPT.format(
             question=question,
-            report=report,
-            round_num=round_num,
-            max_rounds=self.max_rounds,
+            report=self._condense_report(report, self._embed_budget_chars(128)),
+            rounds_line=rounds_line.format(round_num=round_num, max_rounds=self.max_rounds),
+            rounds_guidance=guidance,
         )
 
         try:
@@ -718,11 +925,17 @@ class DeepResearcher:
                 [{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=128,
+                think=self.mechanical_think,
+                response_schema=STOP_SCHEMA,
             )
             # Reasoning models prepend a <think>...</think> block — strip it
             # before checking for YES/NO, otherwise the answer always looks
             # like it starts with "<THINK>" and the engine never stops.
             clean = strip_thinking(response).strip()
+            # Structured output: {"answer": "YES"|"NO", "reason": "..."}.
+            parsed = self._parse_json_object(clean) if clean.startswith(("{", "`")) else None
+            if parsed and isinstance(parsed.get("answer"), str):
+                clean = f"{parsed['answer']} — {parsed.get('reason', '')}".strip(" —")
             # Tolerate "**YES**", "Yes.", quotes, etc.
             answer = re.sub(r'^[\s*_`"\'>#\-]+', '', clean).upper()
             should_stop = answer.startswith("YES")
@@ -737,9 +950,11 @@ class DeepResearcher:
     # ------------------------------------------------------------------
     async def _final_report(self, question: str, report: str) -> str:
         """LLM writes a polished final report, retrying if too short."""
+        max_tokens = self._output_budget(self.max_report_tokens)
         prompt = FINAL_REPORT_PROMPT.format(
             question=question,
-            report=report,
+            report=self._condense_report(report, self._embed_budget_chars(max_tokens)),
+            min_words=self.report_min_words,
         )
         cat_extra = CATEGORY_PROMPTS.get(self.category or "", "")
         if cat_extra:
@@ -749,12 +964,16 @@ class DeepResearcher:
             result = await self._llm(
                 [{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=self.max_report_tokens,
+                max_tokens=max_tokens,
                 timeout=180,
             )
 
-            # If report is too short, ask the LLM to expand it
-            if len(result.split()) < 400:
+            # If report is too short, ask the LLM to expand it — unless the
+            # follow-up (prompt + draft + new report) would overflow the window.
+            fits = (not self.context_window or estimate_tokens(
+                [{"content": prompt}, {"content": result}]) + max_tokens + _PROMPT_OVERHEAD_TOKENS
+                <= self.context_window)
+            if len(result.split()) < self.expand_below_words and fits:
                 logger.info(f"Final report too short ({len(result.split())} words), requesting expansion")
                 self._emit(phase="writing", message="Expanding report...")
                 expanded = await self._llm(
@@ -767,12 +986,12 @@ class DeepResearcher:
                             "- Include specific data, numbers, and comparisons from the evidence\n"
                             "- Explain context and significance — don't just list facts\n"
                             "- Use ## headings and ### subheadings\n"
-                            "- Target at least 1000 words\n"
+                            f"- Target at least {self.report_min_words * 2 // 3} words\n"
                             "Write the full expanded report now."
                         },
                     ],
                     temperature=0.4,
-                    max_tokens=self.max_report_tokens,
+                    max_tokens=max_tokens,
                     timeout=180,
                 )
                 if len(expanded.split()) > len(result.split()):
@@ -871,7 +1090,9 @@ class DeepResearcher:
         """Extract a JSON object from LLM output."""
         text = self._strip_code_block(text)
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
@@ -879,14 +1100,46 @@ class DeepResearcher:
         match = re.search(r'\{[\s\S]*\}', text)
         if match:
             try:
-                return json.loads(match.group())
+                parsed = json.loads(match.group())
+                if isinstance(parsed, dict):
+                    return parsed
             except json.JSONDecodeError:
                 pass
 
         return None
 
-    def _format_findings(self, findings: List[Dict]) -> str:
-        """Format findings list into readable text for synthesis prompt."""
+    @staticmethod
+    def _salvage_extraction(text: str) -> Optional[Dict]:
+        """Recover extraction fields from a JSON object cut off by max_tokens.
+
+        A length-capped structured reply stops mid-string; keep the fields
+        that were (partially) written instead of storing raw JSON as evidence.
+        """
+        fields = {}
+        for key in ("rational", "evidence", "summary"):
+            m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)' % key, text or "")
+            if m:
+                try:
+                    fields[key] = json.loads(f'"{m.group(1)}"')
+                except json.JSONDecodeError:
+                    fields[key] = m.group(1)
+        if not (fields.get("summary") or fields.get("evidence")):
+            return None
+        if not fields.get("summary"):
+            fields["summary"] = fields["evidence"][:500]
+        fields.setdefault("evidence", fields["summary"])
+        fields.setdefault("rational", "LLM extraction (truncated)")
+        return fields
+
+    def _format_findings(self, findings: List[Dict], max_chars: Optional[int] = None) -> str:
+        """Format findings list into readable text for synthesis prompt.
+
+        ``max_chars`` bounds the whole block by shortening each finding's
+        content evenly (links and titles are kept).
+        """
+        per_finding = None
+        if max_chars is not None and findings:
+            per_finding = max(200, max_chars // len(findings) - 120)
         parts = []
         for i, f in enumerate(findings, 1):
             url = f.get("url", "unknown")
@@ -895,6 +1148,8 @@ class DeepResearcher:
             evidence = f.get("evidence", "")
             # Use summary if available, fall back to truncated evidence
             content = summary if summary else (evidence[:1000] if evidence else "(no content)")
+            if per_finding is not None and len(content) > per_finding:
+                content = self._cut(content, per_finding) + " …"
             parts.append(f"**Finding {i}** — [{title}]({url})\n{content}")
         return "\n\n".join(parts)
 
@@ -927,4 +1182,6 @@ class DeepResearcher:
             stats["Search"] = ", ".join(self.providers_used)
         if self.category:
             stats["Category"] = self.category.capitalize()
+        if self.preset_label:
+            stats["Preset"] = self.preset_label
         return stats

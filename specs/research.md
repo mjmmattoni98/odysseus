@@ -57,6 +57,31 @@ Agent tools and the CLI read and mutate persisted research JSON directly. They a
 - synthesis into final answers/reports;
 - partial/fallback reports when extraction or synthesis fails.
 
+### Hardware presets
+
+`src.research_presets` owns the `research_preset` setting (`auto`, `small`, `medium`, `large`, `custom`; empty = never chosen, which resolves to `custom` when a saved `research_max_tokens` differs from its 16384 default and to `auto` otherwise). `ResearchHandler.call_research_service()` resolves it off the event loop for the research model and threads the values into `DeepResearcher`. Auto picks **small** when the known context window is ≤16K or Ollama `/api/show` `details.parameter_size` is under 10B, **medium** when the window is ≤64K (or nothing is known), **large** above that. The window comes from `src.model_context.get_context_length_known` (unknown windows are not used for bounding). `GET /api/research/preset` returns the configured choice, what Auto resolves to for the current research model, and the table; the Settings → Search → Deep Research card shows a Preset selector with that hint (Max Tokens is editable only in Custom).
+
+| | Small | Medium | Large | Custom |
+|---|---|---|---|---|
+| Max rounds (Auto rounds) | 4 | 6 | 10 | 20 |
+| Stop check from round | 2 | 2 | 3 | 2 |
+| Queries round 1 / later | 3 / 2 | 4 / 3 | 5 / 3 | 4 / 3 |
+| URLs per query | 2 | 2 | 3 | 3 |
+| Page chars per extraction | 6,000 | 12,000 | 20,000 | 15,000 |
+| Extraction / query max tokens | 768 / 768 | 1,536 / 1,024 | 2,048 / 2,048 | 2,048 / 4,096 |
+| Synthesis / final report max tokens | 2,048 / 3,072 | 4,096 / 6,144 | 8,192 / 12,288 | `research_max_tokens` |
+| Final report target words (expand below) | 600 (250) | 1,000 (300) | 1,500 (400) | 1,500 (400) |
+| Findings carried into synthesis | 5 | 8 | 12 | 10 |
+| `think=False` for plan, category, queries, extraction, stop check | yes | yes | yes | no (settings) |
+
+Synthesis and the final report always keep the configured thinking. Timeouts, extraction concurrency and the run timeout stay separate settings in every preset. Scheduled research (`TaskScheduler`) builds `DeepResearcher` directly and keeps the pre-preset defaults.
+
+Rounds: `max_rounds=0` (panel Auto, chat research, diagnostics) uses the preset cap and consults the model's stop check from the preset minimum; the stop prompt then states automatic mode instead of a round target. An explicit count N keeps "about N rounds": the stop check starts at `max(min(N, preset minimum), N - 2)`.
+
+Context fitting: when the window is known, generation budgets are capped at half the window, and the report/findings/page text embedded in query, extraction, synthesis, stop and final-report prompts is bounded to `min(60% of window, window − output − 800)` tokens using the `estimate_tokens` ratio (chars × 0.3). Findings get at most half of that (each finding shortened evenly); the report is condensed by shortening the longest section bodies first while keeping every heading. The short-report expansion call is skipped when it would overflow the window.
+
+Structured outputs: the plan, query list, extraction, category (string `enum`) and stop check (`{"answer": "YES"|"NO", "reason"}`) calls pass `response_schema`; prompts and the tolerant parsers stay because cloud providers ignore the schema. Truncated extraction JSON is salvaged field by field.
+
 Panel runtime behavior:
 
 - reconnects to active jobs through `/api/research/active`;
@@ -102,7 +127,7 @@ Research library thumbnails prefer visible source/report images and Open Graph i
 ## Degraded Runtime
 
 - `/api/research*` is exempt from the app-level hard request timeout.
-- `ResearchHandler.start_research()` applies `research_run_timeout_seconds`; `0` means unlimited and bounded settings protect accidental extremes. User-selected round count is threaded into `DeepResearcher`; `max_rounds=0` means automatic mode capped by the route/handler rather than unbounded research.
+- `ResearchHandler.start_research()` applies `research_run_timeout_seconds`; `0` means unlimited and bounded settings protect accidental extremes. User-selected round count is threaded into `DeepResearcher`; `max_rounds=0` means automatic mode capped by the research preset rather than unbounded research.
 - Deep extraction has separate timeout and concurrency controls.
 - Scheduled research currently uses its own fixed max-time behavior.
 - Probe failures are formatted before long jobs start.
