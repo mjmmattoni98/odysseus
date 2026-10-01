@@ -11,6 +11,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from src.model_context import get_context_length, estimate_tokens
+from src.context_budget import SMALL_CONTEXT_TIER_MAX
 from src.llm_core import llm_call_async
 from src.endpoint_resolver import resolve_endpoint
 from core.models import ChatMessage
@@ -39,7 +40,15 @@ def _content_as_text(content: Any) -> str:
 
 COMPACT_THRESHOLD = 0.85  # Trigger compaction at 85% of context window
 SUMMARY_MAX_TOKENS = 1024
-SMALL_CONTEXT_LIMIT = 8192  # Models with context <= this get aggressive trimming
+# Models with context <= this get aggressive trimming (fewer protected recent
+# messages). Same boundary as the agent's small-context tier.
+SMALL_CONTEXT_LIMIT = SMALL_CONTEXT_TIER_MAX
+PROTECT_RECENT_MESSAGES = 10
+SMALL_CONTEXT_PROTECT_RECENT_MESSAGES = 6
+CONSUMED_TOOL_RESULT_STUB = (
+    "[Earlier tool output omitted to fit the context window ({chars} chars). "
+    "It was already used above; run the tool again if it is needed.]"
+)
 
 # Cursor-style self-summarization prompt — produces structured, dense summaries
 SELF_SUMMARY_SYSTEM_PROMPT = """You are summarizing a conversation to preserve context after compaction. Produce a structured summary that lets the conversation continue seamlessly.
@@ -221,13 +230,86 @@ def _truncate_message_to_token_budget(msg: Dict[str, Any], token_budget: int) ->
     return _truncate_tool_call_args(out, token_budget)
 
 
-def trim_for_context(messages: List[Dict], context_length: int, reserve_tokens: int = 512) -> List[Dict]:
-    """Trim system messages to fit within context_length.
+def _is_tool_result_message(msg: Dict[str, Any]) -> bool:
+    """True for a tool output fed back to the model (native or textual)."""
+    role = msg.get("role")
+    if role == "tool":
+        return True
+    if role != "user":
+        return False
+    meta = msg.get("metadata")
+    if isinstance(meta, dict) and meta.get("source") == "tool execution results":
+        return True
+    content = msg.get("content")
+    return isinstance(content, str) and content.startswith("[Tool execution results]")
 
-    For small-context models, progressively strips:
-    1. RAG/memory system messages (keep preset system prompt)
-    2. Older conversation turns
-    Reserves space for the response.
+
+def _stub_consumed_tool_results(prefix: List[Dict], convo: List[Dict], budget: int) -> List[Dict]:
+    """Replace consumed tool outputs with a one-line stub, oldest first.
+
+    A tool result is consumed once an assistant message follows it: the model
+    already read it and acted on it. The newest batch (after the last assistant
+    turn) is never stubbed here, so the result the model is about to reason
+    over stays intact while stale ones make room. Stops as soon as the request
+    fits. ``tool_call_id``/metadata are preserved so pairing and the untrusted-
+    context gate are unaffected.
+    """
+    last_assistant = max(
+        (i for i, m in enumerate(convo) if m.get("role") == "assistant"),
+        default=-1,
+    )
+    candidates = [
+        i for i, m in enumerate(convo[:last_assistant]) if _is_tool_result_message(m)
+    ]
+    if not candidates:
+        return convo
+    out = list(convo)
+    used = estimate_tokens(prefix + out)
+    for i in candidates:
+        if used <= budget:
+            break
+        text = _content_as_text(out[i].get("content"))
+        stub = CONSUMED_TOOL_RESULT_STUB.format(chars=len(text))
+        if len(text) <= len(stub):
+            continue
+        stubbed = dict(out[i])
+        stubbed["content"] = stub
+        used -= estimate_tokens([out[i]]) - estimate_tokens([stubbed])
+        out[i] = stubbed
+    return out
+
+
+def _truncate_system_at_boundary(text: str, max_chars: int) -> str:
+    """Shorten a system prompt by dropping whole trailing sections.
+
+    Cuts at the last paragraph break (then line break, then word break) that
+    fits, so a tool instruction or rule is never left half-written.
+    """
+    notice = "\n[System prompt truncated for context limits]"
+    if len(text) <= max_chars:
+        return text
+    limit = max(0, max_chars - len(notice))
+    cut = -1
+    for sep in ("\n\n", "\n", " "):
+        cut = text.rfind(sep, 0, limit)
+        if cut > 0:
+            break
+    if cut <= 0:
+        cut = limit
+    return text[:cut].rstrip() + notice
+
+
+def trim_for_context(messages: List[Dict], context_length: int, reserve_tokens: int = 512) -> List[Dict]:
+    """Trim messages to fit within context_length.
+
+    Progressively, stopping as soon as the request fits:
+    1. Drop RAG/memory system messages (keep the preset/agent system prompt).
+    2. Stub tool outputs the model already consumed (oldest first).
+    3. Drop older conversation turns (always keeping the latest ones).
+    4. Shorten the system prompt at a section boundary.
+    5. Truncate the newest message itself.
+    Reserves ``reserve_tokens`` for the response (callers add the native tool
+    schema cost here, since schemas are sent alongside the messages).
     """
     budget = context_length - reserve_tokens
     used = estimate_tokens(messages)
@@ -278,28 +360,31 @@ def trim_for_context(messages: List[Dict], context_length: int, reserve_tokens: 
                 break
         return _sanitize_tool_messages(result + protected_msgs + convo_msgs)
 
-    # Still too big — truncate the first system message (but keep more than 500 chars)
-    if essential_system:
-        sys_text = essential_system[0].get("content", "")
-        if len(sys_text) > 2000:
-            truncated_system = dict(essential_system[0])
-            truncated_system["content"] = sys_text[:2000] + "\n[System prompt truncated for context limits]"
-            essential_system[0] = truncated_system
-            trimmed = essential_system + convo_msgs
-            if estimate_tokens(trimmed) <= budget:
-                return _sanitize_tool_messages(essential_system + protected_msgs + convo_msgs)
+    # Still too big — stub tool outputs the model already consumed. In an
+    # agent tool loop these dominate the context, and cutting the newest
+    # result (the one the model is about to use) while stale ones stay whole
+    # is the worst trade.
+    convo_msgs = _stub_consumed_tool_results(essential_system, convo_msgs, budget)
+    if estimate_tokens(essential_system + convo_msgs) <= budget:
+        return _sanitize_tool_messages(essential_system + protected_msgs + convo_msgs)
 
     # Still too big — drop older conversation turns BUT always keep the current
     # user turn. If a pasted message alone exceeds the model context, truncate
     # that message with a visible notice instead of dropping it; otherwise the
     # model appears to "ignore" large pastes because it never receives them.
-    # Hermes-style: recent context matters more than old context.
-    PROTECT_RECENT = 10
+    # Hermes-style: recent context matters more than old context. This runs
+    # before the system prompt is touched, so tool instructions and rules are
+    # never cut while older chatter could still go.
+    protect_recent = (
+        SMALL_CONTEXT_PROTECT_RECENT_MESSAGES
+        if context_length <= SMALL_CONTEXT_LIMIT
+        else PROTECT_RECENT_MESSAGES
+    )
     current_msg = convo_msgs[-1:] if convo_msgs else []
     prior_convo = convo_msgs[:-1] if convo_msgs else []
-    if len(prior_convo) >= PROTECT_RECENT:
-        old_msgs = prior_convo[:-(PROTECT_RECENT - 1)]
-        recent_msgs = prior_convo[-(PROTECT_RECENT - 1):] + current_msg
+    if len(prior_convo) >= protect_recent:
+        old_msgs = prior_convo[:-(protect_recent - 1)]
+        recent_msgs = prior_convo[-(protect_recent - 1):] + current_msg
         while old_msgs and estimate_tokens(essential_system + old_msgs + recent_msgs) > budget:
             old_msgs.pop(0)
         convo_msgs = old_msgs + recent_msgs
@@ -308,6 +393,18 @@ def trim_for_context(messages: List[Dict], context_length: int, reserve_tokens: 
         while prior_convo and estimate_tokens(essential_system + prior_convo + current_msg) > budget:
             prior_convo.pop(0)
         convo_msgs = prior_convo + current_msg
+
+    # Still too big — shorten the leading system prompt, dropping whole
+    # trailing sections rather than cutting mid-instruction.
+    if essential_system and estimate_tokens(essential_system + convo_msgs) > budget:
+        sys_text = essential_system[0].get("content", "")
+        if isinstance(sys_text, str) and len(sys_text) > 2000:
+            available = budget - estimate_tokens(essential_system[1:] + convo_msgs)
+            max_chars = max(2000, int(max(0, available - 8) / 0.3))
+            if len(sys_text) > max_chars:
+                truncated_system = dict(essential_system[0])
+                truncated_system["content"] = _truncate_system_at_boundary(sys_text, max_chars)
+                essential_system[0] = truncated_system
 
     # If the current message itself is too large, shrink only that message.
     if current_msg and estimate_tokens(essential_system + protected_msgs + convo_msgs) > budget:
@@ -330,13 +427,22 @@ async def maybe_compact(
     *,
     persist: bool = True,
     compaction_state: Optional[Dict[str, Any]] = None,
+    overhead_tokens: int = 0,
 ) -> tuple:
     """Check context usage and compact if above threshold.
+
+    ``overhead_tokens`` is request content the caller adds after this check
+    (the agent prompt and native tool schemas), so the decision reflects the
+    true request size instead of triggering late in agent mode.
 
     Returns (messages, context_length, was_compacted).
     """
     context_length = get_context_length(endpoint_url, model)
-    used = estimate_tokens(messages)
+    try:
+        overhead = max(0, int(overhead_tokens or 0))
+    except (TypeError, ValueError):
+        overhead = 0
+    used = estimate_tokens(messages) + overhead
     pct = (used / context_length) * 100 if context_length else 0
 
     if pct < COMPACT_THRESHOLD * 100:

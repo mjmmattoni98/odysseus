@@ -597,6 +597,101 @@ def _parse_raw_web_json_lookup(text: str) -> Optional[tuple[ToolBlock, tuple[int
     return None
 
 
+_BARE_JSON_CALL_ARG_KEYS = ("arguments", "parameters")
+
+
+def _bare_json_tool_call(value) -> Optional[ToolBlock]:
+    """Convert ``{"name": <tool>, "arguments"|"parameters": {...}}`` to a block.
+
+    Strict on purpose, so an ordinary JSON answer never executes: the object
+    has exactly a ``name`` and one argument key, the name is a registered tool
+    (exact TOOL_TAGS name, no generic aliases like "run" or "search"), and the
+    arguments are an object.
+    """
+    if not isinstance(value, dict) or set(value) - {"name", *_BARE_JSON_CALL_ARG_KEYS}:
+        return None
+    name = value.get("name")
+    arg_keys = [key for key in _BARE_JSON_CALL_ARG_KEYS if key in value]
+    if not isinstance(name, str) or len(arg_keys) != 1:
+        return None
+    name = name.strip()
+    args = value[arg_keys[0]]
+    if name not in TOOL_TAGS or not isinstance(args, dict):
+        return None
+    from src.tool_schemas import function_call_to_tool_block
+    return function_call_to_tool_block(name, json.dumps(args))
+
+
+def _strip_json_fence(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        first_newline = stripped.find("\n")
+        tag = stripped[3:first_newline if first_newline >= 0 else len(stripped)].strip().lower()
+        if first_newline >= 0 and tag in ("", "json") and stripped.endswith("```"):
+            return stripped[first_newline + 1:-3].strip()
+    return stripped
+
+
+def _iter_bare_json_tool_calls(text: str, whole_response_only: bool):
+    """Yield ``(block, (start, end))`` for bare JSON tool calls in ``text``.
+
+    ``whole_response_only`` (native-tool routes): accept only a response that
+    IS the call — the JSON object alone, optionally in a ```json fence, after
+    any <think> block. Text-mode routes accept the objects anywhere, like their
+    other textual tool formats.
+    """
+    if not isinstance(text, str) or '"name"' not in text:
+        return
+    decoder = json.JSONDecoder()
+    if whole_response_only:
+        head_end = text.rfind("</think>")
+        offset = head_end + len("</think>") if head_end >= 0 else 0
+        body = _strip_json_fence(text[offset:])
+        if not body.startswith("{"):
+            return
+        try:
+            parsed, end = decoder.raw_decode(body)
+        except json.JSONDecodeError:
+            return
+        if body[end:].strip():
+            return
+        block = _bare_json_tool_call(parsed)
+        if block:
+            # The whole remainder (fence included) is the call.
+            yield block, (offset, len(text))
+        return
+    pos = 0
+    while True:
+        start = text.find("{", pos)
+        if start < 0:
+            return
+        try:
+            parsed, rel_end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            pos = start + 1
+            continue
+        block = _bare_json_tool_call(parsed)
+        if block:
+            yield block, (start, start + rel_end)
+        # Skip the whole decoded value either way: an object nested inside
+        # other JSON (e.g. a pipeline step) is data, not a call.
+        pos = start + rel_end
+
+
+def _strip_bare_json_tool_calls(text: str, whole_response_only: bool) -> str:
+    spans = [span for _block, span in _iter_bare_json_tool_calls(text, whole_response_only)]
+    if not spans:
+        return text
+    pieces = []
+    pos = 0
+    for start, end in spans:
+        pieces.append(text[pos:start])
+        pos = end
+    pieces.append(text[pos:])
+    # Drop the ```json fence that wrapped a stripped call.
+    return re.sub(r"```(?:json)?\s*```", "", "".join(pieces))
+
+
 def _looks_like_openai_tool_call_blob(value) -> bool:
     """Return True for raw OpenAI-style tool-call JSON leaked as text."""
     if isinstance(value, list):
@@ -1291,7 +1386,9 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
     4. <tool_code> blocks (MiniMax-M2.5 style)
     5. StepFun Step-3 native <｜tool▁call▁begin｜> tokens
     6. DeepSeek DSML markup (normalized to <invoke> first)
-    7. Non-native local model fallback: prose mentioning web_search followed by
+    7. Bare {"name": <registered tool>, "arguments": {...}} JSON, unwrapped or
+       in a ```json fence (whole response only when `skip_fenced`)
+    8. Non-native local model fallback: prose mentioning web_search followed by
        bare JSON args, e.g. {"query":"...", "time_filter":"week"}
 
     `skip_fenced`: when True, Pattern 1 (fenced ```bash/```python/```json code
@@ -1460,6 +1557,14 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
         if block:
             blocks.append(block)
 
+    # Pattern 5: bare {"name": <tool>, "arguments": {...}} JSON (optionally in
+    # a ```json fence). Native routes accept it only when it is the whole
+    # response; text-mode routes accept it anywhere.
+    if not blocks:
+        blocks.extend(
+            block for block, _span in _iter_bare_json_tool_calls(text, whole_response_only=skip_fenced)
+        )
+
     # Pattern 6: local text-model web_search call leaked as prose + bare JSON.
     if not blocks and not skip_fenced:
         raw_web_json = _parse_raw_web_json_lookup(text)
@@ -1508,6 +1613,7 @@ def strip_tool_blocks(text: str, skip_fenced: bool = False) -> str:
     cleaned = _GEMMA_TOOL_CALL_RE.sub('', cleaned)
     cleaned = _strip_delimited(cleaned, _FUNCTION_MODEL_OPEN_RE, _FUNCTION_MODEL_CLOSE_RE)
     cleaned = _strip_raw_openai_tool_call_json(cleaned)
+    cleaned = _strip_bare_json_tool_calls(cleaned, whole_response_only=skip_fenced)
     cleaned = _QWEN_ROLE_MARKER_RE.sub('', cleaned)
     cleaned = _QWEN_BARE_MARKER_RE.sub(' ', cleaned)
     if not skip_fenced:

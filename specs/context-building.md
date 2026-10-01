@@ -83,6 +83,8 @@ Taint is server-owned continuation state, not a model instruction. After untrust
 
 Context budgeting uses known model context windows when available. `src.context_budget` treats the default 6000-token value as an automatic sentinel, scales to a capped fraction of known context length for non-explicit budgets, and leaves unknown windows on conservative defaults.
 
+Agent requests count the native tool payload: `estimate_tool_tokens()` (JSON chars × 0.3, same convention as `estimate_tokens`) is reserved out of each round's trim budget, and agent-side compaction is decided on the true request size (history + agent prompt + schemas). `trim_for_context` drops extra system messages, then stubs tool outputs the model already consumed (oldest first, one-line stub), then drops old turns, and only then shortens the system prompt at a section boundary; the newest message is truncated last. Known windows ≤ 16,384 tokens (`SMALL_CONTEXT_TIER_MAX`/`SMALL_CONTEXT_LIMIT`) form the small-context tier: fewer protected recent messages, each tool result fed back capped to ~15% of the window, and prefetched web-search context capped the same way.
+
 Side-effect enforcement lives outside context building. Chat route disabled-tool policy, `src.tool_security`, `src.tool_execution`, and `do_app_api()` block unsafe tool execution; prompt wording alone is not the authority.
 
 Guide-only/no-tools policy can suppress context acquisition before the model call. `src.tool_policy` feeds chat route preprocessing and agent-loop assembly so tool-backed search/research/memory/RAG/skills/local-context paths are skipped when the latest user turn explicitly forbids tools.

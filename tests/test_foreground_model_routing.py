@@ -3048,7 +3048,7 @@ def test_force_answer_recovery_persists_and_bills_pinned_fallback_route(
 
     async def fake_compact(
         session, url, model, messages, headers=None, owner=None,
-        *, persist=True, compaction_state=None,
+        *, persist=True, compaction_state=None, overhead_tokens=0,
     ):
         return (list(messages), 4096, False)
 
@@ -3396,9 +3396,10 @@ def test_agent_fallback_request_uses_candidate_context_budget(
         )
     )
 
+    # Each route's window is probed once per run (memoized), then reused by
+    # every trim of that route, including the pinned round-two request.
     assert [(url, model) for url, model, _fallback in context_lookups] == [
         (primary[0], primary[1]),
-        (backup[0], backup[1]),
         (backup[0], backup[1]),
     ]
     assert trim_budgets == [primary_context, backup_context, backup_context]
@@ -3434,7 +3435,7 @@ def test_agent_persists_only_answering_route_compaction(monkeypatch):
 
     async def fake_compact(
         session, url, model, messages, headers=None, owner=None,
-        *, persist=True, compaction_state=None,
+        *, persist=True, compaction_state=None, overhead_tokens=0,
     ):
         assert persist is False
         compaction_state.update({"route": model, "applied": False})
@@ -3489,7 +3490,7 @@ def test_agent_deferred_compaction_survives_duplicate_primary_fallback(monkeypat
 
     async def fake_compact(
         session, url, model, messages, headers=None, owner=None,
-        *, persist=True, compaction_state=None,
+        *, persist=True, compaction_state=None, overhead_tokens=0,
     ):
         assert persist is False
         compacted_routes.append((url, model))

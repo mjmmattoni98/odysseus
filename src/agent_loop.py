@@ -12,6 +12,7 @@ import json
 import re
 import math
 import time
+import threading
 import logging
 from typing import Any, AsyncGenerator, List, Dict, Optional, Set
 from urllib.parse import urlparse
@@ -310,124 +311,6 @@ def _load_mcp_disabled_map() -> Dict[str, set]:
 # System prompt that tells the LLM about available tools.
 # Always injected — the LLM decides whether to use them.
 _AGENT_PREAMBLE = """\
-You are an AI assistant with tool access. You can run shell commands, execute Python, search the web, \
-read/write files, create and edit documents, generate images, manage memories, and more. \
-To use a tool, write a fenced code block with the tool name as the language tag. \
-The block executes automatically and you see the output."""
-
-_AGENT_RULES = """\
-## Rules
-- Only use tools when needed. Don't search for things you already know.
-- For web lookup/search/latest/current requests, use `web_search` or `web_fetch`. Do NOT use `bash`, `python`, `curl`, `requests`, or scraping code for web lookup unless web tools are disabled or already failed.
-- If `web_search` is listed in this prompt, web search is available. Do NOT tell the user search/web tools are unavailable.
-- These exact tags execute automatically. For showing code examples, use ```shell, ```sh, ```py, etc. instead.
-- Multiple tool blocks per response OK. 60s timeout per tool, 10K char output limit.
-- Code/content >15 lines → ```create_document (NOT in chat). Short snippets OK in chat.
-- Long-form or structured writing is a document by default when the user asks to write/create/make/generate it and the answer would be more than a short paragraph. Use create_document instead of dumping the full content in chat.
-- Editing an existing document: ALWAYS use ```edit_document with FIND/REPLACE blocks. Do NOT rewrite the whole document with ```update_document unless genuinely changing more than half of it.
-- BIAS TOWARD ACTION on edit requests. If the user says "edit out X", "remove the Y paragraph", "change Z" — JUST DO IT with your best interpretation. Don't ask for clarification on minor ambiguity. The user can undo or re-prompt if wrong.
-- AFTER A TOOL SUCCEEDS, do not second-guess. The success message ("Document edited: v2, 1 edit") means it worked. Reply in ONE short sentence confirming what was done. No re-checking, no replaying the diff in your head, no validation theater.
-- AFTER A TOOL FAILS (timeout, error, "Unknown action", "not found"), DO NOT GO SILENT. The user expects a follow-up: either retry with a fix (e.g. correct args, longer-running form, run `tail -f /tmp/foo.log` to see progress, split into smaller steps), OR explicitly tell them "this didn't work, want me to try X instead?". A failed tool is not a stopping condition — only a successful one is.
-- YOU DECLARE WHEN THE JOB IS DONE — not a timer. Keep taking concrete steps while the task still needs them; you have plenty of rounds, so don't rush to quit just because you've made a few calls. There are exactly three ways to end a turn: (1) DONE — before you declare it, sanity-check that every concrete thing the user asked for actually exists or succeeded (file written, edit applied, command exited clean); then stop calling tools and write the final answer (that IS your "done" signal); (2) BLOCKED — you genuinely can't proceed (a capability is missing, permission denied, or data you can't obtain), so say plainly what's blocking you, in a sentence or two, and stop; (3) keep going with the single most useful next step. The only wrong moves are trailing off mid-task without one of these, and repeating a call you already ran.
-- Calendar: call `manage_calendar` with `action=list_calendars` FIRST before create/update/delete operations.
-- BULK email actions ("delete all those", "mark all as read", "archive these", "delete all spam", "mark these 19 read") → use the `bulk_email` tool ONCE with either the exact `uids` list from the latest `list_emails` result or `all_unread: true`. NEVER just say you deleted/archived/marked messages unless a delete/archive/mark/bulk email tool call succeeded. NEVER loop mark_email_read / archive_email / delete_email one message at a time — that floods the context and can blow the token budget. One bulk_email call handles the whole set.
-- Email UIDs are the values after `UID:` in tool output, not list row numbers. For example, row `1.` with `UID: 90186` must use `"90186"`, never `"1"`.
-- "Last/latest/newest email" means call `list_emails` with `max_results: 1`, `unread_only: false`, and the right `account`, then read the UID returned by that tool if full content is needed. NEVER use a table row number like "#18" as an email UID.
-- Plain "list/show/check my inbox/emails" means latest inbox mail, including read messages. Do not set `unread_only: true` unless the user explicitly asks for unread/needs attention.
-- Multiple email accounts: if tool output says "Other accounts" or the user asks "my Gmail?", "other inbox?", "work mail?", "custom domain mail?", or names any mailbox/account, DO NOT answer from memory. Call `list_email_accounts` if needed, then call `list_emails`/`read_email`/`bulk_email` with the exact `account` value for that mailbox. Account names are user-defined labels; if the user typo-matches a known account, use the closest listed account instead of claiming it does not exist. NEVER use `app_api` or `/api/email/accounts` to discover email accounts; that route is owner-filtered in tool context and can falsely return empty.
-- User identity facts/preferences ("my name is <name>", "I live in <place>", "I prefer concise replies", "call me <name>") → use `manage_memory` with action=add. NEVER use `manage_contact` for facts about the user unless the user explicitly says to create/update a contact and provides contact details such as an email or phone.
-- "Create/add/write a note" / "notes" / "todos" / "remind me to X at <time>" → use `manage_notes`. Do NOT store notes in `manage_memory`; memory is for persistent facts/preferences about the user, not note content. For reminders, include a `due_date`; for todos, use `note_type=checklist` when appropriate.
-- "Do X every morning / daily / on a schedule / automatically" (e.g. "summarize my inbox every morning") → this is a request to CREATE A SCHEDULED TASK, not to do X once right now. Call `manage_tasks` with action=create (prompt = what to do, schedule + cron/time). Do NOT just perform the action inline this turn — the user wants it to recur. After creating, return a clickable `[Task name](#task-<id>)` link and tell them it'll run on schedule and show in the Tasks panel. If you also want to show a sample of this run, do that AFTER creating the task, not instead of it.
-
-## UI conventions
-- When you reference an entity by ID in your reply, render it as a STANDARD markdown link with a hash-prefixed anchor. The frontend converts these into clickable jump buttons:
-  - Sessions / chats: `[Name](#session-<id>)`
-  - Documents: `[Title](#document-<id>)`
-  - Notes: `[Title](#note-<id>)`
-  - Gallery images: `[Caption](#image-<id>)`
-  - Emails (use the UID from list_emails/read_email output): `[Subject](#email-<uid>)`
-  - Calendar events (use the uid from manage_calendar): `[Summary](#event-<uid>)` — opens the calendar on that day
-  - Tasks: `[Task name](#task-<id>)`
-  - Skills: `[skill-name](#skill-<name>)`
-  - Research jobs: `[Topic](#research-<session_id>)`
-- The format is `[link text](#kind-<id>)` — text in square brackets, anchor in parens. NOT `[name] [#kind-id]` and NOT `[#kind-id]`. That's plain text and the user can't click it.
-- Use this inside lists, tables, prose — anywhere. Tables: `| Name | Open |` rows like `| Big Chat | [open](#session-abc123) |` work fine.
-- Examples:
-  - After `create_session` returns id `89effa28`: "Created [New Chat](#session-89effa28) — click to switch."
-  - Listing five sessions:
-    ```
-    1. [Big Chat](#session-abc123) — 2h ago
-    2. [Code Review](#session-def456) — 5h ago
-    3. [Note Taking](#session-ghi789) — 1d ago
-    ```
-"""
-
-_API_AGENT_RULES = """\
-## Rules
-- Prefer native tool/function calling when tools are needed.
-- Only call tools when they materially help answer the request.
-- You MUST use tools to take action — do not describe what you would do. Act, don't narrate.
-- For web lookup/search/latest/current requests, call `web_search` or `web_fetch`. Do NOT use shell, Python, curl, requests, or scraping code for web lookup unless web tools are unavailable or already failed.
-- If `web_search` is listed in this prompt, web search is available. Do NOT tell the user search/web tools are unavailable.
-- Keep answers concise unless the user asks for depth.
-- For long code or content, use document tools instead of pasting large blocks into chat.
-- Long-form or structured writing is a document by default when the user asks to write/create/make/generate it and the answer would be more than a short paragraph. Call create_document instead of dumping the full content in chat.
-- Editing an existing document: ALWAYS use `edit_document` with find/replace. Only use `update_document` for genuine full rewrites (>50% changed) — do NOT echo the entire file back for small edits.
-- If the active editor document is an email draft/compose window, treat that open email as the target for "write this", "write the email", "reply with...", "make it say...", "draft this", and similar requests. Do NOT create another document, search/list/manage documents, or open a different reply unless the user explicitly asks. Edit the open email draft with `edit_document` or `update_document`; preserve To/Cc/Bcc/Subject/In-Reply-To/References/X-* header lines unless the user asks to change them.
-- "Give suggestions / feedback / review / how can I improve this / what would make it better" about the OPEN document → call `suggest_document`, do NOT write a prose list of ideas in chat. It creates inline accept/reject bubbles on the doc. Give concrete `find`/`replace`/`reason` items. To suggest an ADDITION (e.g. "add a bow to the SVG", a new section), set `find` to a short existing anchor snippet and `replace` to that same snippet PLUS the new content. Only answer in prose when no document is open, or the request is purely conceptual with no concrete change to propose.
-- BIAS TOWARD ACTION on edit requests. If the user says "edit out X", "remove the Y paragraph", "change Z" — call the edit tool with your best interpretation. Don't ask for clarification on minor ambiguity. The user can undo.
-- AFTER A TOOL SUCCEEDS, do not second-guess. A success response means it worked. Reply in ONE short sentence confirming what was done. No verification thinking, no re-analyzing — move on.
-- AFTER A TOOL FAILS, DO NOT GO SILENT. The user expects a follow-up: retry with a fix, run a diagnostic (`tail`, `ls`, `which`), or explicitly tell them what didn't work and what you'll try next. Failure is not a stopping condition.
-- YOU DECLARE WHEN THE JOB IS DONE — not a timer. Keep taking concrete steps while the task still needs them; don't quit early just because you've made a few calls. Three ways to end a turn: (1) DONE — before declaring it, verify every concrete deliverable the user asked for actually exists or succeeded; then stop calling tools and write the final answer (that IS your "done" signal); (2) BLOCKED — you can't proceed (missing capability, permission denied, unobtainable data), so state plainly what's blocking you and stop; (3) keep going with the single most useful next step. Never trail off mid-task without (1) or (2), and never repeat a call you already ran.
-- Calendar: call `manage_calendar` with `action=list_calendars` FIRST before create/update/delete operations.
-- "Create/add/write a note" / "notes" / "todos" / "remind me to X at <time>" → use `manage_notes`. Do NOT store notes in `manage_memory`; memory is for persistent facts/preferences about the user, not note content. For reminders, include a `due_date`; for todos, use `note_type=checklist` when appropriate. `manage_tasks` is for RECURRING background AI jobs, NOT for one-off user reminders.
-- "Disable/turn off/enable/turn on <tool>" (shell, search, research, browser, documents, incognito, etc.) → call `ui_control` with `toggle <name> <on|off>`. Aliases accepted: shell→bash, search→web, deepresearch→research, documents→document_editor. NEVER record this as a memory — the user wants the toggle flipped, not a note about preferring it.
-- "Research X" / "do research on X" / "look into Y" / "deep dive on Z" → call `trigger_research` with `topic`. This starts a live job that appears in the Deep Research sidebar (streams progress + final report). **Do NOT use `web_search` for these** — saw the agent do a plain web_search for "do research on X" when the user wanted the deep-research job. "research X" is a deep-research request, not a quick lookup. (web_search is only for a single quick fact mid-task.) Do NOT POST /api/research/start via app_api either — blocked. After starting, tell the user it's running in the Deep Research sidebar. Only if the user explicitly wants it inline/quick should you fall back to web_search.
-- "Open/show <panel>" (documents, library, gallery, email, inbox, sessions, brain/memories, skills, settings, notes, cookbook) → call `ui_control` with `open_panel <name>`. Panel aliases: library/doc/docs/document→documents, images→gallery, mail/inbox/emails→email, chats/history→sessions, memory/memories→brain, preferences→settings, models/serve/serving→cookbook. CRITICAL: "open memory/memories/brain" / "open skills" / "open notes" / "open documents" / "open cookbook" means OPEN THE PANEL — call `ui_control`, NOT a manage/list tool. The "manage_*" tools list contents in chat; `ui_control open_panel` opens the visual modal the user is asking for.
-- "Write/draft a reply saying X" for an open/read email → call `ui_control` with `action="open_email_reply"`, the email `uid`/`folder`, `mode="reply"`, and `body` containing the drafted reply. This opens the same email compose document as clicking Reply and DOES NOT send. Do NOT call `reply_to_email` unless the user explicitly says to send immediately.
-- "Open/start a reply", "open a reply to <sender>", "draft a reply window" with no requested body → find/read the email if needed, then call `ui_control` with `open_email_reply <uid> <folder> reply`.
-- Bulk email actions ("delete all those", "archive these", "mark all read") require a real email tool call. Use `bulk_email` once with UIDs from the latest `list_emails` result and the same `account`; never claim success without the tool result.
-- Email UIDs are the values after `UID:` in tool output, not list row numbers. For example, row `1.` with `UID: 90186` must use `"90186"`, never `"1"`.
-- "Last/latest/newest email" means call `list_emails` with `max_results: 1`, `unread_only: false`, and the right `account`, then read the UID returned by that tool if full content is needed. NEVER use a table row number like "#18" as an email UID.
-- Plain "list/show/check my inbox/emails" means latest inbox mail, including read messages. Do not set `unread_only: true` unless the user explicitly asks for unread/needs attention.
-- Multiple email accounts: if tool output says "Other accounts" or the user asks "my Gmail?", "other inbox?", "work mail?", "custom domain mail?", or names any mailbox/account, DO NOT answer from memory or infer it is the same inbox. Call `list_email_accounts` if needed, then call `list_emails`/`read_email`/`bulk_email` with the exact `account` value for that mailbox. Account names are user-defined labels; if the user typo-matches a known account, use the closest listed account instead of claiming it does not exist. NEVER use `app_api` or `/api/email/accounts` to discover email accounts; that route is owner-filtered in tool context and can falsely return empty.
-- User identity facts/preferences ("my name is <name>", "I live in <place>", "I prefer concise replies", "call me <name>") → use `manage_memory` with action=add. NEVER use `manage_contact` for facts about the user unless the user explicitly says to create/update a contact and provides contact details such as an email or phone.
-- You are running INSIDE Odysseus — there is no OpenWebUI, ChatGPT, or external chat backend to query. All chats/sessions live in THIS app and are accessed via `list_sessions` (or `manage_session` with `action=list`), and deleted via `manage_session` with `action=delete`. Do NOT shell out to find sqlite files, curl localhost:8080, or grep for routers — those don't exist here. If `list_sessions` returns rows, that IS the source of truth.
-- After `list_sessions`, preserve the returned `[Chat title](#session-<id>)` links in your user-facing reply. Do not rewrite chat lists as plain tables with non-clickable titles.
-- "Cookbook" = the LLM-serving subsystem (NOT chat sessions, NOT a recipe app). Routing:
-  • "What's running" / "what's serving" / "show my cookbook" / "is anything up" → **first action MUST be `list_served_models` (no args)**. The tool is ALWAYS available. Do not run `ps aux`, do not `curl localhost:8000`, do not `which vllm`. Even if you don't remember seeing the tool listed, it IS available — call it. The output IS the source of truth (it tracks diffusion models, vLLM, SGLang, llama.cpp, Ollama, etc. — anything spawned via the cookbook, including remote hosts that `ps aux` here can't see).
-  • "What's downloading" / "show downloads" → `list_downloads` (always available).
-  • "What models do I have" → `list_cached_models` (always available).
-  • "Kill / stop / shut down" → `stop_served_model` (or `cancel_download`) with the session_id from the list.
-  • Searching for a model → `search_hf_models`.
-  • Downloading or serving a model → these run on a SERVER. If the user names one ("on gpu-box", "on the gpu box") pass `host=`. If they DON'T name one, the tool defaults to the cookbook's currently-selected server (NOT localhost). When there are multiple servers and it's genuinely ambiguous which they mean, call `list_cookbook_servers` and ask. Only download to localhost when the user explicitly says "locally" / "on this machine" (pass `local=true`).
-  • Image/inpainting/diffusion serve requests ("serve inpaint", "SDXL inpainting", "image model") → use `serve_model` with a built-in image command. Apple/MLX image repos use `python3 scripts/mlx_image_server.py --model <repo> --port 8100`; non-MLX Diffusers repos use `python3 scripts/diffusion_server.py --model <repo> --port 8100`. Do NOT use `mlx_lm.server` for image models, do NOT invent modules like `diffusers_api_server`, and do NOT use bash/ssh/pip directly. The Cookbook route copies the server script to remote hosts and registers the image endpoint.
-  • Launching a saved preset explicitly ("run my preset", "start the saved SD 3.5 preset", "use the existing preset") → `list_serve_presets`, then `serve_preset {name: "..."}`. Do NOT fabricate a tmux command — the user already saved working ones from the UI. Only fall back to raw `serve_model` if no preset matches and the autonomous launch tool is not appropriate.
-  • Launching a model the user names ("serve minimax m2.7 on gpu-box") with NO preset → `serve_model {repo_id, cmd, host}`. The cookbook route OWNS tmux session creation AND state-file registration AND UI live-refresh — bypassing it produces an orphan the UI can never see. After launching, call `list_served_models` to verify readiness. If it reports a diagnosis and suggested adjusted command, retry with `serve_model` using that command instead of asking the user to debug raw tmux logs.
-  • Adopting an already-running tmux session (someone or a prior bash launch started a server, but it's not in the cookbook) → `adopt_served_model {host, tmux_session, model, port}`. This registers it in cookbook_state.json AND adds it as a chat endpoint so the user can pick it in the model dropdown. Use this whenever you find a running server that the cookbook doesn't know about.
-  • After ANY successful serve (preset or raw or adopted), the cookbook's serve flow auto-adds the model as an endpoint. If for some reason it didn't (e.g. the launch was external), call `adopt_served_model` to fix both at once, or `manage_endpoints` with action=add to register the URL manually.
-  **Anti-pattern (CRITICAL — saw the agent do this and it produced an orphan session invisible to the UI):** `ssh <host> 'tmux new-session ... vllm serve ...'` via bash. THIS IS WRONG even when it "works". The launch must go through `serve_model` so the cookbook route creates the tmux session AND writes the task to cookbook_state.json. If the user asks for a launch and you reach for bash/ssh/tmux, STOP — call `serve_model` instead. Bash launches don't show up in the Cookbook UI, can't be `stop_served_model`'d, and don't survive a UI refresh.
-  Anti-pattern (DO NOT do this — saw it twice): "I don't see list_served_models in my tool list, let me try bash ps aux." → wrong. The tool IS available. Just call it.
-  Anti-pattern: POSTing to `/api/cookbook/state` via `app_api` — that overwrites the whole state file (presets and all). Blocked. Use serve_preset / serve_model / stop_served_model.
-
-## UI conventions
-- When referencing an entity by ID, render it as a STANDARD markdown link with a hash-prefixed anchor — the frontend renders these as clickable jump buttons:
-  - Sessions / chats: `[Name](#session-<id>)`
-  - Documents: `[Title](#document-<id>)`
-  - Notes: `[Title](#note-<id>)`
-  - Gallery images: `[Caption](#image-<id>)`
-  - Emails (use the UID from list_emails/read_email output): `[Subject](#email-<uid>)`
-  - Calendar events (use the uid from manage_calendar): `[Summary](#event-<uid>)` — opens the calendar on that day
-  - Tasks: `[Task name](#task-<id>)`
-  - Skills: `[skill-name](#skill-<name>)`
-  - Research jobs: `[Topic](#research-<session_id>)`
-- The format is `[link text](#kind-<id>)` — text in square brackets, anchor in parens. NOT `[name] [#kind-id]` and NOT `[#kind-id]`. That's plain text and the user can't click it.
-- Use this inside lists, tables, prose — anywhere. Tables: `| Big Chat | [open](#session-abc123) |` works.
-- Examples:
-  - After `create_session` returns id `89effa28`: "Created [New Chat](#session-89effa28) — click to switch."
-  - Listing sessions: "1. [Big Chat](#session-abc123) — 2h ago, 2. [Code Review](#session-def456) — 5h ago\""""
-
-_AGENT_PREAMBLE = """\
 You are an AI assistant with tool access. Only the tools listed below are available for this turn.
 To use a tool, write a fenced code block with the tool name as the language tag. The block executes automatically and you see the output."""
 
@@ -549,15 +432,48 @@ _WORKSPACE_TERMINUS_TOOLS = (
     | {"manage_skills", "ask_teacher", "web_search", "web_fetch", "ask_user", "update_plan"}
 )
 
-def _domain_rules_for_tools(tool_names: set) -> list[str]:
+# Backticked identifiers in rule text; only names that are disabled tools
+# matter, so ordinary backticked words never drop a line.
+_RULE_TOOL_NAME_RE = re.compile(r"`([a-z_][a-z0-9_]*)")
+
+
+def _drop_rules_for_disabled_tools(text: str, disabled_tools: Optional[Set[str]] = None) -> str:
+    """Remove rule bullets that point the model at a tool it cannot call.
+
+    Profiles such as Everyday disable write tools and memory; a rule saying
+    "use `manage_memory`" then only produces refused calls. A section left
+    with no bullets is dropped entirely.
+    """
+    disabled = set(disabled_tools or ())
+    if not disabled or not text:
+        return text
+    kept = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("- ") and any(
+            name in disabled for name in _RULE_TOOL_NAME_RE.findall(line)
+        ):
+            continue
+        kept.append(line)
+    if not any(line.lstrip().startswith("- ") for line in kept):
+        return ""
+    return "\n".join(kept)
+
+
+def _domain_rules_for_tools(
+    tool_names: set,
+    disabled_tools: Optional[Set[str]] = None,
+    *,
+    include_link_rules: bool = True,
+) -> list[str]:
     names = set(tool_names or set())
     rules = []
     for domain, domain_tools in _DOMAIN_TOOL_MAP.items():
         if names & domain_tools:
             rules.append(_DOMAIN_RULES[domain])
-    if names & {"create_session", "list_sessions", "manage_session", "manage_documents", "manage_notes", "manage_calendar", "manage_tasks", "manage_skills", "manage_research"}:
+    if include_link_rules and names & {"create_session", "list_sessions", "manage_session", "manage_documents", "manage_notes", "manage_calendar", "manage_tasks", "manage_skills", "manage_research"}:
         rules.append(_LINK_RULES)
-    return rules
+    filtered = [_drop_rules_for_disabled_tools(rule, disabled_tools) for rule in rules]
+    return [rule for rule in filtered if rule]
 
 # Each tool section is keyed by tool name(s) it covers.
 # Sections with multiple tools use a tuple key.
@@ -603,11 +519,17 @@ Use this instead of `bash`, `curl`, `python`, `requests`, or scraping code for w
 ```
 Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check example.com", "what does this page say <url>"). A bare domain like `example.com` works (defaults to https). Use this when you already have a concrete URL. For open-ended lookups use `web_search`, and for "research X" jobs use `trigger_research`.""",
 
+    "trigger_research": "- ```trigger_research``` — Start a DEEP RESEARCH job for \"research X\" / \"look into Y\" requests; it runs in the Deep Research sidebar and produces a report. Args (JSON): {\"topic\": \"...\"}.",
+
     "read_file": """\
 ```read_file
 <file path>
 ```
 Read a file and return its contents.""",
+
+    "grep": "- ```grep``` — Search file CONTENTS for a regex (ripgrep, respects .gitignore). Args (JSON): {\"pattern\": \"...\", \"path\": \"src\"?, \"glob\": \"*.py\"?, \"ignore_case\": false?}. Prefer over bash grep.",
+    "glob": "- ```glob``` — Find FILES by glob pattern, newest first. Args (JSON): {\"pattern\": \"**/*.py\", \"path\": \"...\"?}. Prefer over bash find.",
+    "ls": "- ```ls``` — List a directory (folders first, then files with sizes). Args (JSON): {\"path\": \"...\"?}. Prefer over bash ls.",
 
     "write_file": """\
 ```write_file
@@ -644,6 +566,8 @@ Maintain a structured task list for multi-step coding work. Use it when the task
 ```get_workspace
 ```
 Return the absolute path of the active workspace folder. File tools are CONFINED to it (paths can be RELATIVE to it); the shell starts there (cwd) but is NOT sandboxed. Call this first when the user says "the project"/"the code"/"this folder" without a path, instead of asking them. No arguments.""",
+
+    "manage_bg_jobs": "- ```manage_bg_jobs``` — Inspect or stop background bash jobs started with `#!bg`. Args (JSON): {\"action\": \"list|output|kill\", \"job_id\": \"...\"?}.",
 
     "create_document": """\
 ```create_document
@@ -690,6 +614,7 @@ Suggest changes with explanations (for review/feedback requests).""",
 ```
 Generate an image. Line 1 = description, line 2 = model name, line 3 = WxH (e.g. 1024x1024), line 4 = quality.""",
 
+    "edit_image": "- ```edit_image``` — Edit a gallery image. Args (JSON): {\"image_id\": \"...\", \"action\": \"upscale|rembg|inpaint|harmonize\", \"prompt\": \"...\"?, \"scale\": 2?}.",
     "chat_with_model": "- ```chat_with_model``` — Ask a DIFFERENT AI model and relay its answer. Line 1 = model name (or 'model@endpoint'), rest = your message. Use when the user says 'ask <model>', 'what does <model> think', or wants to compare/their answer from another model.",
     "ask_teacher": "- ```ask_teacher``` — Escalate a hard question to a more capable model. Line 1 = model name or 'auto', rest = the question. Use when stuck or need expert knowledge.",
     "list_models": "- ```list_models``` — Show all available AI models across all endpoints. Use when user asks what models are available.",
@@ -735,6 +660,8 @@ CRITICAL — signatures: DO NOT invent a sign-off name. End the body with just `
 {"action": "delete", "uids": ["10997", "10998"], "folder": "INBOX", "account": "Gmail"}
 ```
 Bulk delete/archive/mark emails. Use this for "delete all those" after listing emails. Pass the exact UIDs and the same account from the list result, then report only the tool result.""",
+    "scan_email_unsubscribes": "- ```scan_email_unsubscribes``` — Review-only scan of recent mail for newsletter/spam unsubscribe candidates. Args (JSON): {\"folder\": \"INBOX\"?, \"limit\": 25?, \"account\": \"...\"?}. Review candidates with the user before acting.",
+    "unsubscribe_email": "- ```unsubscribe_email``` — Execute one approved unsubscribe action by UID. Args (JSON): {\"uid\": \"...\", \"method_index\": 0?, \"folder\": \"INBOX\"?, \"account\": \"...\"?}.",
     "delete_email": "- ```delete_email``` — Delete one email by UID. Args (JSON): {\"uid\":\"...\", \"folder\":\"INBOX\", \"account\":\"Gmail\"}. For multiple messages use bulk_email.",
     "archive_email": "- ```archive_email``` — Archive one email by UID. Args (JSON): {\"uid\":\"...\", \"folder\":\"INBOX\", \"account\":\"Gmail\"}. For multiple messages use bulk_email.",
     "mark_email_read": "- ```mark_email_read``` — Mark one email read/unread. Args (JSON): {\"uid\":\"...\", \"read\":true, \"folder\":\"INBOX\", \"account\":\"Gmail\"}. For multiple messages use bulk_email.",
@@ -770,6 +697,11 @@ If the user asks for a reminder/alarm before the event, pass `reminder_minutes` 
     "cancel_download": "- ```cancel_download``` — Cancel an in-progress download. Args (JSON): {\"session_id\": \"<from list_downloads>\"}. Use for 'cancel the download' / 'kill the download'.",
     "search_hf_models": "- ```search_hf_models``` — Search HuggingFace for models. Args (JSON): {\"query\": \"qwen 8b\", \"limit\": 10?}. Use for 'find a model for X' / 'search huggingface' / 'what models are there for Y'.",
     "list_cached_models": "- ```list_cached_models``` — List models already on disk. Args (JSON, all optional): {\"host\": \"server-name or user@gpu-box\"?, \"model_dir\": \"/data/models,/extra\"?}. Friendly Cookbook server names work. Use for 'what models do I have' / 'show cached models' / 'is X downloaded'.",
+    "list_serve_presets": "- ```list_serve_presets``` — List saved Cookbook serve presets (launch templates). NO args. Check this before a raw serve_model when the user names a model to launch.",
+    "serve_preset": "- ```serve_preset``` — Launch a saved Cookbook preset. Args (JSON): {\"name\": \"<preset name>\"}.",
+    "adopt_served_model": "- ```adopt_served_model``` — Register an already-running tmux model server with the Cookbook and add it as a chat endpoint. Args (JSON): {\"tmux_session\": \"...\", \"model\": \"...\", \"host\": \"user@host\"?, \"port\": 8000?}.",
+    "list_cookbook_servers": "- ```list_cookbook_servers``` — List configured Cookbook servers and the default host. NO args. Use when the target machine for a download/serve is unclear.",
+    "api_call": "- ```api_call``` — Call a configured service integration (Home Assistant, Miniflux, Gitea, ...). Args (JSON): {\"integration\": \"Miniflux\", \"method\": \"GET\", \"path\": \"/v1/entries?status=unread\", \"body\": {...}?}.",
     "app_api": """\
 ```app_api
 {"action": "call", "method": "GET", "path": "/api/cookbook/gpus"}
@@ -823,49 +755,111 @@ def _section_text(name: str, default: str) -> str:
     return val if isinstance(val, str) and val.strip() else default
 
 
+_SLIM_TOOL_LINE_CHARS = 320
+
+
 def _compact_tool_line(name: str, section: str) -> str:
-    """One-line fenced-tool usage hint for compact/local prompts."""
+    """One-line fenced-tool usage hint for slim/local prompts.
+
+    Keeps the first example's block body (the argument format; the preamble
+    shows the full fence shape) plus the first sentence of the prose.
+    """
     text = (section or "").strip()
     if not text:
         return f"- `{name}`"
     if text.startswith("- "):
-        return text
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    usage = []
+        if len(text) <= _SLIM_TOOL_LINE_CHARS:
+            return text
+        cut = text[:_SLIM_TOOL_LINE_CHARS].rsplit(" ", 1)[0]
+        return cut.rstrip(" ,;:") + " ..."
+    body = []
+    prose = ""
     in_fence = False
-    for ln in lines:
-        if ln.startswith("```"):
-            usage.append(ln)
-            in_fence = not in_fence
-            if len(usage) >= 3:
-                break
+    fences_seen = 0
+    for ln in (line.strip() for line in text.splitlines()):
+        if not ln:
             continue
-        if in_fence and len(usage) < 3:
-            usage.append(ln)
-    if usage:
-        return f"- `{name}` — " + " ".join(usage)
-    return f"- `{name}` — " + lines[0][:160]
+        if ln.startswith("```"):
+            in_fence = not in_fence
+            fences_seen += 1
+            continue
+        if in_fence:
+            if fences_seen == 1 and len(body) < 5:
+                body.append(ln)
+        elif not prose and not ln.endswith(":"):
+            prose = re.split(r"(?<=[.!?])\s", ln, maxsplit=1)[0][:200]
+    parts = [f"- `{name}`"]
+    if body:
+        parts.append("block body: " + " / ".join(body))
+    if prose:
+        parts.append(prose)
+    return " — ".join(parts)
 
 
-def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool = False) -> str:
-    """Build the system prompt with only the specified tools included."""
+_NATIVE_TOOL_PREAMBLE = (
+    "You are an AI assistant with native tool/function calling. "
+    "Only the tool schemas provided by the API are available for this turn. "
+    "Use native tool calls when action is needed; do not write tool syntax or tool instructions in chat."
+)
+
+_SLIM_FENCED_PREAMBLE = """\
+You are an AI assistant with tool access. Only the tools listed below are available for this turn.
+To use a tool, write a fenced code block with the tool name as the language tag and the arguments on the next lines, e.g.
+```web_search
+latest news about X
+```
+For tools that take JSON args, put one JSON object inside the block. The block executes automatically and you see the output."""
+
+
+def _assemble_prompt(
+    tool_names: set,
+    disabled_tools: set = None,
+    compact: bool = False,
+    *,
+    slim: bool = False,
+    tool_order: Optional[List[str]] = None,
+    include_link_rules: bool = True,
+) -> str:
+    """Build the system prompt with only the specified tools included.
+
+    ``compact``: native tool-calling routes — list the tools, no syntax.
+    ``slim``: text-mode local routes — one fenced usage line per tool.
+    Otherwise the full fenced tool sections are included.
+    ``tool_order``: the exact tool list sent this turn (payload order); the
+    "Available tools" list is rebuilt from it so it never names a tool whose
+    schema was capped away.
+    """
     disabled = disabled_tools or set()
-    included = tool_names - disabled
+    included = set(tool_names) - disabled
+    if tool_order is not None:
+        ordered = [name for name in tool_order if name in included and not name.startswith("mcp__")]
+    else:
+        ordered = [name for name in TOOL_SECTIONS if name in included]
+    base_rules_disabled = disabled | (set(TOOL_SECTIONS) - included if tool_order is not None else set())
 
     if compact:
-        tool_lines = []
-        for name, _default_section in TOOL_SECTIONS.items():
-            if name in included:
-                tool_lines.append(f"- `{name}`")
+        tool_lines = [f"- `{name}`" for name in ordered]
         parts = [
-            "You are an AI assistant with native tool/function calling. "
-            "Only the tool schemas provided by the API are available for this turn. "
-            "Use native tool calls when action is needed; do not write tool syntax or tool instructions in chat.",
+            _NATIVE_TOOL_PREAMBLE,
             "## Available tools\n" + ("\n".join(tool_lines) if tool_lines else "none"),
-            _API_AGENT_RULES,
+            _drop_rules_for_disabled_tools(_API_AGENT_RULES, base_rules_disabled),
         ]
-        parts.extend(_domain_rules_for_tools(included))
-        return "\n\n".join(parts)
+        parts.extend(_domain_rules_for_tools(included, disabled, include_link_rules=include_link_rules))
+        return "\n\n".join(part for part in parts if part)
+
+    if slim:
+        tool_lines = [
+            _compact_tool_line(name, _section_text(name, TOOL_SECTIONS[name]))
+            for name in ordered
+            if name in TOOL_SECTIONS
+        ]
+        parts = [
+            _SLIM_FENCED_PREAMBLE,
+            "## Available tools\n" + ("\n".join(tool_lines) if tool_lines else "none"),
+            _drop_rules_for_disabled_tools(_AGENT_RULES, base_rules_disabled),
+        ]
+        parts.extend(_domain_rules_for_tools(included, disabled, include_link_rules=include_link_rules))
+        return "\n\n".join(part for part in parts if part)
 
     parts = [_AGENT_PREAMBLE]
 
@@ -890,9 +884,9 @@ def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool 
     if one_liners:
         parts.append("## Additional tools\n" + "\n".join(one_liners))
 
-    parts.append(_AGENT_RULES)
-    parts.extend(_domain_rules_for_tools(included))
-    return "\n\n".join(parts)
+    parts.append(_drop_rules_for_disabled_tools(_AGENT_RULES, disabled))
+    parts.extend(_domain_rules_for_tools(included, disabled, include_link_rules=include_link_rules))
+    return "\n\n".join(part for part in parts if part)
 
 
 # Legacy: full prompt with all tools (fallback when RAG unavailable)
@@ -1101,6 +1095,15 @@ _ADMIN_KEYWORDS = [
     "note", "notes", "todo", "todos", "reminder", "reminders",
 ]
 
+# Whole words (plus a plural "s"), not substrings: "doc", "note", "chat",
+# "task", "token", "server" and "manage" used to fire inside "docker",
+# "notebook", "chatgpt", "multitask", "tokenizer", "observer", "management"
+# and drag ~3.5K tokens of admin schemas into unrelated turns.
+_ADMIN_KEYWORD_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(kw) for kw in sorted(_ADMIN_KEYWORDS, key=len, reverse=True)) + r")s?\b"
+)
+
+
 def _detect_admin_intent(messages: List[Dict]) -> bool:
     """Check if the last user message suggests admin/management tool usage."""
     for msg in reversed(messages):
@@ -1108,8 +1111,7 @@ def _detect_admin_intent(messages: List[Dict]) -> bool:
             content = msg.get("content", "")
             if isinstance(content, list):
                 content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
-            content_lower = content.lower()
-            return any(kw in content_lower for kw in _ADMIN_KEYWORDS)
+            return bool(_ADMIN_KEYWORD_RE.search(str(content or "").lower()))
     return False
 
 
@@ -2254,8 +2256,17 @@ def _build_system_prompt(
     suppress_skills: bool = False,
     active_email: Optional[Dict[str, str]] = None,
     workspace: Optional[str] = None,
+    slim: bool = False,
+    tool_order: Optional[List[str]] = None,
+    small_context: bool = False,
 ) -> List[Dict]:
-    """Build agent system prompt, inject MCP/document context, merge consecutive system msgs."""
+    """Build agent system prompt, inject MCP/document context, merge consecutive system msgs.
+
+    ``tool_order`` is the planned tool list for this route (see
+    ``_plan_tool_schemas``); when given, the prompt lists exactly those tools.
+    ``slim`` selects the one-line fenced prompt for text-mode local routes and
+    ``small_context`` drops optional rule packs for small windows.
+    """
     global _cached_base_prompt, _cached_base_prompt_key
     if suppress_local_context:
         active_document = None
@@ -2270,7 +2281,8 @@ def _build_system_prompt(
         _ov_sig = _hl.sha256(_json.dumps(get_builtin_overrides() or {}, sort_keys=True).encode()).hexdigest()
     except Exception:
         _ov_sig = ""
-    cache_key = (frozenset(disabled_tools or []), bool(mcp_mgr), needs_admin, _rt_key, compact, _ov_sig, owner, suppress_local_context, suppress_skills)
+    _order_key = tuple(tool_order) if tool_order is not None else None
+    cache_key = (frozenset(disabled_tools or []), bool(mcp_mgr), needs_admin, _rt_key, compact, _ov_sig, owner, suppress_local_context, suppress_skills, slim, _order_key, small_context)
     if _cached_base_prompt and _cached_base_prompt_key == cache_key and not active_document:
         agent_prompt = _cached_base_prompt
         # Skill index is user-editable (name + description), so it must never
@@ -2281,6 +2293,7 @@ def _build_system_prompt(
             mcp_disabled_map=mcp_disabled_map, compact=compact, owner=owner,
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
+            **_prompt_shape_kwargs(slim, tool_order, small_context),
         )
     else:
         agent_prompt, _skill_index_block = _build_base_prompt(
@@ -2293,6 +2306,7 @@ def _build_system_prompt(
             owner=owner,
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
+            **_prompt_shape_kwargs(slim, tool_order, small_context),
         )
         if not active_document:
             _cached_base_prompt = agent_prompt
@@ -2615,7 +2629,10 @@ def _build_system_prompt(
     elif (
         relevant_tools
         and not suppress_local_context
-        and (set(relevant_tools) & _WORKSPACE_TERMINUS_TOOLS)
+        # Only turns that can touch the machine (file/shell tools selected).
+        # The Terminus set also contains always-on tools (ask_user, web
+        # search), so a plain intersection appended these rules to every turn.
+        and (set(relevant_tools) & _DOMAIN_TOOL_MAP["files"])
     ):
         agent_prompt += _local_computer_rules()
 
@@ -2867,6 +2884,18 @@ _ADMIN_TOOLS = {
     "send_to_session", "pipeline", "ask_teacher", "list_models",
 }
 
+def _prompt_shape_kwargs(slim: bool, tool_order, small_context: bool) -> dict:
+    """Only pass the new prompt-shape options when set (keeps legacy call shapes)."""
+    kwargs = {}
+    if slim:
+        kwargs["slim"] = True
+    if tool_order is not None:
+        kwargs["tool_order"] = list(tool_order)
+    if small_context:
+        kwargs["small_context"] = True
+    return kwargs
+
+
 def _build_base_prompt(
     disabled_tools,
     mcp_mgr,
@@ -2877,6 +2906,9 @@ def _build_base_prompt(
     owner: Optional[str] = None,
     suppress_local_context: bool = False,
     suppress_skills: bool = False,
+    slim: bool = False,
+    tool_order: Optional[List[str]] = None,
+    small_context: bool = False,
 ):
     """Build the agent prompt with only relevant tools included.
 
@@ -2897,10 +2929,22 @@ def _build_base_prompt(
         # ALWAYS_AVAILABLE back in here used to silently undo those
         # drops. Only force-include the irreducible loop primitives
         # (ask_user, update_plan) as belt-and-suspenders.
-        tool_names = set(relevant_tools) | {"ask_user", "update_plan"}
-        if needs_admin:
-            tool_names |= _ADMIN_TOOLS
-        agent_prompt = _assemble_prompt(tool_names, disabled, compact=compact)
+        if tool_order is not None:
+            # Planned route: the prompt lists exactly the tools sent this turn
+            # (admin/loop primitives were already ranked into the plan).
+            tool_names = set(tool_order)
+        else:
+            tool_names = set(relevant_tools) | {"ask_user", "update_plan"}
+            if needs_admin:
+                tool_names |= _ADMIN_TOOLS
+        agent_prompt = _assemble_prompt(
+            tool_names,
+            disabled,
+            compact=compact,
+            slim=slim and not compact,
+            tool_order=tool_order,
+            include_link_rules=not small_context,
+        )
     else:
         # Fallback: full prompt (RAG unavailable)
         agent_prompt = AGENT_SYSTEM_PROMPT
@@ -3487,25 +3531,205 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
-_OLLAMA_NATIVE_TOOL_SCHEMA_LIMIT = 24
+# ── Tool payload planning for local routes ──
+# Local routes (Ollama, llama.cpp, LM Studio, vLLM on a private address) render
+# every schema into the prompt prefix. The payload is capped by TOKENS (a share
+# of the model window, see src.context_budget.tool_schema_token_budget), with a
+# count ceiling as a safety net, and kept stable across turns so the KV prefix
+# cache survives. Cloud routes are not capped.
+_LOCAL_TOOL_SCHEMA_COUNT_CEILING = 24
+_SMALL_CONTEXT_TOOL_COUNT_CEILING = 6
+_SMALL_CONTEXT_RETRIEVAL_K = 4
+_SMALL_CONTEXT_RETRIEVAL_MIN_SCORE = 0.3
+# Follow-up turns of a sticky conversation only add similarity-retrieved tools
+# above this score; explicit intent (keywords, domains, forced tools) always adds.
+_STICKY_RETRIEVAL_MIN_SCORE = 0.4
+
+# Priority tiers for the cap (lower = kept first).
+_TOOL_RANK_PINNED = 0      # always-on loop primitives and per-request forced tools
+_TOOL_RANK_CORE = 1        # core tools of this turn's classified domains
+_TOOL_RANK_INTENT = 2      # other explicit intent (keywords, documents, uploads, skills)
+_TOOL_RANK_STICKY = 3      # carried over from earlier turns of the conversation
+_TOOL_RANK_RETRIEVED = 4   # similarity retrieval only
+_TOOL_RANK_DEFAULT = 5     # admin expansion and everything else
+
+# The few tools of each domain that cover most requests. Small-context models
+# get only these instead of the whole domain pack; every route ranks them
+# ahead of the rest of the pack when the payload is capped.
+_DOMAIN_CORE_TOOLS = {
+    "web": ("web_search", "web_fetch"),
+    "documents": ("create_document", "edit_document"),
+    "email": ("list_emails", "read_email", "send_email"),
+    "cookbook": ("list_served_models",),
+    "notes_calendar_tasks": ("manage_notes", "manage_calendar"),
+    "ui": ("ui_control",),
+    "sessions": ("list_sessions", "manage_session"),
+    "files": ("read_file", "ls", "grep"),
+    "settings": ("manage_settings",),
+    "contacts": ("resolve_contact",),
+    "integrations": ("api_call",),
+}
 
 
-def _cap_ollama_tool_schemas(schemas, relevant_tools=None):
-    """Trim the native schema set for Ollama routes.
+def _schema_name(schema) -> str:
+    if not isinstance(schema, dict):
+        return ""
+    fn = schema.get("function")
+    if isinstance(fn, dict) and fn.get("name"):
+        return str(fn["name"])
+    return str(schema.get("name") or "")
 
-    Ollama renders every schema into the model context, and small/local models
-    degrade — or stall after a token — when handed the full catalog. Keep the
-    curated head of the list plus anything explicitly relevant; cloud routes
-    are never capped.
+
+def _plan_tool_schemas(
+    schemas,
+    *,
+    ranks: Optional[Dict[str, float]] = None,
+    established_order=(),
+    token_budget: Optional[int] = None,
+    max_count: Optional[int] = None,
+    transform=None,
+) -> List[Dict]:
+    """Deterministically cap and order a native tool payload.
+
+    Tools are admitted in (rank, canonical position) order while they fit
+    ``token_budget`` and ``max_count``; rank-0 (pinned) tools are always kept.
+    The kept tools are emitted with ``established_order`` names first, in that
+    order, then the rest in canonical order — so an unchanged selection yields
+    a byte-identical payload and a newly needed tool is appended instead of
+    reshuffling the prefix. ``transform`` (e.g. short small-context schemas) is
+    applied before costing.
     """
-    if not schemas or len(schemas) <= _OLLAMA_NATIVE_TOOL_SCHEMA_LIMIT:
-        return schemas
-    relevant = {str(name) for name in (relevant_tools or ())}
-    if relevant:
-        keep = [s for s in schemas if s.get("function", {}).get("name") in relevant]
-        rest = [s for s in schemas if s.get("function", {}).get("name") not in relevant]
-        schemas = keep + rest
-    return schemas[:_OLLAMA_NATIVE_TOOL_SCHEMA_LIMIT]
+    from src.context_budget import estimate_tool_tokens
+
+    ranks = ranks or {}
+    items = []
+    seen = set()
+    for schema in schemas or ():
+        name = _schema_name(schema)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        items.append((name, transform(schema) if transform else schema))
+    position = {name: index for index, (name, _schema) in enumerate(items)}
+    by_priority = sorted(
+        items,
+        key=lambda item: (ranks.get(item[0], _TOOL_RANK_DEFAULT), position[item[0]]),
+    )
+    kept: Dict[str, Dict] = {}
+    used = 0
+    for name, schema in by_priority:
+        cost = estimate_tool_tokens([schema])
+        if ranks.get(name, _TOOL_RANK_DEFAULT) != _TOOL_RANK_PINNED:
+            if max_count is not None and len(kept) >= max_count:
+                continue
+            if token_budget is not None and used + cost > token_budget:
+                continue
+        kept[name] = schema
+        used += cost
+    established = []
+    for name in established_order or ():
+        if name in kept and name not in established:
+            established.append(name)
+    rest = [name for name, _schema in items if name in kept and name not in established]
+    return [kept[name] for name in established + rest]
+
+
+class _StickyToolSets:
+    """Bounded in-memory LRU of the last tool list sent per conversation route."""
+
+    def __init__(self, max_entries: int = 256):
+        self._max_entries = max_entries
+        self._entries: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key) -> Optional[tuple]:
+        if key is None:
+            return None
+        with self._lock:
+            names = self._entries.get(key)
+            if names is not None:
+                self._entries.move_to_end(key)
+            return names
+
+    def put(self, key, names) -> None:
+        if key is None:
+            return
+        with self._lock:
+            self._entries[key] = tuple(names)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_sticky_tool_sets = _StickyToolSets()
+
+
+def _sticky_tool_key(owner, session_id, endpoint_url, model, profile, plan_mode) -> Optional[tuple]:
+    """Key for the per-conversation tool list; None without a session id."""
+    if not session_id:
+        return None
+    return (
+        str(owner or ""),
+        str(session_id),
+        str(endpoint_url or "").rstrip("/"),
+        str(model or ""),
+        str(profile or ""),
+        bool(plan_mode),
+    )
+
+
+def _is_local_tool_route(endpoint_url: str) -> bool:
+    """Routes whose tool payload is capped and kept sticky."""
+    url = endpoint_url or ""
+    if _is_ollama_native_url(url) or _is_ollama_openai_compat_url(url):
+        return True
+    try:
+        from src.model_context import is_local_endpoint
+
+        return bool(is_local_endpoint(url))
+    except Exception:
+        return False
+
+
+def _cap_presearch_context(messages: List[Dict], max_chars: Optional[int]) -> List[Dict]:
+    """Shrink prefetched web-search context to a small model's output cap."""
+    if not max_chars:
+        return messages
+    out = []
+    for message in messages:
+        meta = message.get("metadata") if isinstance(message, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if (
+            isinstance(meta, dict)
+            and meta.get("source") in {"web search results", "prefetched search context"}
+            and isinstance(content, str)
+            and len(content) > max_chars
+        ):
+            message = dict(message)
+            message["content"] = (
+                content[:max_chars].rstrip()
+                + "\n... [search context truncated to fit the model context]"
+            )
+        out.append(message)
+    return out
+
+
+def _rejected_tool_call_results(rejected, available_names) -> List[str]:
+    """Tool-result texts telling the model why its native calls did not run."""
+    offered = ", ".join(name for name in (available_names or []) if name) or "none"
+    texts = []
+    for tc, reason in rejected:
+        name = str(tc.get("name") or "").strip() or "(no name)"
+        texts.append(
+            f"### {name}: NOT EXECUTED\n**Error:** {reason}\n"
+            f"Available tools this turn: {offered}. Retry with one of them and "
+            "arguments as a JSON object matching its schema, or answer without a tool."
+        )
+    return texts
 
 
 async def stream_agent_loop(
@@ -3963,12 +4187,73 @@ async def stream_agent_loop(
         disabled_tools.update(_mcp_block_q)
     prep_timings["request_setup"] = time.time() - _t0
 
+    # Per-run route facts, memoized: context-window probes and local-endpoint
+    # checks hit the network/DB, and they cannot change within one run.
+    _route_windows: Dict[tuple, int] = {}
+    _route_local: Dict[str, bool] = {}
+
+    def _route_context_window(candidate_url, candidate_model) -> int:
+        key = (candidate_url, candidate_model)
+        if key not in _route_windows:
+            try:
+                from src.model_context import budget_context_for_model
+
+                _route_windows[key] = int(budget_context_for_model(
+                    candidate_url,
+                    candidate_model,
+                    fallback=context_length,
+                ) or 0)
+            except Exception:
+                _route_windows[key] = int(context_length or 0)
+        return _route_windows[key]
+
+    def _route_is_local(candidate_url) -> bool:
+        if candidate_url not in _route_local:
+            _route_local[candidate_url] = _is_local_tool_route(candidate_url)
+        return _route_local[candidate_url]
+
+    from src.context_budget import (
+        estimate_tool_tokens,
+        is_small_context_window,
+        tool_output_char_cap,
+        tool_schema_token_budget,
+    )
+
+    _primary_context_window = _route_context_window(endpoint_url, model)
+    # Small-context tier (known window <= 16K): fewer retrieved tools, core
+    # domain tools only, no admin expansion, short schemas, scaled outputs.
+    _small_context_tier = is_small_context_window(_primary_context_window)
+    _tool_output_cap = tool_output_char_cap(_primary_context_window)
+    if _small_context_tier:
+        _needs_admin = False
+        logger.info("[tool-rag] small-context tier (window=%s)", _primary_context_window)
+    try:
+        _assistant_profile = current_preferences().profile
+    except Exception:
+        _assistant_profile = ""
+
+    def _route_sticky_key(candidate_url, candidate_model):
+        if not _route_is_local(candidate_url):
+            return None
+        return _sticky_tool_key(
+            owner, session_id, candidate_url, candidate_model, _assistant_profile, plan_mode,
+        )
+
+    _primary_sticky_prev = _sticky_tool_sets.get(_route_sticky_key(endpoint_url, model))
+    # name -> priority tier for the local-route cap (see _plan_tool_schemas).
+    _tool_ranks: Dict[str, float] = {}
+
+    def _rank_tools(names, tier):
+        for name in names or ():
+            _tool_ranks[name] = min(_tool_ranks.get(name, _TOOL_RANK_DEFAULT), tier)
+
     # RAG-based tool selection: retrieve relevant tools for this query.
     # If caller provided a pre-computed set (e.g. task_scheduler), use that.
     _relevant_tools = relevant_tools
     _t1 = time.time()
     if _relevant_tools:
         logger.info(f"[tool-rag] Using caller-provided relevant_tools ({len(_relevant_tools)} tools)")
+        _rank_tools(_relevant_tools, _TOOL_RANK_INTENT)
     if not guide_only and not _relevant_tools and _low_signal_turn:
         from src.tool_index import ALWAYS_AVAILABLE
         if workspace:
@@ -4014,12 +4299,37 @@ async def stream_agent_loop(
                             _TOOL_SELECTION_TIMEOUT_SECONDS,
                         )
                 if _retrieval_query:
+                    _retrieval_k = _SMALL_CONTEXT_RETRIEVAL_K if _small_context_tier else 8
+                    _retrieval_min_score = None
+                    if _small_context_tier:
+                        _retrieval_min_score = _SMALL_CONTEXT_RETRIEVAL_MIN_SCORE
+                    if _primary_sticky_prev:
+                        _retrieval_min_score = max(
+                            _retrieval_min_score or 0.0, _STICKY_RETRIEVAL_MIN_SCORE,
+                        )
+                    _retrieval_call = (
+                        (lambda: tool_idx.get_tools_for_query(_retrieval_query, _retrieval_k))
+                        if _retrieval_min_score is None
+                        else (lambda: tool_idx.get_tools_for_query(
+                            _retrieval_query, _retrieval_k, min_score=_retrieval_min_score,
+                        ))
+                    )
                     try:
                         _relevant_tools = await asyncio.wait_for(
-                            asyncio.to_thread(tool_idx.get_tools_for_query, _retrieval_query, 8),
+                            asyncio.to_thread(_retrieval_call),
                             timeout=_TOOL_SELECTION_TIMEOUT_SECONDS,
                         )
                         logger.info(f"[tool-rag] Retrieved tools for query: {sorted(_relevant_tools - ALWAYS_AVAILABLE)}")
+                        _rank_tools(_relevant_tools, _TOOL_RANK_RETRIEVED)
+                        try:
+                            from src.tool_index import ToolIndex as _TI
+
+                            _rank_tools(
+                                _TI.keyword_tools_for_query(_retrieval_query) & _relevant_tools,
+                                _TOOL_RANK_INTENT,
+                            )
+                        except Exception:
+                            pass
                     except asyncio.TimeoutError:
                         # Leave _relevant_tools unset so the keyword fallback
                         # below still runs. Hard-coding ALWAYS_AVAILABLE here
@@ -4041,10 +4351,11 @@ async def stream_agent_loop(
     if not guide_only and not _relevant_tools and _retrieval_query:
         from src.tool_index import ALWAYS_AVAILABLE, ToolIndex
         _relevant_tools = set(ALWAYS_AVAILABLE)
-        ql = _retrieval_query.lower()
-        for keywords, tools in ToolIndex._KEYWORD_HINTS.items():
-            if any(kw in ql for kw in keywords):
-                _relevant_tools.update(tools)
+        # Same whole-word matching as retrieval-time hints: substring matches
+        # ("fix" in "prefix", "serve" in "observe") dragged in whole packs.
+        _keyword_tools = ToolIndex.keyword_tools_for_query(_retrieval_query)
+        _relevant_tools.update(_keyword_tools)
+        _rank_tools(_keyword_tools, _TOOL_RANK_INTENT)
         logger.info(f"[tool-rag] Keyword fallback selected: {sorted(_relevant_tools - ALWAYS_AVAILABLE)}")
 
     # If deterministic domain detection fired, seed the corresponding domain
@@ -4055,19 +4366,34 @@ async def stream_agent_loop(
     # times out.
     if not guide_only and _relevant_tools is not None:
         for _domain in (_intent.get("domains") or set()):
-            _relevant_tools.update(_DOMAIN_TOOL_MAP.get(str(_domain), set()))
-        if "cookbook" in (_intent.get("domains") or set()):
-            _relevant_tools.update({
+            _core = set(_DOMAIN_CORE_TOOLS.get(str(_domain), ()))
+            # The domain's lead tool outranks its other core tools, so a tight
+            # budget keeps manage_notes over manage_calendar for a notes turn.
+            for _core_index, _core_name in enumerate(_DOMAIN_CORE_TOOLS.get(str(_domain), ())):
+                _rank_tools({_core_name}, _TOOL_RANK_CORE + _core_index / 10)
+            if _small_context_tier:
+                # Small windows: the domain's core tools, not the whole pack.
+                _relevant_tools.update(_core)
+                continue
+            _pack = _DOMAIN_TOOL_MAP.get(str(_domain), set())
+            _relevant_tools.update(_pack)
+            _rank_tools(_pack, _TOOL_RANK_INTENT)
+        if "cookbook" in (_intent.get("domains") or set()) and not _small_context_tier:
+            _cookbook_reads = {
                 "list_served_models",
                 "list_downloads",
                 "list_cached_models",
                 "list_cookbook_servers",
                 "list_serve_presets",
-            })
-        if "email" in (_intent.get("domains") or set()):
+            }
+            _relevant_tools.update(_cookbook_reads)
+            _rank_tools(_cookbook_reads, _TOOL_RANK_INTENT)
+        if "email" in (_intent.get("domains") or set()) and not _small_context_tier:
             _relevant_tools.add("ui_control")
+            _rank_tools({"ui_control"}, _TOOL_RANK_INTENT)
         if "web" in (_intent.get("domains") or set()):
             _relevant_tools.update(WEB_TOOL_NAMES)
+            _rank_tools(WEB_TOOL_NAMES, _TOOL_RANK_CORE)
             _blocked_web_tools = sorted(WEB_TOOL_NAMES & disabled_tools)
             if _blocked_web_tools:
                 logger.info(
@@ -4076,6 +4402,7 @@ async def stream_agent_loop(
                 )
         if "ui" in (_intent.get("domains") or set()):
             _relevant_tools.add("ui_control")
+            _rank_tools({"ui_control"}, _TOOL_RANK_CORE)
         if (
             (
                 (
@@ -4088,6 +4415,7 @@ async def stream_agent_loop(
             and not active_email
         ):
             _relevant_tools = set(_WORKSPACE_TERMINUS_TOOLS)
+            _rank_tools(_relevant_tools, _TOOL_RANK_INTENT)
             logger.info("[tool-rag] Workspace file/terminal request; using Odysseus Terminus toolset")
 
     # If this turn targets the open document, keep editing tools available
@@ -4096,6 +4424,8 @@ async def stream_agent_loop(
     # panel is open.
     if _relevant_tools is not None and _active_document_relevant:
         _relevant_tools.update({"edit_document", "update_document", "suggest_document"})
+        _rank_tools({"edit_document", "update_document"}, _TOOL_RANK_CORE)
+        _rank_tools({"suggest_document"}, _TOOL_RANK_INTENT)
         if _active_email_draft_relevant:
             # The open compose document already contains the recipient,
             # subject, source UID, and quoted previous-message excerpt. Reading
@@ -4118,6 +4448,8 @@ async def stream_agent_loop(
             from src.tool_index import ALWAYS_AVAILABLE
             _relevant_tools = set(ALWAYS_AVAILABLE)
         _relevant_tools.update({"read_file", "grep", "ls", "manage_documents"})
+        _rank_tools({"read_file"}, _TOOL_RANK_CORE)
+        _rank_tools({"grep", "ls", "manage_documents"}, _TOOL_RANK_INTENT)
 
     # Per-request forced tools are stronger than retrieval. Explicit search
     # settings make web tools visible even when tool RAG misses them;
@@ -4128,9 +4460,12 @@ async def stream_agent_loop(
             from src.tool_index import ALWAYS_AVAILABLE
             _relevant_tools = set(ALWAYS_AVAILABLE)
         _relevant_tools.update(forced_set)
+        _rank_tools(forced_set, _TOOL_RANK_PINNED)
 
     if not guide_only and _relevant_tools is not None:
+        _before_browser_expand = set(_relevant_tools)
         _relevant_tools = _expand_browser_mcp_tools(_relevant_tools, mcp_mgr)
+        _rank_tools(_relevant_tools - _before_browser_expand, _TOOL_RANK_INTENT)
 
     # The skill index injected by _build_system_prompt tells the model to
     # call `manage_skills action=view`, and Jaccard-matched skills are pasted
@@ -4153,6 +4488,7 @@ async def stream_agent_loop(
             _owner_skills = _sm.load(owner=owner) if _skills_on else []
             if _owner_skills:
                 _relevant_tools.add("manage_skills")
+                _rank_tools({"manage_skills"}, _TOOL_RANK_RETRIEVED)
                 if _retrieval_query:
                     # Validate against every known executable tool, not just
                     # TOOL_SECTIONS — code-nav tools (grep/glob/ls) ship as
@@ -4163,12 +4499,35 @@ async def stream_agent_loop(
                         _retrieval_query, skills=_owner_skills,
                         threshold=0.25, max_items=3,
                     ):
-                        _relevant_tools.update(
+                        _skill_tools = {
                             t for t in (_sk.get("requires_toolsets") or [])
                             if t in _known
-                        )
+                        }
+                        _relevant_tools.update(_skill_tools)
+                        _rank_tools(_skill_tools | {"manage_skills"}, _TOOL_RANK_INTENT)
         except Exception as _e:
             logger.debug(f"[tool-rag] skill-aware tool include skipped: {_e}")
+
+    if not guide_only and _relevant_tools is not None:
+        from src.tool_index import ALWAYS_AVAILABLE as _ALWAYS
+
+        if _small_context_tier and not (approved_plan and approved_plan.strip()):
+            # update_plan only acts on an approved plan; a small window cannot
+            # afford a schema that does nothing.
+            _relevant_tools.discard("update_plan")
+        _rank_tools(set(_ALWAYS) & _relevant_tools, _TOOL_RANK_PINNED)
+        if _primary_sticky_prev:
+            # Sticky conversation tool set: keep what earlier turns sent so the
+            # payload (and the prompt prefix it lives in) stays identical, and
+            # only add what this turn newly needs.
+            _carried = {name for name in _primary_sticky_prev if name not in disabled_tools}
+            _relevant_tools.update(_carried)
+            _rank_tools(_carried, _TOOL_RANK_STICKY)
+            logger.info(
+                "[tool-rag] sticky tool set carried=%s new=%s",
+                len(_carried),
+                sorted(_relevant_tools - _carried)[:20],
+            )
 
     _intent_domains = set(_intent.get("domains") or set())
     _base_relevant_tools = None if _relevant_tools is None else set(_relevant_tools)
@@ -4303,8 +4662,12 @@ async def stream_agent_loop(
     _t2 = time.time()
     _route_context_lengths = {}
 
-    def _trim_route_request_messages(candidate_url, candidate_model, route_messages):
-        """Apply the candidate route's own context budget to its request."""
+    def _trim_route_request_messages(candidate_url, candidate_model, route_messages, tools=None):
+        """Apply the candidate route's own context budget to its request.
+
+        ``tools`` (the native schemas sent with it) are reserved out of the
+        budget: they occupy the same window as the messages.
+        """
 
         def _without_protection(items):
             # Route markers remain internal for later prompt rebuilding;
@@ -4319,19 +4682,14 @@ async def stream_agent_loop(
                 DEFAULT_HARD_MAX,
                 budget_is_explicit as _budget_is_explicit,
             )
-            from src.model_context import budget_context_for_model
-
-            candidate_context = budget_context_for_model(
-                candidate_url,
-                candidate_model,
-                fallback=context_length,
-            )
+            candidate_context = _route_context_window(candidate_url, candidate_model)
             _route_context_lengths[(candidate_url, candidate_model)] = candidate_context
             soft_budget = int(get_setting("agent_input_token_budget", DEFAULT_BUDGET) or 0)
             if soft_budget <= 0:
                 return _without_protection(route_messages)
             before_trim_tokens = estimate_tokens(route_messages)
-            reserve_tokens = min(max(max_tokens or 1024, 512), 2048)
+            tool_tokens = estimate_tool_tokens(tools)
+            reserve_tokens = min(max(max_tokens or 1024, 512), 2048) + tool_tokens
             try:
                 hard_max = int(
                     get_setting("agent_input_token_hard_max", DEFAULT_HARD_MAX)
@@ -4373,21 +4731,138 @@ async def stream_agent_loop(
             )
             return _without_protection(route_messages)
 
-    async def _build_route_request_state(candidate_url, candidate_model, candidate_headers, source_messages):
-        compaction_state: Dict = {}
-        compacted_source = list(source_messages)
-        was_compacted = False
-        if defer_context_shaping or fallbacks:
-            compacted_source, _candidate_context, was_compacted = await maybe_compact(
-                None,
-                candidate_url,
-                candidate_model,
-                compacted_source,
-                candidate_headers,
-                owner=owner,
-                persist=False,
-                compaction_state=compaction_state,
+    _force_answer = False  # set by loop-breaker → next round runs with NO tools
+    _run_mcp_schemas: Optional[List[Dict]] = None
+    # Established tool order per (url, model) for this run; seeded from the
+    # sticky per-conversation store so new tools append instead of reshuffle.
+    _route_tool_orders: Dict[tuple, List[str]] = {}
+
+    def _all_mcp_schemas() -> List[Dict]:
+        nonlocal _run_mcp_schemas
+        if _run_mcp_schemas is None:
+            try:
+                _run_mcp_schemas = (
+                    list(mcp_mgr.get_all_openai_schemas(_mcp_disabled_map or {}))
+                    if mcp_mgr else []
+                )
+            except Exception as exc:
+                logger.debug("MCP schema listing failed: %s", exc)
+                _run_mcp_schemas = []
+        return _run_mcp_schemas
+
+    def _filter_route_tool_schemas(schemas):
+        # Keep candidate actions visible after taint so the model can propose
+        # the exact call that the server will seal for user approval.  Schema
+        # visibility is not authority: both the loop and dispatcher still gate
+        # execution, and only a one-use server record can cross that boundary.
+        return schemas
+
+    def _candidate_tool_schemas(route_relevant_tools, route_mcp_schemas, is_ody):
+        """Native schemas a route may send, before the local-route cap."""
+        if route_relevant_tools:
+            schema_names = set(route_relevant_tools)
+            if _needs_admin:
+                schema_names |= _ADMIN_TOOLS
+            base_schemas = [
+                schema for schema in FUNCTION_TOOL_SCHEMAS
+                if schema.get("function", {}).get("name") in schema_names
+            ]
+            mcp_filtered = [
+                schema for schema in (route_mcp_schemas or [])
+                if schema.get("function", {}).get("name") in route_relevant_tools
+            ]
+            schemas = base_schemas + mcp_filtered
+        else:
+            base_schemas = FUNCTION_TOOL_SCHEMAS if _needs_admin else [
+                schema for schema in FUNCTION_TOOL_SCHEMAS
+                if schema.get("function", {}).get("name") not in _ADMIN_SCHEMA_NAMES
+            ]
+            schemas = list(base_schemas) + list(route_mcp_schemas or [])
+        if is_ody:
+            schemas = []
+        if disabled_tools:
+            schemas = [
+                schema for schema in schemas
+                if schema.get("function", {}).get("name") not in disabled_tools
+                and schema.get("name") not in disabled_tools
+            ]
+        return _filter_route_tool_schemas(schemas)
+
+    def _planned_route_schemas(route_key, schemas):
+        """Token-capped, stably ordered payload for local routes (cloud: as is)."""
+        candidate_url, candidate_model = route_key
+        if not _route_is_local(candidate_url):
+            return schemas
+        from src.tool_schemas import small_context_tool_schema
+
+        window = _route_context_window(candidate_url, candidate_model)
+        small = is_small_context_window(window)
+        sticky_key = _route_sticky_key(candidate_url, candidate_model)
+        established = _route_tool_orders.get(route_key)
+        if established is None:
+            established = list(_sticky_tool_sets.get(sticky_key) or ())
+        ranks = dict(_tool_ranks)
+        try:
+            from src.tool_index import ALWAYS_AVAILABLE as _always
+
+            for _name in _always:
+                ranks.setdefault(_name, _TOOL_RANK_PINNED)
+        except Exception:
+            pass
+        planned = _plan_tool_schemas(
+            schemas,
+            ranks=ranks,
+            established_order=established,
+            token_budget=tool_schema_token_budget(window),
+            max_count=(
+                _SMALL_CONTEXT_TOOL_COUNT_CEILING if small else _LOCAL_TOOL_SCHEMA_COUNT_CEILING
+            ),
+            transform=small_context_tool_schema if small else None,
+        )
+        names = [_schema_name(schema) for schema in planned]
+        _route_tool_orders[route_key] = names
+        if names:
+            _sticky_tool_sets.put(sticky_key, names)
+        if len(planned) < len(schemas or []):
+            logger.info(
+                "[tool-rag] capped local tools %s -> %s (budget=%s tokens, window=%s)",
+                len(schemas or []),
+                len(planned),
+                tool_schema_token_budget(window),
+                window,
             )
+        return planned
+
+    def _tool_schemas_for_route(route_state):
+        if _force_answer:
+            return []
+        # The native-tool salvage (#1567) retries in fenced mode. That round
+        # must send no schemas at all — built-in or MCP — because the retry
+        # prompt teaches the textual fenced channel instead.
+        if route_state.get("suppress_tool_schemas"):
+            return []
+        if not route_state["is_api_model"]:
+            # Text-mode routes get no schemas at all (built-in or MCP): the
+            # model has no native tool channel to use them with.
+            return []
+        schemas = _candidate_tool_schemas(
+            route_state["relevant_tools"],
+            route_state["mcp_schemas"],
+            route_state["ody_qwen_finetune_model"],
+        )
+        route_key = route_state.get("route_key") or (endpoint_url, model)
+        return _planned_route_schemas(route_key, schemas)
+
+    async def _build_route_request_state(
+        candidate_url,
+        candidate_model,
+        candidate_headers,
+        source_messages,
+        *,
+        force_text_mode: bool = False,
+    ):
+        compaction_state: Dict = {}
+        was_compacted = False
         (
             is_ody,
             doc_mode,
@@ -4402,22 +4877,94 @@ async def stream_agent_loop(
             owner,
             headers=candidate_headers,
         )
-        route_messages, route_mcp_schemas = _build_system_prompt(
-            _strip_agent_injected_messages(compacted_source),
-            candidate_model,
-            _prompt_active_document,
-            mcp_mgr,
-            disabled_tools,
-            needs_admin=_needs_admin,
-            relevant_tools=route_tools,
-            mcp_disabled_map=_mcp_disabled_map,
-            compact=is_api or is_native_ollama or is_ollama_compat,
-            owner=owner,
-            suppress_local_context=guide_only,
-            suppress_skills=_low_signal_turn,
-            active_email=active_email,
-            workspace=workspace,
-        )
+        if force_text_mode:
+            is_api = False
+        route_key = (candidate_url, candidate_model)
+        route_local = _route_is_local(candidate_url)
+        route_window = _route_context_window(candidate_url, candidate_model) if route_local else 0
+        route_small = is_small_context_window(route_window)
+
+        # Plan the local route's tool set BEFORE building the prompt, so the
+        # prompt's tool list is exactly what is sent (never a capped-away tool).
+        planned_names: Optional[List[str]] = None
+        planned_schemas: List[Dict] = []
+        if route_local and not is_ody:
+            planned_schemas = _planned_route_schemas(
+                route_key,
+                _candidate_tool_schemas(route_tools, _all_mcp_schemas(), False),
+            )
+            planned_names = [_schema_name(schema) for schema in planned_schemas]
+            if not is_api and route_tools:
+                # Prose-only fenced tools (no native schema) ride along.
+                planned_names += [
+                    name for name in TOOL_SECTIONS
+                    if name in route_tools and name not in planned_names
+                    and name not in {_schema_name(s) for s in FUNCTION_TOOL_SCHEMAS}
+                    and name not in disabled_tools
+                ]
+
+        # Native routes get the schema-list prompt; text-mode local (or small)
+        # routes get one fenced usage line per tool; other text routes keep the
+        # full fenced sections.
+        slim_prompt = (not is_api) and (route_local or route_small)
+
+        def _build_prompt(source):
+            return _build_system_prompt(
+                _strip_agent_injected_messages(source),
+                candidate_model,
+                _prompt_active_document,
+                mcp_mgr,
+                disabled_tools,
+                needs_admin=_needs_admin and planned_names is None,
+                relevant_tools=set(planned_names) if planned_names is not None else route_tools,
+                mcp_disabled_map=_mcp_disabled_map,
+                compact=is_api,
+                owner=owner,
+                suppress_local_context=guide_only,
+                suppress_skills=_low_signal_turn,
+                active_email=active_email,
+                workspace=workspace,
+                **_prompt_shape_kwargs(slim_prompt, planned_names, route_small),
+            )
+
+        source = list(source_messages)
+        route_messages, route_mcp_schemas = _build_prompt(source)
+
+        # Decide compaction on the TRUE request size: the agent prompt and the
+        # native tool schemas are added after the history the chat route
+        # measured, so compaction used to trigger late in agent mode.
+        prompt_overhead = max(0, estimate_tokens(route_messages) - estimate_tokens(source))
+        if is_api:
+            prompt_overhead += estimate_tool_tokens(
+                planned_schemas if planned_names is not None
+                else _candidate_tool_schemas(route_tools, route_mcp_schemas, is_ody)
+            )
+        should_compact = bool(defer_context_shaping or fallbacks)
+        if not should_compact and prompt_overhead:
+            from src.context_compactor import COMPACT_THRESHOLD
+
+            window = _route_context_window(candidate_url, candidate_model)
+            should_compact = bool(window) and (
+                estimate_tokens(source) + prompt_overhead >= COMPACT_THRESHOLD * window
+            )
+        if should_compact:
+            compacted_source, _candidate_context, was_compacted = await maybe_compact(
+                None,
+                candidate_url,
+                candidate_model,
+                source,
+                candidate_headers,
+                owner=owner,
+                persist=False,
+                compaction_state=compaction_state,
+                overhead_tokens=prompt_overhead,
+            )
+            if was_compacted:
+                route_messages, route_mcp_schemas = _build_prompt(compacted_source)
+        if route_small:
+            route_messages = _cap_presearch_context(
+                route_messages, tool_output_char_cap(route_window),
+            )
         if doc_mode and not plan_mode and not approved_plan and not guide_only:
             route_messages = _minimal_odysseus_doc_messages(
                 route_messages,
@@ -4456,6 +5003,8 @@ async def stream_agent_loop(
             "ody_doc_stream_create_mode": stream_create_mode,
             "compaction_state": compaction_state,
             "was_compacted": was_compacted,
+            "route_key": route_key,
+            "planned_tool_names": planned_names,
         }
 
     _initial_route_source_messages = messages
@@ -4476,10 +5025,12 @@ async def stream_agent_loop(
     prep_timings["prompt_build"] = time.time() - _t2
 
     _t3 = time.time()
+    _initial_route_tools = _tool_schemas_for_route(_route_state)
     _initial_route_request_messages = _trim_route_request_messages(
         endpoint_url,
         model,
         messages,
+        tools=_initial_route_tools,
     )
     _initial_route_context_length = _route_context_lengths.get(
         (endpoint_url, model),
@@ -4490,9 +5041,10 @@ async def stream_agent_loop(
     run_security.observe_messages(_initial_route_request_messages)
     agent_prompt_tokens = estimate_tokens(_initial_route_request_messages)
     logger.info(
-        "[agent-timing] prep_done model=%s prompt_tokens=%s context_length=%s prep=%s",
+        "[agent-timing] prep_done model=%s prompt_tokens=%s tool_tokens=%s context_length=%s prep=%s",
         model,
         agent_prompt_tokens,
+        estimate_tool_tokens(_initial_route_tools),
         context_length,
         {k: round(v, 3) for k, v in prep_timings.items()},
     )
@@ -4550,6 +5102,8 @@ async def stream_agent_loop(
     # calls and no usable text, retry that round with schemas off so the model
     # falls back to the fenced tool channel instead of ending the turn empty.
     _native_schema_fallback_used = False
+    # One-shot repair when every native call in a round was rejected.
+    _rejected_call_feedback_used = False
     # Supervisor: how many times we've nudged the model after it announced
     # an action without emitting the tool call. Capped to prevent a model
     # that *can't* call the tool from looping forever.
@@ -4582,60 +5136,6 @@ async def stream_agent_loop(
     # using tools — i.e. it was cut off, not finished. Drives a "Continue" event
     # so the user can resume instead of the turn silently stalling.
     _exhausted_rounds = False
-
-    def _filter_route_tool_schemas(schemas):
-        # Keep candidate actions visible after taint so the model can propose
-        # the exact call that the server will seal for user approval.  Schema
-        # visibility is not authority: both the loop and dispatcher still gate
-        # execution, and only a one-use server record can cross that boundary.
-        return schemas
-
-    def _tool_schemas_for_route(route_state):
-        route_mcp_schemas = route_state["mcp_schemas"]
-        route_relevant_tools = route_state["relevant_tools"]
-        if _force_answer:
-            return []
-        # The native-tool salvage (#1567) retries in fenced mode. That round
-        # must send no schemas at all — built-in or MCP — because the retry
-        # prompt teaches the textual fenced channel instead.
-        if route_state.get("suppress_tool_schemas"):
-            return []
-        if route_state["is_api_model"]:
-            if route_relevant_tools:
-                schema_names = set(route_relevant_tools)
-                if _needs_admin:
-                    schema_names |= _ADMIN_TOOLS
-                base_schemas = [
-                    schema for schema in FUNCTION_TOOL_SCHEMAS
-                    if schema.get("function", {}).get("name") in schema_names
-                ]
-                mcp_filtered = [
-                    schema for schema in route_mcp_schemas
-                    if schema.get("function", {}).get("name") in route_relevant_tools
-                ]
-                schemas = base_schemas + mcp_filtered
-            else:
-                base_schemas = FUNCTION_TOOL_SCHEMAS if _needs_admin else [
-                    schema for schema in FUNCTION_TOOL_SCHEMAS
-                    if schema.get("function", {}).get("name") not in _ADMIN_SCHEMA_NAMES
-                ]
-                schemas = base_schemas + route_mcp_schemas
-            if route_state["ody_qwen_finetune_model"]:
-                schemas = []
-            if disabled_tools:
-                schemas = [
-                    schema for schema in schemas
-                    if schema.get("function", {}).get("name") not in disabled_tools
-                    and schema.get("name") not in disabled_tools
-                ]
-            schemas = _filter_route_tool_schemas(schemas)
-            if route_state.get("is_ollama_native") or route_state.get("ollama_openai_compat"):
-                schemas = _cap_ollama_tool_schemas(schemas, route_relevant_tools)
-            return schemas
-
-        wants_mcp = any(keyword in _last_user.lower() for keyword in _MCP_KEYWORDS)
-        schemas = route_mcp_schemas if wants_mcp and route_mcp_schemas else []
-        return _filter_route_tool_schemas(schemas)
 
     _approved_result_injected = False
     if exact_approval is not None:
@@ -4865,7 +5365,7 @@ async def stream_agent_loop(
         tool_events.append(approved_tool_event)
         if approved.tool_name in _VERIFIER_EFFECTFUL_TOOLS:
             _effectful_used = True
-        formatted_approved_result = format_tool_result(desc, approved_result)
+        formatted_approved_result = format_tool_result(desc, approved_result, max_chars=_tool_output_cap)
         _append_tool_results(
             messages,
             "",
@@ -4904,6 +5404,7 @@ async def stream_agent_loop(
             "compaction_state": (
                 _route_state.get("compaction_state", {}) if round_num == 1 else {}
             ),
+            "route_key": (endpoint_url, model),
         }
         if round_num == 1 and not _approved_result_injected:
             _active_route_state["request_messages"] = _initial_route_request_messages
@@ -4953,12 +5454,14 @@ async def stream_agent_loop(
                     candidate_headers,
                     candidate_source_messages,
                 )
+            candidate_tools = _tool_schemas_for_route(state)
             request_messages = state.get("request_messages")
             if request_messages is None:
                 request_messages = _trim_route_request_messages(
                     candidate_url,
                     candidate_model,
                     state["messages"],
+                    tools=candidate_tools,
                 )
                 state["request_messages"] = request_messages
             _last_route_request_messages = request_messages
@@ -4968,7 +5471,6 @@ async def stream_agent_loop(
             )
             _last_route_context_length = state["context_length"]
             run_security.observe_messages(request_messages)
-            candidate_tools = _tool_schemas_for_route(state)
             state["tools"] = candidate_tools
             _candidate_request_states[index] = state
             return {
@@ -5248,6 +5750,7 @@ async def stream_agent_loop(
                                     endpoint_url,
                                     model,
                                     answering_state["messages"],
+                                    tools=_tool_schemas_for_route(answering_state),
                                 )
                                 answering_state["context_length"] = _route_context_lengths.get(
                                     (endpoint_url, model),
@@ -5372,8 +5875,19 @@ async def stream_agent_loop(
         # Surface native calls the converter rejected (unknown/decorated name,
         # empty required args, bad JSON) instead of leaving them in the logs
         # only — the frontend renders this as an "[Agent guard: ...]" note.
+        _rejected_native_calls = []
         if native_tool_calls and not guide_only:
             _converted_ids = {id(tc) for tc in converted_calls}
+            if not tool_blocks:
+                # Nothing converted: remember why, so the model is told once
+                # instead of the turn silently ending (see below).
+                from src.tool_schemas import function_call_rejection_reason
+
+                _rejected_native_calls = [
+                    (tc, function_call_rejection_reason(tc.get("name", ""), tc.get("arguments", "{}")))
+                    for tc in native_tool_calls
+                    if id(tc) not in _converted_ids
+                ]
             _rejected_names = sorted({
                 str(tc.get("name") or "").strip()
                 for tc in native_tool_calls
@@ -5569,6 +6083,45 @@ async def stream_agent_loop(
             yield f'data: {json.dumps({"delta": cleaned_round})}\n\n'
 
         if not tool_blocks:
+            # ── Rejected native call repair ──────────────────────────────
+            # The model tried to call a tool but every call was unusable
+            # (unknown name, bad JSON, empty required args). Feed the reasons
+            # back once as tool results so it can correct the call.
+            if (
+                _rejected_native_calls
+                and not _rejected_call_feedback_used
+                and not _force_answer
+                and round_num < max_rounds
+            ):
+                _rejected_call_feedback_used = True
+                _rejected_texts = _rejected_tool_call_results(
+                    _rejected_native_calls, _tool_names_sent,
+                )
+                _append_tool_results(
+                    messages,
+                    round_response,
+                    [tc for tc, _reason in _rejected_native_calls],
+                    _rejected_texts,
+                    _rejected_texts,
+                    True,
+                    round_num,
+                    round_reasoning=round_reasoning,
+                    tool_result_records=[
+                        {
+                            "tool_name": str(tc.get("name") or ""),
+                            "content": tc.get("arguments", "{}"),
+                            "result": {"error": reason, "exit_code": 1, "blocked": True},
+                            "text": text,
+                        }
+                        for (tc, reason), text in zip(_rejected_native_calls, _rejected_texts)
+                    ],
+                )
+                logger.info(
+                    "[agent] fed %s rejected native call(s) back to the model",
+                    len(_rejected_native_calls),
+                )
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
             # ── Degenerate native-tool round salvage (#1567) ───────────────
             # Some local models stop after a token when tool schemas are
             # present. Retry once with schemas off so the model can use the
@@ -5589,6 +6142,19 @@ async def stream_agent_loop(
                 # fenced syntax and would otherwise leave the model with no
                 # usable tool channel at all.
                 _active_route_state["suppress_tool_schemas"] = True
+                # Swap the native-only system prompt for the fenced one (same
+                # tools), rather than leaving a prompt that forbids tool syntax.
+                try:
+                    _salvage_state = await _build_route_request_state(
+                        endpoint_url,
+                        model,
+                        headers,
+                        messages,
+                        force_text_mode=True,
+                    )
+                    messages = _salvage_state["messages"]
+                except Exception as _salvage_err:
+                    logger.warning("[agent] fenced prompt rebuild failed: %s", _salvage_err)
                 _salvage_tool_names = []
                 for _schema in (all_tool_schemas or []):
                     _name = (_schema.get("function") or {}).get("name")
@@ -6060,6 +6626,7 @@ async def stream_agent_loop(
                                 if _new:
                                     _relevant_tools.update(_new)
                                     _runtime_skill_tools.update(_new)
+                                    _rank_tools(_new, _TOOL_RANK_INTENT)
                                     if _base_relevant_tools is not None:
                                         _base_relevant_tools.update(_new)
                                     logger.info(
@@ -6425,7 +6992,7 @@ async def stream_agent_loop(
             if block.tool_type in _VERIFIER_EFFECTFUL_TOOLS:
                 _effectful_used = True
 
-            formatted = format_tool_result(desc, result)
+            formatted = format_tool_result(desc, result, max_chars=_tool_output_cap)
             tool_results.append(formatted)
             tool_result_texts.append(formatted)
             tool_result_records.append(

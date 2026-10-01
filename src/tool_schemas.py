@@ -10,6 +10,7 @@ tool parsing / execution logic.
 
 import json
 import logging
+import re
 from typing import Optional
 
 from src.agent_tools import ToolBlock, TOOL_TAGS
@@ -1297,6 +1298,105 @@ FUNCTION_TOOL_SCHEMAS = [
 
 
 # ---------------------------------------------------------------------------
+# Short schemas for small-context models
+# ---------------------------------------------------------------------------
+
+# Hand-written short descriptions for the largest schemas. Everything else is
+# shortened mechanically to its first sentence. Parameters keep their names,
+# types, enums, items and required lists, so the schema stays valid and the
+# converter above receives the same argument shapes.
+_SMALL_CONTEXT_TOOL_DESCRIPTIONS = {
+    "ui_control": (
+        "Control the UI: toggle tools on/off, open_panel, open_email_reply "
+        "(opens a reply draft, does not send), set_mode, switch_model, "
+        "set_theme, create_theme."
+    ),
+    "manage_calendar": (
+        "Calendar events: list_calendars, list_events (start/end ISO range), "
+        "create_event, update_event, delete_event. Use reminder_minutes for "
+        "event alarms; rrule only for explicit recurrence."
+    ),
+    "manage_tasks": (
+        "Scheduled/recurring background tasks: list, create, edit, delete, "
+        "pause, resume, run. Use for 'every morning...' style requests."
+    ),
+    "manage_notes": (
+        "Notes, checklists and one-off reminders: list, search, view, add, "
+        "update, delete, toggle_item. due_date sets the reminder time; "
+        "checklists use checklist_items."
+    ),
+    "manage_skills": (
+        "Skill library: list, view, view_ref, search, add, edit, patch, "
+        "publish, delete."
+    ),
+    "ask_user": (
+        "Ask the user a multiple-choice question when the answer changes what "
+        "you do next. Ends your turn."
+    ),
+}
+_SMALL_CONTEXT_TOOL_DESCRIPTION_CHARS = 200
+_SMALL_CONTEXT_PARAM_DESCRIPTION_CHARS = 90
+
+
+def _first_sentence(text, limit: int) -> str:
+    """Collapse whitespace and keep the first sentence, at most ``limit`` chars."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    sentence_end = re.search(r"[.!?](?=\s|$)", text[:limit + 1])
+    if sentence_end:
+        return text[:sentence_end.end()]
+    cut = text[:limit].rsplit(" ", 1)[0] if " " in text[:limit] else text[:limit]
+    return cut.rstrip(" ,;:-")
+
+
+def _shorten_schema_descriptions(node, depth: int = 0):
+    """Return a copy of a JSON Schema node with shortened ``description`` prose."""
+    if isinstance(node, list):
+        return [_shorten_schema_descriptions(item, depth) for item in node]
+    if not isinstance(node, dict):
+        return node
+    out = {}
+    required = node.get("required") if isinstance(node.get("required"), list) else None
+    for key, value in node.items():
+        if key == "description" and isinstance(value, str):
+            # Top-level parameters keep a first-sentence hint; nested field
+            # prose (theme colors, checklist items) is dropped.
+            if depth <= 1:
+                out[key] = _first_sentence(value, _SMALL_CONTEXT_PARAM_DESCRIPTION_CHARS)
+        elif key == "properties" and isinstance(value, dict):
+            props = value
+            if depth >= 1 and required:
+                # Nested objects keep only their required fields; optional
+                # extras (16 advanced theme colors, option descriptions) are
+                # the bulk of the largest schemas. Still valid JSON Schema.
+                props = {prop: schema for prop, schema in value.items() if prop in required}
+            out[key] = {
+                prop: _shorten_schema_descriptions(prop_schema, depth + 1)
+                for prop, prop_schema in props.items()
+            }
+        else:
+            out[key] = _shorten_schema_descriptions(value, depth)
+    return out
+
+
+def small_context_tool_schema(schema: dict) -> dict:
+    """Copy of an OpenAI-style tool schema with short prose for small windows."""
+    fn = schema.get("function") if isinstance(schema, dict) else None
+    if not isinstance(fn, dict):
+        return schema
+    short_fn = dict(fn)
+    short_fn["description"] = _SMALL_CONTEXT_TOOL_DESCRIPTIONS.get(fn.get("name")) or _first_sentence(
+        fn.get("description"), _SMALL_CONTEXT_TOOL_DESCRIPTION_CHARS
+    )
+    if isinstance(fn.get("parameters"), dict):
+        short_fn["parameters"] = _shorten_schema_descriptions(fn["parameters"])
+    short = dict(schema)
+    short["function"] = short_fn
+    return short
+
+
+# ---------------------------------------------------------------------------
 # Converter: native function call -> ToolBlock
 # ---------------------------------------------------------------------------
 
@@ -1412,6 +1512,24 @@ def normalize_native_tool_name(name: str) -> str:
 
 def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock]:
     """Convert a native function call into a ToolBlock for the existing execution pipeline."""
+    return _convert_function_call(name, arguments)[0]
+
+
+def function_call_rejection_reason(name: str, arguments: str) -> Optional[str]:
+    """Why ``function_call_to_tool_block`` rejects this call, or None if it converts.
+
+    The agent loop feeds this back to the model as the tool result, so a model
+    that emitted an unknown name or unusable arguments can correct itself
+    instead of the turn silently ending.
+    """
+    block, reason = _convert_function_call(name, arguments)
+    if block is not None:
+        return None
+    return reason or f"Tool call '{name}' could not be converted into a tool action."
+
+
+def _convert_function_call(name: str, arguments: str):
+    """Return ``(ToolBlock, None)`` or ``(None, reason)`` for a native call."""
     normalized_name = normalize_native_tool_name(name)
     tool_type = _TOOL_NAME_MAP.get(normalized_name, normalized_name)
     try:
@@ -1425,7 +1543,7 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             logger.warning(f"Repaired malformed document function call arguments for {name}")
         else:
             logger.error(f"Failed to parse function call arguments for {name}: {arguments}")
-            return None
+            return None, f"The arguments for '{name}' are not valid JSON. Send a single JSON object."
 
     # Some models emit valid JSON that isn't an object (e.g. a bare array
     # ["ls -la"], string, or number) as function arguments. Most local tools keep
@@ -1440,26 +1558,30 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             or normalized_name in BUILTIN_EMAIL_TOOLS
         ):
             logger.warning(f"Non-object email function call arguments for {name}: {args!r}; rejecting")
-            return None
+            return None, f"The arguments for '{name}' must be a JSON object."
         logger.warning(f"Non-object function call arguments for {name}: {args!r}; treating as empty")
         args = {}
 
     required_args = _REQUIRED_NATIVE_TOOL_ARGS.get(tool_type)
     if required_args and not any(str(args.get(key) or "").strip() for key in required_args):
         logger.warning(f"Rejecting empty required arguments for function call {name}: {args!r}")
-        return None
+        return None, (
+            f"'{name}' needs a non-empty "
+            + " or ".join(f"'{key}'" for key in required_args)
+            + " argument."
+        )
 
     # Allow MCP tools through (namespaced as mcp__serverid__toolname)
     if tool_type.startswith("mcp__"):
         content = json.dumps(args) if args else "{}"
-        return ToolBlock(tool_type, content)
+        return ToolBlock(tool_type, content), None
     # Email tools are implemented as MCP — route them to email
     if name in BUILTIN_EMAIL_TOOLS or normalized_name in BUILTIN_EMAIL_TOOLS:
         email_name = normalized_name if normalized_name in BUILTIN_EMAIL_TOOLS else name
-        return ToolBlock(f"mcp__email__{email_name}", json.dumps(args) if args else "{}")
+        return ToolBlock(f"mcp__email__{email_name}", json.dumps(args) if args else "{}"), None
     if tool_type not in TOOL_TAGS:
         logger.warning(f"Unknown function call: {name}")
-        return None
+        return None, f"There is no tool named '{name}'. Call one of the tools provided for this turn by its exact name."
 
     # Convert structured args back to the text format each tool expects
     if tool_type == "bash":
@@ -1641,4 +1763,4 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
     else:
         content = json.dumps(args)
 
-    return ToolBlock(tool_type, content)
+    return ToolBlock(tool_type, content), None

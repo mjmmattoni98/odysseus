@@ -74,6 +74,11 @@ FASTEMBED_CACHE_DIR = os.getenv("FASTEMBED_CACHE_PATH") or os.path.join(DATA_DIR
 MAX_OUTPUT_CHARS = 10_000       # cap for bash/python/web_search/web_fetch output
 MAX_READ_CHARS = 20_000         # cap for read_file / document preview
 MAX_DIFF_LINES = 400            # cap for edit_file unified-diff display
+# Small-context models (window <= src.context_budget.SMALL_CONTEXT_TIER_MAX)
+# get each tool result fed back to the model capped to this share of the
+# window, so one web page or log cannot fill a 8K context on its own.
+SMALL_CONTEXT_TOOL_OUTPUT_FRACTION = 0.15
+MIN_SCALED_TOOL_OUTPUT_CHARS = 1_500
 
 # web_fetch response-size policy (#3812). MAX_OUTPUT_CHARS above only trims
 # what the agent SEES; these caps bound what the server downloads, parses,

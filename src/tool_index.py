@@ -296,8 +296,13 @@ class ToolIndex:
         self._mcp_generation = gen
         logger.info(f"Indexed {len(docs)} MCP tools")
 
-    def retrieve(self, query: str, k: int = 8) -> List[str]:
-        """Retrieve the top-K most relevant tool names for a query."""
+    def retrieve(self, query: str, k: int = 8, min_score: Optional[float] = None) -> List[str]:
+        """Retrieve the top-K most relevant tool names for a query.
+
+        ``min_score`` (cosine similarity, 0..1) drops weak matches instead of
+        always returning K names; small-context models pass it so a vague
+        query does not fill their prompt with unrelated schemas.
+        """
         rows = []
         lane_priority = {LANE_CUSTOM: 0, LANE_FASTEMBED: 1}
         for lane in self._lanes:
@@ -326,6 +331,8 @@ class ToolIndex:
                             })
             except Exception as e:
                 logger.warning("Tool retrieval failed in %s lane: %s", lane.name, e)
+        if min_score is not None:
+            rows = [row for row in rows if row["score"] >= min_score]
         rows.sort(key=lambda row: (-row["score"], lane_priority.get(row["embedding_lane"], 99)))
         return [row["tool_name"] for row in dedupe_results(rows, id_key="tool_name", limit=k)]
 
@@ -515,34 +522,54 @@ class ToolIndex:
             {"create_document", "edit_document", "update_document"},
     }
 
-    def get_tools_for_query(
-        self, query: str, k: int = 8, always_include: Optional[Set[str]] = None
-    ) -> Set[str]:
-        """Get the set of tool names to include for a given user query."""
-        base = set(always_include or ALWAYS_AVAILABLE)
-        retrieved = self.retrieve(query, k=k)
-        base.update(retrieved)
+    @classmethod
+    def keyword_tools_for_query(cls, query: str) -> Set[str]:
+        """Deterministic keyword/structural tool hints for a query.
+
+        No embeddings: safe to call when the index is unavailable, and used by
+        the agent loop to tell explicit intent apart from similarity matches.
+        """
+        tools: Set[str] = set()
         # Keyword-based force-include for common intents. Match on word
         # boundaries, not raw substrings, so short hints like "fix", "line",
         # "serve", "reply" or "unread" don't fire inside unrelated words
         # ("prefix", "deadline"/"online", "observe"/"reserve", "replying",
         # "unreadable"). Same word-boundary matching used in topic_analyzer.
-        ql = query.lower()
-        for keywords, tools in self._KEYWORD_HINTS.items():
+        ql = str(query or "").lower()
+        for keywords, hinted in cls._KEYWORD_HINTS.items():
             if any(re.search(rf"\b{re.escape(kw)}\b", ql) for kw in keywords):
-                base.update(tools)
+                tools.update(hinted)
         # Structural scheduling-intent detection — typo-resilient (the literal
         # keyword "every day" misses "every dya"). Catches "every <word>",
         # daily/nightly/etc., or a clock time like "at 7:30 am" / "7am", which
         # all signal a recurring/scheduled task. Force-include manage_tasks so
         # the agent can actually create the cron job instead of fumbling.
-        if self._SCHEDULE_RE.search(ql):
-            base.add("manage_tasks")
+        if cls._SCHEDULE_RE.search(ql):
+            tools.add("manage_tasks")
         # URL/site requests need web tools even when embedding retrieval is
         # stubbed/unavailable. Keep this structural, not always-on, so trivial
         # prompts do not drag web schemas into the agent context.
-        if self._WEB_RE.search(query):
-            base.update({"web_search", "web_fetch"})
+        if cls._WEB_RE.search(str(query or "")):
+            tools.update({"web_search", "web_fetch"})
+        return tools
+
+    def get_tools_for_query(
+        self,
+        query: str,
+        k: int = 8,
+        always_include: Optional[Set[str]] = None,
+        min_score: Optional[float] = None,
+    ) -> Set[str]:
+        """Get the set of tool names to include for a given user query."""
+        base = set(always_include or ALWAYS_AVAILABLE)
+        retrieved = (
+            self.retrieve(query, k=k)
+            if min_score is None
+            else self.retrieve(query, k=k, min_score=min_score)
+        )
+        base.update(retrieved)
+        base.update(self.keyword_tools_for_query(query))
+        ql = query.lower()
         # Hard steering: when the query is a clear "save info about a specific
         # person" pattern (address paste + name, phone next to a name, etc.),
         # the model has been observed defaulting to manage_memory even with

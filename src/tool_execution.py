@@ -1356,8 +1356,12 @@ _FORMATTER_HANDLED_KEYS = {
 }
 
 
-def format_tool_result(description: str, result: Dict) -> str:
-    """Format a tool result into text for feeding back to the LLM."""
+def format_tool_result(description: str, result: Dict, max_chars: Optional[int] = None) -> str:
+    """Format a tool result into text for feeding back to the LLM.
+
+    ``max_chars`` scales the result to a small model's context window (see
+    src.context_budget.tool_output_char_cap); None keeps the tools' own caps.
+    """
     parts = [f"### {description}"]
 
     if "stdout" in result:
@@ -1408,10 +1412,22 @@ def format_tool_result(description: str, result: Dict) -> str:
         try:
             extra_json = json.dumps(extra, indent=2, default=str, ensure_ascii=False)
             # Cap to avoid blowing the context window on huge payloads.
-            if len(extra_json) > 8000:
-                extra_json = extra_json[:8000] + f"\n... (truncated, {len(extra_json)} chars total)"
+            extra_cap = 8000 if not max_chars else max(500, min(8000, max_chars // 2))
+            if len(extra_json) > extra_cap:
+                extra_json = extra_json[:extra_cap] + f"\n... (truncated, {len(extra_json)} chars total)"
             parts.append(f"**data:**\n```json\n{extra_json}\n```")
         except (TypeError, ValueError):
             pass
 
-    return "\n".join(parts)
+    text = "\n".join(parts)
+    if max_chars and len(text) > max_chars:
+        # Keep the head (status, first output) and a short tail (errors and
+        # exit codes usually land at the end).
+        tail = max(200, max_chars // 5)
+        head = max(200, max_chars - tail)
+        text = (
+            text[:head].rstrip()
+            + f"\n... [tool output truncated to fit the model context: {len(text)} chars total] ...\n"
+            + text[-tail:].lstrip()
+        )
+    return text
