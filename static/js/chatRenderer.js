@@ -2046,6 +2046,24 @@ export function createUserMsgFooter(msgElement) {
   return footer;
 }
 
+// Model load time above this is a real (re)load, e.g. Ollama swapping models.
+const SIGNIFICANT_MODEL_LOAD_MS = 500;
+
+/**
+ * Backend-reported speed details for the stats line: prompt (prefill) tok/s,
+ * model load seconds when significant, and whether the reply hit the
+ * max-token limit. Fields are null/false when the backend did not report them.
+ */
+export function backendSpeedSummary(metrics) {
+  const positive = (value) => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null);
+  const loadMs = positive(metrics?.load_ms);
+  return {
+    promptTps: positive(metrics?.prefill_tps),
+    loadSeconds: loadMs !== null && loadMs > SIGNIFICANT_MODEL_LOAD_MS ? Math.round(loadMs / 100) / 10 : null,
+    truncated: metrics?.finish_reason === 'length',
+  };
+}
+
 /**
  * Display performance metrics for a message.
  */
@@ -2081,17 +2099,27 @@ export function displayMetrics(messageElement, metrics) {
   // Keep token counts in the Message Stats popup; the footer should stay slim.
   const costStr0 = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : null;
   const hasTps = tps != null && tps !== 'undefined';
-  const metricsLabel = hasTps
+  const speed = backendSpeedSummary(metrics);
+  const baseLabel = hasTps
     ? `${tps} tok/s`
     : costStr0
       ? costStr0
       : responseTime != null
         ? `${responseTime}s`
         : '';
-  if (!metricsLabel) return;
+  if (!baseLabel) return;
+  // Only the model-swap signal and a length cut-off earn footer space.
+  const metricsLabel = baseLabel
+    + (speed.loadSeconds !== null ? ` · load ${speed.loadSeconds}s` : '')
+    + (speed.truncated ? ' · cut off' : '');
   metricsContainer.textContent = metricsLabel;
   metricsContainer.style.cursor = 'pointer';
-  metricsContainer.title = 'Click for details';
+  metricsContainer.title = [
+    hasTps ? `Generation ${tps} tok/s` : '',
+    speed.promptTps !== null ? `prompt ${speed.promptTps} tok/s` : '',
+    speed.loadSeconds !== null ? `model load ${speed.loadSeconds}s` : '',
+    speed.truncated ? 'stopped at the max-token limit' : '',
+  ].filter(Boolean).concat('Click for details').join(' · ');
   const metricsDivider = document.createElement('span');
   metricsDivider.className = 'metrics-divider';
   metricsDivider.textContent = ' | ';
@@ -2128,7 +2156,10 @@ export function displayMetrics(messageElement, metrics) {
       <div><span class="ctx-label">Input</span> ${inputTokens.toLocaleString()} tokens${isReal ? '' : '~'}</div>
       <div><span class="ctx-label">Output</span> ${outputTokens.toLocaleString()} tokens${isReal ? '' : '~'}</div>
       <div><span class="ctx-label">Total</span> ${totalTok.toLocaleString()} tokens</div>
-      <div><span class="ctx-label">Speed</span> ${speedStr}</div>
+      <div><span class="ctx-label">${speed.promptTps !== null ? 'Generation' : 'Speed'}</span> ${speedStr}</div>
+      ${speed.promptTps !== null ? `<div><span class="ctx-label">Prompt</span> ${speed.promptTps} tok/s</div>` : ''}
+      ${speed.loadSeconds !== null ? `<div><span class="ctx-label">Model load</span> ${speed.loadSeconds}s</div>` : ''}
+      ${speed.truncated ? '<div><span class="ctx-label">Stopped</span> max-token limit</div>' : ''}
       <div><span class="ctx-label">Time</span> ${responseTime}s</div>
       ${prepTime != null ? `<div><span class="ctx-label">Prep</span> ${prepTime}s</div>` : ''}
       ${modelWaitTime != null ? `<div><span class="ctx-label">Model wait</span> ${modelWaitTime}s</div>` : ''}

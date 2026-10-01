@@ -376,6 +376,232 @@ def _stream_delta_event(text: str, *, thinking: bool = False) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+_INLINE_THINK_OPEN_RE = re.compile(r"<think(?:ing)?(?:\s[^>]*)?>", re.IGNORECASE)
+_INLINE_THINK_CLOSE_RE = re.compile(r"</think(?:ing)?>", re.IGNORECASE)
+_INLINE_THINK_CLOSE_TAGS = ("</think>", "</thinking>")
+
+
+class _InlineThinkRouter:
+    """Route a leading inline ``<think>…</think>`` block to the thinking channel.
+
+    Native Ollama normally reports reasoning in ``message.thinking``, but a
+    request sent without ``think`` (or a template without thinking support)
+    streams the raw tags inside ``content``. Like the OpenAI-compatible path,
+    only a block that opens the reply counts as reasoning. Unlike it, tags split
+    across chunks are held back until they can be classified.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._state = "start"  # start -> think -> text
+
+    def feed(self, text: str) -> List[Tuple[str, bool]]:
+        if not text:
+            return []
+        self._buf += text
+        return self._drain(final=False)
+
+    def flush(self) -> List[Tuple[str, bool]]:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> List[Tuple[str, bool]]:
+        out: List[Tuple[str, bool]] = []
+        while self._buf:
+            if self._state == "text":
+                out.append((self._buf, False))
+                self._buf = ""
+                break
+            if self._state == "start":
+                stripped = self._buf.lstrip()
+                if not stripped:
+                    if final:
+                        out.append((self._buf, False))
+                        self._buf = ""
+                    break
+                opener = _INLINE_THINK_OPEN_RE.match(stripped)
+                if opener:
+                    self._buf = stripped[opener.end():]
+                    self._state = "think"
+                    continue
+                low = stripped.lower()
+                maybe_opener = "<thinking".startswith(low) or (low.startswith("<think") and ">" not in low)
+                if maybe_opener and not final:
+                    break
+                self._state = "text"
+                continue
+            closer = _INLINE_THINK_CLOSE_RE.search(self._buf)
+            if closer:
+                if closer.start():
+                    out.append((self._buf[:closer.start()], True))
+                self._buf = self._buf[closer.end():]
+                self._state = "text"
+                continue
+            hold = 0
+            if not final:
+                tail = self._buf[-(len(_INLINE_THINK_CLOSE_TAGS[1]) - 1):].lower()
+                start = tail.rfind("<")
+                if start != -1 and any(tag.startswith(tail[start:]) for tag in _INLINE_THINK_CLOSE_TAGS):
+                    hold = len(tail) - start
+            emit = self._buf[:len(self._buf) - hold]
+            if emit:
+                out.append((emit, True))
+            self._buf = self._buf[len(self._buf) - hold:]
+            break
+        return out
+
+
+def _ollama_duration_ms(value) -> Optional[float]:
+    """Convert an Ollama nanosecond duration to milliseconds; ``None`` if malformed."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value / 1e6
+
+
+def _ollama_usage_timings(chunk: dict) -> Dict:
+    """Map Ollama's final-chunk durations onto the usage timing fields.
+
+    ``gen_tps``/``prefill_tps`` are the keys the OpenAI-compatible path fills
+    from llama.cpp ``timings``, so consumers need no provider branch.
+    ``load_ms`` is model load time: a large value means Ollama had to load or
+    swap the model in. ``prefill_ms``/``gen_ms`` are the raw phase durations.
+    """
+    out: Dict = {}
+    if not isinstance(chunk, dict):
+        return out
+    load_ms = _ollama_duration_ms(chunk.get("load_duration"))
+    prefill_ms = _ollama_duration_ms(chunk.get("prompt_eval_duration"))
+    gen_ms = _ollama_duration_ms(chunk.get("eval_duration"))
+    counts = _normalize_usage_counts(
+        chunk.get("prompt_eval_count", 0),
+        chunk.get("eval_count", 0),
+    )
+    if counts:
+        if gen_ms and counts["output_tokens"]:
+            out["gen_tps"] = round(counts["output_tokens"] / (gen_ms / 1000), 2)
+        if prefill_ms and counts["input_tokens"]:
+            out["prefill_tps"] = round(counts["input_tokens"] / (prefill_ms / 1000), 2)
+    if load_ms is not None:
+        out["load_ms"] = round(load_ms, 1)
+    if prefill_ms is not None:
+        out["prefill_ms"] = round(prefill_ms, 1)
+    if gen_ms is not None:
+        out["gen_ms"] = round(gen_ms, 1)
+    return out
+
+
+_OLLAMA_MODEL_MISSING_RE = re.compile(
+    r"model\s+['\"]?(?P<model>[^'\"\s,]+)['\"]?\s+not found|try pulling it first",
+    re.IGNORECASE,
+)
+_OLLAMA_OOM_RE = re.compile(
+    r"requires more system memory|out of memory|unable to allocate|failed to allocate"
+    r"|cudaMalloc failed|hipMalloc failed|insufficient memory|not enough memory",
+    re.IGNORECASE,
+)
+_OLLAMA_RUNNER_CRASH_RE = re.compile(
+    r"runner process (?:has )?terminated|model runner has unexpectedly stopped",
+    re.IGNORECASE,
+)
+
+
+def _is_ollama_route(url: str) -> bool:
+    """True for native Ollama, or Ollama's ``/v1`` surface on its own port/host.
+
+    ``_is_ollama_openai_compat_url`` also matches any loopback ``/v1`` server,
+    so the ``/v1`` case additionally requires Ollama's default port or an
+    "ollama" host name; llama.cpp/vLLM on localhost keep neutral wording.
+    """
+    if _is_ollama_native_url(url or ""):
+        return True
+    if not _is_ollama_openai_compat_url(url or ""):
+        return False
+    try:
+        parsed = urlparse(url or "")
+        return parsed.port == 11434 or "ollama" in (parsed.hostname or "").lower()
+    except Exception:
+        return False
+
+
+def _ollama_error_status(detail: str) -> Optional[int]:
+    """Availability status for Ollama failures that carry no usable HTTP status.
+
+    Out-of-memory loads map to 507 and runner crashes to 502 so the foreground
+    fallback policy can move to another model instead of treating them as a
+    malformed request (the generic in-stream default is 400).
+    """
+    text = str(detail or "")
+    if _OLLAMA_OOM_RE.search(text):
+        return 507
+    if _OLLAMA_RUNNER_CRASH_RE.search(text):
+        return 502
+    if _OLLAMA_MODEL_MISSING_RE.search(text):
+        return 404
+    return None
+
+
+def _ollama_error_message(status: Optional[int], detail: str, url: str, model: Optional[str] = None) -> Optional[str]:
+    """Actionable wording for common Ollama failures, or ``None`` when generic."""
+    if not _is_ollama_route(url):
+        return None
+    detail = str(detail or "").strip()
+    cloud = _host_match(url or "", "ollama.com")
+    label = "Ollama Cloud" if cloud else "Ollama"
+    missing = _OLLAMA_MODEL_MISSING_RE.search(detail)
+    if missing or (status == 404 and "model" in detail.lower()):
+        name = (missing.group("model") if missing and missing.group("model") else "") or (model or "")
+        shown = f" '{name}'" if name else ""
+        if cloud:
+            return f"{label} does not offer model{shown}. Check the model name in Model Endpoints."
+        pull = f"`ollama pull {name}`" if name else "`ollama pull <model>`"
+        return f"{label} does not have model{shown} installed. Run {pull} on the Ollama host, or pick an installed model."
+    if cloud:
+        return None
+    suffix = f" ({detail[:240]})" if detail else ""
+    if _OLLAMA_OOM_RE.search(detail):
+        shown = f" '{model}'" if model else ""
+        return (
+            f"Ollama ran out of memory loading model{shown}. Unload other models, "
+            f"lower the context limit, or use a smaller model/quantization.{suffix}"
+        )
+    if _OLLAMA_RUNNER_CRASH_RE.search(detail):
+        return (
+            "Ollama's model runner stopped unexpectedly (often out of memory). "
+            f"Check the Ollama server log, then retry or use a smaller model/context.{suffix}"
+        )
+    if status is not None and status >= 500:
+        # A local server error is not a provider "outage"; point at the log.
+        return f"Ollama failed with HTTP {status}. Check the Ollama server log.{suffix}"
+    return None
+
+
+def _ollama_unreachable_hint(url: str) -> str:
+    """Suffix for connection failures to a local Ollama server ("" otherwise)."""
+    if not _is_ollama_route(url) or _host_match(url or "", "ollama.com"):
+        return ""
+    try:
+        host = (urlparse(url or "").hostname or "").lower()
+    except Exception:
+        host = ""
+    try:
+        from src.host_docker_access import running_in_container
+        in_container = running_in_container()
+    except Exception:
+        in_container = False
+    if in_container and host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        return (
+            " Odysseus runs in a container, where localhost is the container itself: "
+            "use http://host.docker.internal:11434 and start Ollama with OLLAMA_HOST=0.0.0.0."
+        )
+    if host == "host.docker.internal":
+        return (
+            " Make sure Ollama is running on the host and listens beyond 127.0.0.1 "
+            "(OLLAMA_HOST=0.0.0.0)."
+        )
+    return " Make sure Ollama is running (`ollama serve` or the desktop app) and that OLLAMA_HOST matches this URL."
+
+
 _DEGENERATE_WORD_RE = re.compile(r"[A-Za-z0-9_\u0370-\u03ff\u0400-\u04ff]+")
 
 
@@ -654,8 +880,13 @@ def _normalize_openai_chat_url(url: str) -> str:
     return base + "/chat/completions"
 
 
-def _ollama_normalize_messages(messages: List[Dict]) -> List[Dict]:
+def _ollama_normalize_messages(messages: List[Dict], model: Optional[str] = None) -> List[Dict]:
     """Adapt Odysseus' canonical OpenAI-style messages to native Ollama /api/chat.
+
+    Tool results carry ``tool_name`` (the field native Ollama reads on
+    ``role: "tool"`` messages), resolved from the preceding assistant
+    ``tool_calls`` by id. For gpt-oss the aliased names the model was shown
+    (see ``_alias_harmony_tools``) are used for both the call and the result.
 
     Two shape mismatches silently break requests:
 
@@ -679,6 +910,7 @@ def _ollama_normalize_messages(messages: List[Dict]) -> List[Dict]:
        succeeded.
     """
     out: List[Dict] = []
+    tool_names_by_id: Dict[str, str] = {}
     for m in messages or []:
         if not isinstance(m, dict):
             out.append(m)
@@ -698,11 +930,22 @@ def _ollama_normalize_messages(messages: List[Dict]) -> List[Dict]:
                         args = json.loads(args) if args.strip() else {}
                     except (json.JSONDecodeError, TypeError):
                         args = {}
-                call: Dict = {"function": {"name": fn.get("name", ""), "arguments": args or {}}}
+                name = _alias_harmony_tool_name(fn.get("name", ""), model)
+                call: Dict = {"function": {"name": name, "arguments": args or {}}}
                 if tc.get("id"):
                     call["id"] = tc["id"]
+                    if name:
+                        tool_names_by_id[str(tc["id"])] = name
                 new_calls.append(call)
             nm["tool_calls"] = new_calls
+
+        if nm.get("role") == "tool" and not nm.get("tool_name"):
+            tool_name = tool_names_by_id.get(str(nm.get("tool_call_id") or "")) or _alias_harmony_tool_name(
+                nm.get("name") if isinstance(nm.get("name"), str) else "",
+                model,
+            )
+            if tool_name:
+                nm["tool_name"] = tool_name
 
         # 2. Multimodal content list -> native content string + images array.
         content = nm.get("content")
@@ -892,7 +1135,7 @@ def _build_ollama_payload(
     """
     payload: Dict = {
         "model": model,
-        "messages": _ollama_normalize_messages(messages),
+        "messages": _ollama_normalize_messages(messages, model),
         "stream": stream,
     }
     options: Dict = {}
@@ -1296,7 +1539,7 @@ def _provider_label(url: str) -> str:
                 return "Kimi Code"
         except Exception:
             pass
-    if _is_ollama_native_url(url): return "Ollama"
+    if _is_ollama_route(url): return "Ollama"
     try:
         _parsed_local = urlparse(url)
         host = (_parsed_local.hostname or "").lower()
@@ -1370,6 +1613,13 @@ def _alias_harmony_tools(tools: Optional[List[Dict]], model: str) -> Optional[Li
             t["function"]["name"] = alias
         out.append(t)
     return out
+
+
+def _alias_harmony_tool_name(name: str, model: Optional[str]) -> str:
+    """Map a real tool name to the alias a harmony model is shown."""
+    if not name or not _is_harmony_model(model or ""):
+        return name
+    return _HARMONY_TOOL_ALIASES.get(name, name)
 
 
 def _unalias_harmony_tool_name(name: str, model: str) -> str:
@@ -1461,11 +1711,13 @@ def _format_chatgpt_subscription_error(status_code: int, text: str) -> str:
     return _format_upstream_error(status_code, text, "https://chatgpt.com/backend-api/codex")
 
 
-def _format_upstream_error(status: int, body: bytes | str, url: str) -> str:
+def _format_upstream_error(status: int, body: bytes | str, url: str, model: Optional[str] = None) -> str:
     """Turn an upstream HTTP error into a user-readable sentence.
 
     Auth failures (401/403) become 'xAI rejected the API key' etc., so the UI
     stops showing raw JSON like '{"error":{"message":"User not found."}}'.
+    Ollama routes (native and ``/v1``) get actionable wording for a missing
+    model (``ollama pull``), out-of-memory loads and runner crashes.
     """
     if isinstance(body, bytes):
         try:
@@ -1486,6 +1738,9 @@ def _format_upstream_error(status: int, body: bytes | str, url: str) -> str:
     except Exception:
         detail = (body or "").strip()[:240]
 
+    ollama_message = _ollama_error_message(status, detail, url, model)
+    if ollama_message:
+        return ollama_message
     if status in (401, 403):
         msg = f"{provider} rejected the API key"
         if status == 403:
@@ -2564,9 +2819,13 @@ async def llm_call_async(
         h = {"Content-Type": "application/json"}
         if headers:
             h.update(headers)
-        payload = _build_ollama_payload(
+        # Context discovery and the thinking-capability probe do DB queries
+        # and sync HTTP (/api/show, /api/ps); keep them off the event loop.
+        num_ctx = await asyncio.to_thread(get_context_length, url, model)
+        payload = await asyncio.to_thread(
+            _build_ollama_payload,
             model, messages_copy, temperature, max_tokens,
-            stream=False, num_ctx=get_context_length(url, model), url=url,
+            stream=False, num_ctx=num_ctx, url=url,
             think=think, response_schema=response_schema,
         )
     else:
@@ -2575,6 +2834,10 @@ async def llm_call_async(
         if provider == "copilot":
             from src.copilot import apply_request_headers
             apply_request_headers(h, messages_copy)
+        if _is_ollama_openai_compat_url(url):
+            # Warm the TTL-cached /api/show probe off the event loop; the
+            # payload helpers below then read it from cache.
+            await asyncio.to_thread(_route_supports_thinking, url, model)
         payload = {
             "model": model,
             "messages": messages_copy,
@@ -2601,7 +2864,11 @@ async def llm_call_async(
         _apply_local_generation_stability(payload, target_url, model)
 
     if _is_host_dead(target_url):
-        raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
+        raise HTTPException(
+            503,
+            f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)"
+            + _ollama_unreachable_hint(url),
+        )
 
     call_timeout = _call_timeout(timeout)
     attempt = 0
@@ -2615,7 +2882,7 @@ async def llm_call_async(
                 r = await httpx_post_kimi_aware_async(client, target_url, h, json=payload, timeout=call_timeout)
             duration = time.time() - start
             if not r.is_success:
-                friendly = _format_upstream_error(r.status_code, r.text, target_url)
+                friendly = _format_upstream_error(r.status_code, r.text, target_url, model)
                 logger.warning(
                     f"LLM async call to {target_url} failed in {duration:.2f}s "
                     f"(attempt {attempt}): HTTP {r.status_code} {friendly}"
@@ -2634,6 +2901,10 @@ async def llm_call_async(
                     detail = provider_error.get("message") or provider_error.get("type") or str(provider_error)
                 else:
                     detail = str(provider_error)
+                if _is_ollama_route(url):
+                    if status == 400:
+                        status = _ollama_error_status(detail) or status
+                    detail = _ollama_error_message(status, detail, url, model) or detail
                 raise HTTPException(status, detail or "Upstream request failed")
             try:
                 reported_model = data.get("model") if isinstance(data, dict) else None
@@ -2646,6 +2917,7 @@ async def llm_call_async(
                     response = _parse_anthropic_response(data)
                 elif provider == "ollama":
                     response = _parse_ollama_response(data)
+                    _log_ollama_timings(model, data)
                 else:
                     msg = data["choices"][0]["message"]
                     content = msg.get("content")
@@ -2682,7 +2954,10 @@ async def llm_call_async(
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
             logger.warning(f"LLM async connect to {target_url} failed after {duration:.2f}s: {e}{_tail}")
             if _cooled or attempt >= max_retries:
-                raise HTTPException(503, f"Cannot reach {_host_key(target_url)}: {e}")
+                raise HTTPException(
+                    503,
+                    f"Cannot reach {_host_key(target_url)}: {e}" + _ollama_unreachable_hint(url),
+                )
             await asyncio.sleep(LLMConfig.RETRY_DELAY)
         except httpx.ReadTimeout as e:
             duration = time.time() - start
@@ -2744,6 +3019,19 @@ async def llm_call_async(
                 502,
                 f"POST {target_url} could not be configured: {e}",
             )
+
+def _log_ollama_timings(model: str, data) -> None:
+    """Log a non-streaming native Ollama reply's timings (there is no usage channel)."""
+    timings = _ollama_usage_timings(data)
+    if timings:
+        logger.info(
+            "[ollama-timings] model=%s %s",
+            model,
+            " ".join(f"{key}={value}" for key, value in timings.items()),
+        )
+    if isinstance(data, dict) and data.get("done_reason") == "length":
+        logger.warning("[ollama] reply from %s stopped at the max-token limit", model)
+
 
 def _stream_target_url(url: str) -> str:
     provider = _detect_provider(url)
@@ -2818,9 +3106,13 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         h = {"Content-Type": "application/json"}
         if headers:
             h.update(headers)
-        payload = _build_ollama_payload(
+        # Context discovery and the thinking-capability probe do DB queries
+        # and sync HTTP (/api/show, /api/ps); keep them off the event loop.
+        num_ctx = await asyncio.to_thread(get_context_length, url, model)
+        payload = await asyncio.to_thread(
+            _build_ollama_payload,
             model, messages_copy, temperature, max_tokens,
-            stream=True, tools=tools, num_ctx=get_context_length(url, model), url=url,
+            stream=True, tools=tools, num_ctx=num_ctx, url=url,
         )
     elif provider == "chatgpt-subscription":
         target_url = _normalize_chatgpt_subscription_url(url)
@@ -2828,6 +3120,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         payload = _build_chatgpt_responses_payload(model, messages_copy, temperature, max_tokens, stream=True)
     else:
         target_url = _normalize_openai_chat_url(url)
+        if _is_ollama_openai_compat_url(url):
+            # Warm the TTL-cached /api/show probe off the event loop; the
+            # payload helpers below then read it from cache.
+            await asyncio.to_thread(_route_supports_thinking, url, model)
         payload = {
             "model": model,
             "messages": messages_copy,
@@ -2876,7 +3172,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     stream_timeout = _stream_timeout(timeout)
 
     if _is_host_dead(target_url):
-        yield f'event: error\ndata: {json.dumps({"error": f"Upstream {_host_key(target_url)} unreachable (cooldown active)", "status": 503})}\n\n'
+        _dead_text = f"Upstream {_host_key(target_url)} unreachable (cooldown active)" + _ollama_unreachable_hint(url)
+        yield f'event: error\ndata: {json.dumps({"error": _dead_text, "status": 503})}\n\n'
         return
     note_model_activity(target_url, model)
     degenerate_guard = _DegenerateStreamGuard(model)
@@ -3007,15 +3304,32 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     if provider == "ollama":
         _ollama_tool_calls: List[Dict] = []
         _harmony_router = _HarmonyStreamRouter()
+        # Parity with the OpenAI-compatible path: leaked template markers are
+        # stripped, token loops trip the repetition guard, and a leading
+        # inline <think> block streams into the thinking channel.
+        _think_router = _InlineThinkRouter()
         _ollama_actual_model = ""
         _ollama_model_announced = False
+
+        def _ollama_content_events(parts: List[Tuple[str, bool]]) -> List[str]:
+            events = []
+            for part, is_thinking in parts:
+                routed = [(part, True)] if is_thinking else _think_router.feed(part)
+                events.extend(_stream_delta_event(text, thinking=flag) for text, flag in routed)
+            return events
+
+        def _ollama_flush_events() -> List[str]:
+            events = _ollama_content_events(_harmony_router.flush())
+            events.extend(_stream_delta_event(text, thinking=flag) for text, flag in _think_router.flush())
+            return events
+
         try:
             client = _get_http_client()
             async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
                 _clear_host_dead(target_url)
                 if r.status_code != 200:
                     raw = (await r.aread()).decode(errors="replace")
-                    friendly = _format_upstream_error(r.status_code, raw, target_url)
+                    friendly = _format_upstream_error(r.status_code, raw, target_url, model)
                     yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
                     return
                 async for line in r.aiter_lines():
@@ -3027,9 +3341,15 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                         continue
                     if j.get("error"):
                         err = j.get("error")
+                        raw_text = err.get("message") if isinstance(err, dict) else str(err)
                         status = _provider_stream_error_status(err, default=400)
-                        text = err.get("message") if isinstance(err, dict) else str(err)
-                        yield f'event: error\ndata: {json.dumps({"error": text or "Ollama request failed", "status": status})}\n\n'
+                        if status == 400:
+                            # Plain-string Ollama errors carry no status; OOM
+                            # and runner crashes are availability failures.
+                            status = _ollama_error_status(raw_text) or status
+                        text = _ollama_error_message(status, raw_text, url, model) or raw_text or "Ollama request failed"
+                        # Same status + text shape as the HTTP-error event above.
+                        yield f'event: error\ndata: {json.dumps({"status": status, "text": text, "error": text})}\n\n'
                         return
                     reported_model = _reported_model_name(j.get("model"))
                     if reported_model:
@@ -3042,11 +3362,19 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                     message = j.get("message") or {}
                     thinking = message.get("thinking") or ""
                     if thinking:
+                        _degenerate = degenerate_guard.check(thinking)
+                        if _degenerate:
+                            yield _degenerate
+                            return
                         yield _stream_delta_event(thinking, thinking=True)
-                    content = message.get("content") or ""
+                    content = _strip_visible_chat_template_artifacts(message.get("content") or "")
                     if content:
-                        for part, is_thinking in _harmony_router.feed(content):
-                            yield _stream_delta_event(part, thinking=is_thinking)
+                        _degenerate = degenerate_guard.check(content)
+                        if _degenerate:
+                            yield _degenerate
+                            return
+                        for event in _ollama_content_events(_harmony_router.feed(content)):
+                            yield event
                     for tc in message.get("tool_calls") or []:
                         fn = tc.get("function") or {}
                         if fn.get("name"):
@@ -3056,16 +3384,22 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                 "arguments": json.dumps(fn.get("arguments") or {}),
                             })
                     if j.get("done"):
-                        for part, is_thinking in _harmony_router.flush():
-                            yield _stream_delta_event(part, thinking=is_thinking)
+                        for event in _ollama_flush_events():
+                            yield event
                         if _ollama_tool_calls:
                             yield f'data: {json.dumps({"type": "tool_calls", "calls": _ollama_tool_calls})}\n\n'
+                        cut_by_length = j.get("done_reason") == "length"
+                        if cut_by_length:
+                            logger.info("[ollama] stream from %s stopped at the max-token limit", model)
                         if j.get("prompt_eval_count") is not None or j.get("eval_count") is not None:
                             normalized_usage = _normalize_usage_counts(
                                 j.get("prompt_eval_count", 0),
                                 j.get("eval_count", 0),
                             )
                             if normalized_usage:
+                                normalized_usage.update(_ollama_usage_timings(j))
+                                if cut_by_length:
+                                    normalized_usage["finish_reason"] = "length"
                                 _annotate_usage_model(
                                     normalized_usage,
                                     model,
@@ -3074,14 +3408,16 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                 yield f'data: {json.dumps({"type": "usage", "data": normalized_usage})}\n\n'
                         yield "data: [DONE]\n\n"
                         return
-                for part, is_thinking in _harmony_router.flush():
-                    yield _stream_delta_event(part, thinking=is_thinking)
+                for event in _ollama_flush_events():
+                    yield event
                 yield "data: [DONE]\n\n"
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
             logger.warning(f"Ollama stream connect to {target_url} failed: {e}{_tail}")
-            yield f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n'
+            _hint = _ollama_unreachable_hint(url)
+            _text = f"Cannot reach {_host_key(target_url)}" + (f".{_hint}" if _hint else "")
+            yield f'event: error\ndata: {json.dumps({"error": _text, "text": _text, "status": 503})}\n\n'
         except httpx.ReadTimeout:
             yield f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n'
         except httpx.PoolTimeout:
@@ -3295,7 +3631,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             _clear_host_dead(target_url)
             if r.status_code != 200:
                 raw = (await r.aread()).decode(errors="replace")
-                friendly = _format_upstream_error(r.status_code, raw, target_url)
+                friendly = _format_upstream_error(r.status_code, raw, target_url, model)
                 yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
                 return
 
@@ -3325,6 +3661,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                     err = j.get("error")
                                     status = _provider_stream_error_status(err, default=400)
                                     text = err.get("message") if isinstance(err, dict) else str(err)
+                                    if _is_ollama_route(url):
+                                        if status == 400:
+                                            status = _ollama_error_status(text) or status
+                                        text = _ollama_error_message(status, text, url, model) or text
                                     yield f'event: error\ndata: {json.dumps({"error": text or "Upstream request failed", "status": status})}\n\n'
                                     return
                                 chunk_model = j.get("model")
@@ -3550,7 +3890,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         _cooled = _mark_host_dead(target_url)
         _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
         logger.warning(f"Stream connect to {target_url} failed: {e}{_tail}")
-        yield f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n'
+        _hint = _ollama_unreachable_hint(url)
+        yield f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}" + (f".{_hint}" if _hint else ""), "status": 503})}\n\n'
     except httpx.ReadTimeout:
         yield f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n'
     except httpx.PoolTimeout:

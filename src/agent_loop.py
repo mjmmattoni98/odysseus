@@ -10,6 +10,7 @@ import asyncio
 import collections
 import json
 import re
+import math
 import time
 import logging
 from typing import Any, AsyncGenerator, List, Dict, Optional, Set
@@ -3165,8 +3166,14 @@ def _compute_final_metrics(
     prep_timings: Optional[Dict[str, float]] = None,
     backend_gen_tps: float = 0,
     backend_prefill_tps: float = 0,
+    backend_timings: Optional[Dict[str, float]] = None,
+    finish_reason: Optional[str] = None,
 ) -> dict:
-    """Compute token counts, TPS, and build the final metrics dict."""
+    """Compute token counts, TPS, and build the final metrics dict.
+
+    ``backend_timings`` holds backend phase durations summed over the turn's
+    rounds (native Ollama: ``load_ms``, ``prefill_ms``, ``gen_ms``).
+    """
     if has_real_usage:
         input_tokens = real_input_tokens
         output_tokens = real_output_tokens
@@ -3218,6 +3225,11 @@ def _compute_final_metrics(
     }
     if backend_prefill_tps and backend_prefill_tps > 0:
         metrics["prefill_tps"] = round(backend_prefill_tps, 2)
+    for key, value in (backend_timings or {}).items():
+        metrics[key] = round(value, 1)
+    if finish_reason == "length":
+        # The final round stopped at the max-token limit, not a natural end.
+        metrics["finish_reason"] = "length"
     if prep_timings:
         prep_total = round(sum(prep_timings.values()), 3)
         metrics["agent_prep_time"] = prep_total
@@ -3233,6 +3245,37 @@ def _compute_final_metrics(
         metrics["round_endpoint_ids"] = list(round_endpoint_ids or [])
         metrics["round_endpoint_labels"] = list(round_endpoint_labels or [])
     return metrics
+
+
+_BACKEND_TIMING_KEYS = ("load_ms", "prefill_ms", "gen_ms")
+
+
+def _accumulate_backend_timings(totals: Dict[str, float], usage: dict) -> None:
+    """Sum backend phase durations (ms) from one usage event into ``totals``."""
+    for key in _BACKEND_TIMING_KEYS:
+        value = usage.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if math.isfinite(value) and value >= 0:
+            totals[key] = totals.get(key, 0.0) + float(value)
+
+
+def _backend_speed_metrics(usage: dict) -> dict:
+    """Metrics fields for one direct-path usage event's backend speed/timings."""
+    out = {}
+    gen_tps = usage.get("gen_tps")
+    if isinstance(gen_tps, (int, float)) and not isinstance(gen_tps, bool) and gen_tps > 0:
+        out["tokens_per_second"] = round(gen_tps, 2)
+        out["tps_source"] = "backend"
+    prefill_tps = usage.get("prefill_tps")
+    if isinstance(prefill_tps, (int, float)) and not isinstance(prefill_tps, bool) and prefill_tps > 0:
+        out["prefill_tps"] = round(prefill_tps, 2)
+    timings: Dict[str, float] = {}
+    _accumulate_backend_timings(timings, usage)
+    out.update({key: round(value, 1) for key, value in timings.items()})
+    if usage.get("finish_reason") == "length":
+        out["finish_reason"] = "length"
+    return out
 
 
 def _usage_bucket(
@@ -3668,6 +3711,7 @@ async def stream_agent_loop(
         real_input_tokens = 0
         real_output_tokens = 0
         direct_has_real_usage = False
+        direct_speed_metrics = {}
 
         def _direct_candidate_request(_index, _url, candidate_model, _headers):
             candidate_is_qwen = _is_odysseus_qwen_model(candidate_model)
@@ -3777,6 +3821,7 @@ async def stream_agent_loop(
                         real_input_tokens += normalized_usage["input_tokens"]
                         real_output_tokens += normalized_usage["output_tokens"]
                         direct_has_real_usage = True
+                        direct_speed_metrics = _backend_speed_metrics(usage)
                         continue
                     if data.get("type") == "model_actual":
                         direct_actual_model = data.get("model") or direct_actual_model
@@ -3901,6 +3946,7 @@ async def stream_agent_loop(
             "tool_calls": 0,
             "direct_low_signal": True,
             **_usage_bucket_summary([direct_usage]),
+            **direct_speed_metrics,
         }
         if isinstance(direct_actual_endpoint_cost_tracked, bool):
             metrics["endpoint_cost_tracked"] = direct_actual_endpoint_cost_tracked
@@ -4473,6 +4519,8 @@ async def stream_agent_loop(
     has_real_usage = False
     backend_gen_tps = 0      # backend-reported true gen speed (llama.cpp timings)
     backend_prefill_tps = 0  # backend-reported prefill speed
+    backend_timings: Dict[str, float] = {}  # summed load/prefill/gen ms (native Ollama)
+    backend_finish_reason = None  # "length" when the latest round hit max tokens
     requested_model = model
     actual_model = model
     actual_endpoint_id = requested_endpoint_id
@@ -5161,6 +5209,8 @@ async def stream_agent_loop(
                             backend_gen_tps = u["gen_tps"]
                         if u.get("prefill_tps"):
                             backend_prefill_tps = u["prefill_tps"]
+                        _accumulate_backend_timings(backend_timings, u)
+                        backend_finish_reason = u.get("finish_reason")
                     elif data.get("type") == "fallback":
                         # The selected model failed and another answered; surface
                         # the notice so a misconfigured provider isn't masked.
@@ -6548,6 +6598,8 @@ async def stream_agent_loop(
         prep_timings=prep_timings,
         backend_gen_tps=backend_gen_tps,
         backend_prefill_tps=backend_prefill_tps,
+        backend_timings=backend_timings,
+        finish_reason=backend_finish_reason,
     )
     metrics["requested_model"] = requested_model
     metrics["endpoint_id"] = actual_endpoint_id

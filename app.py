@@ -743,6 +743,8 @@ app.include_router(setup_embedding_routes())
 # Models
 from routes.model_routes import setup_model_routes
 app.include_router(setup_model_routes(model_discovery))
+from routes.model_performance_routes import setup_model_performance_routes
+app.include_router(setup_model_performance_routes())
 
 # GitHub Copilot device-flow login
 from routes.copilot_routes import setup_copilot_routes

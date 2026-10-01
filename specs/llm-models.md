@@ -41,6 +41,8 @@ paths share the accepted-value cache and 403 fallback policy.
 
 Provider-specific behavior is part of this layer: `LLM_CONNECT_TIMEOUT` controls the connect budget for sync and streaming calls, Kimi Code endpoints retry a small whitelisted User-Agent set on 403 and cache the accepted value, official Moonshot/Kimi Code and Anthropic Opus 4.7+ payloads omit sampling controls where required, and major-only Opus IDs such as `claude-opus-5` also omit temperature instead of falling through numeric minor-version parsing. Reasoning models omit or clamp unsupported temperature values, while self-hosted compatible endpoints keep normal parameters unless detected otherwise. Mistral structured content is normalized in async utility calls as well as stream/chat paths, and Mistral/Moonshot/Kimi reasoning content, `gpt-oss` harmony output, DeepSeek V4 thinking identifiers, and native/OpenAI-compatible Ollama thinking formats keep hidden reasoning separate from visible text. Tool names that collide with GPT-OSS built-ins are aliased on the provider boundary and mapped back before execution. Copilot request metadata remains defensive against malformed `request_flags`.
 
+Native Ollama `/api/chat` streams have the same protections as the OpenAI-compatible path (repetition guard, leaked chat-template marker stripping, a leading inline `<think>` block routed to the thinking channel). Their usage event carries Ollama's own timings in the llama.cpp field names: `gen_tps`, `prefill_tps`, plus `load_ms`, `prefill_ms`, `gen_ms`, and `finish_reason: "length"` when `done_reason` is `length`. Agent and chat metrics persist these in message metadata; the stats line shows prompt tok/s and model load time when it exceeds 0.5 s (a model swap). Native tool results carry `tool_name` resolved from the preceding assistant call (the harmony alias for gpt-oss). Async payload builders run context discovery and the Ollama capability probe in a worker thread, off the event loop. `GET /api/model-performance` (owner-scoped, read-only) aggregates recent reply metrics per endpoint/model for the Added Models settings card.
+
 ## Canonical Provider And Model Shape
 
 `src.model_capabilities` owns canonical model family, task, modality,
@@ -121,6 +123,7 @@ Provider tool calls are untrusted requests, not authorization. `supports_tools` 
 ## Degraded And Platform Behavior
 
 - Provider offline or probe failures should surface actionable errors without crashing the app. Async calls retry transient 429/502/503/504 responses before failing.
+- Ollama routes (native and `/v1` on port 11434) get Ollama-specific errors: a missing model suggests `ollama pull <model>`, out-of-memory loads map to 507 and runner crashes to 502 (fallback-eligible) instead of 400, and unreachable servers get a hint to start Ollama / check `OLLAMA_HOST` (`host.docker.internal` from a container).
 - Docker deployments may need loopback URL rewriting from `127.0.0.1` to host-accessible addresses.
 - Foreground fallback selection must preserve endpoint identity, explicit owner consent, allowed-model policy, and owner scope. User/API-token LLM dispatch that can carry configured endpoint keys must pass the effective owner into resolver calls.
 - Async and streaming calls use dead-host cooldown; sync utility/vision calls do not have identical cooldown coverage.
