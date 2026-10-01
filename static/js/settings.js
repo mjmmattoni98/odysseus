@@ -824,21 +824,65 @@ async function initTtsSettings() {
   var ttsEnabledToggle = el('set-ttsEnabledToggle');
   var ttsConfigWrap = provSel ? provSel.closest('div[style*="flex-direction"]') : null;
 
+  // Local Kokoro voices, grouped by language (the voice prefix selects the
+  // Kokoro pipeline language, e.g. ef_dora -> Spanish). Filled from
+  // /api/tts/voices; the free-text input stays the fallback.
+  var kokoroSelect = document.createElement('select');
+  kokoroSelect.id = 'set-ttsKokoroVoiceSelect';
+  kokoroSelect.className = 'settings-select';
+  kokoroSelect.style.display = 'none';
+  voiceInput.parentNode.insertBefore(kokoroSelect, voiceInput);
+  var kokoroLoaded = false;
+
+  function setKokoroVoice(value) {
+    if (!kokoroLoaded) return;
+    var v = value || 'af_heart';
+    if (!Array.from(kokoroSelect.options).some(function(o) { return o.value === v; })) {
+      var custom = document.createElement('option');
+      custom.value = v; custom.textContent = v + ' (custom)';
+      kokoroSelect.insertBefore(custom, kokoroSelect.firstChild);
+    }
+    kokoroSelect.value = v;
+  }
+
+  try {
+    var vRes = await fetch('/api/tts/voices', { credentials: 'same-origin' });
+    if (vRes.ok) {
+      var vData = await vRes.json();
+      (vData.groups || []).forEach(function(g) {
+        var og = document.createElement('optgroup');
+        og.label = g.language;
+        (g.voices || []).forEach(function(v) {
+          var opt = document.createElement('option'); opt.value = v; opt.textContent = v; og.appendChild(opt);
+        });
+        kokoroSelect.appendChild(og);
+        // OpenAI-compatible Kokoro servers (e.g. Kokoro-FastAPI) accept the
+        // same voice ids, so offer them for endpoint providers too.
+        var epGroup = og.cloneNode(true);
+        epGroup.label = 'Kokoro-compatible servers: ' + g.language;
+        voiceSelect.appendChild(epGroup);
+      });
+      kokoroLoaded = kokoroSelect.options.length > 0;
+    }
+  } catch (e) { console.warn('Failed to load Kokoro voices', e); }
+
   function isEndpoint() { return provSel.value.startsWith('endpoint:'); }
+  function useKokoroSelect() { return provSel.value === 'local' && kokoroLoaded; }
   function getModel() { return isEndpoint() ? modelSelect.value : modelInput.value; }
-  function getVoice() { return isEndpoint() ? voiceSelect.value : voiceInput.value; }
+  function getVoice() { return isEndpoint() ? voiceSelect.value : (useKokoroSelect() ? kokoroSelect.value : voiceInput.value); }
 
   function updateVisibility() {
     var prov = provSel.value;
     modelRow.style.display = prov.startsWith('endpoint:') ? 'flex' : 'none';
     voiceRow.style.display = prov === 'disabled' ? 'none' : 'flex';
     speedRow.style.display = prov === 'disabled' ? 'none' : 'flex';
+    kokoroSelect.style.display = useKokoroSelect() ? '' : 'none';
     if (isEndpoint()) {
       modelSelect.style.display = ''; modelInput.style.display = 'none';
       voiceSelect.style.display = ''; voiceInput.style.display = 'none';
     } else {
       modelSelect.style.display = 'none'; modelInput.style.display = '';
-      voiceSelect.style.display = 'none'; voiceInput.style.display = prov === 'disabled' ? 'none' : '';
+      voiceSelect.style.display = 'none'; voiceInput.style.display = (prov === 'disabled' || useKokoroSelect()) ? 'none' : '';
     }
   }
 
@@ -860,6 +904,7 @@ async function initTtsSettings() {
     if (settings.tts_provider) provSel.value = settings.tts_provider;
     if (settings.tts_model) { modelSelect.value = settings.tts_model; modelInput.value = settings.tts_model; }
     if (settings.tts_voice) { voiceSelect.value = settings.tts_voice; voiceInput.value = settings.tts_voice; }
+    if (settings.tts_provider === 'local') setKokoroVoice(settings.tts_voice);
     if (settings.tts_speed) { speedSelect.value = settings.tts_speed; }
     if (ttsEnabledToggle) ttsEnabledToggle.checked = settings.tts_enabled !== false;
   } catch (e) { console.warn('Failed to load TTS settings', e); }
@@ -888,7 +933,7 @@ async function initTtsSettings() {
 
   provSel.addEventListener('change', function() {
     var prov = provSel.value;
-    if (prov === 'local') voiceInput.value = 'af_heart';
+    if (prov === 'local') { voiceInput.value = 'af_heart'; setKokoroVoice('af_heart'); }
     else if (isEndpoint()) { voiceSelect.value = 'alloy'; modelSelect.value = 'tts-1'; }
     else if (prov === 'browser') { voiceInput.value = ''; voiceInput.placeholder = 'OS default voice'; }
     updateVisibility();
@@ -898,6 +943,7 @@ async function initTtsSettings() {
   modelInput.addEventListener('change', saveTTS);
   voiceSelect.addEventListener('change', saveAndClearCache);
   voiceInput.addEventListener('change', saveTTS);
+  kokoroSelect.addEventListener('change', saveAndClearCache);
   speedSelect.addEventListener('change', saveAndClearCache);
   if (ttsEnabledToggle) ttsEnabledToggle.addEventListener('change', function() { syncTtsDisabled(); saveTTS(); });
 
@@ -920,6 +966,14 @@ async function initTtsSettings() {
         setTimeout(function() { ttsMsg.textContent = ''; }, 2000); return;
       }
       var testText = 'Hello, this is a test of text to speech.';
+      // Kokoro reads with the voice's language (ef_dora -> Spanish): preview in it.
+      var previewByLang = {
+        e: 'Hola, esta es una prueba de texto a voz.',
+        f: 'Bonjour, ceci est un test de synthèse vocale.',
+        i: 'Ciao, questa è una prova di sintesi vocale.',
+        p: 'Olá, este é um teste de texto para fala.',
+      };
+      if (prov === 'local') testText = previewByLang[(getVoice() || '').charAt(0)] || testText;
       previewPlaying = true; previewBtn.textContent = 'Loading...';
       try {
         if (prov === 'browser') {
@@ -1040,6 +1094,7 @@ async function initSttSettings() {
       sttMsg.textContent = 'Saved'; sttMsg.style.color = 'var(--fg)'; setTimeout(() => { sttMsg.textContent = ''; }, 2000);
       // Notify voiceRecorder of effective provider and update send button icon
       if (window.voiceRecorderModule) window.voiceRecorderModule._sttProvider = effectiveProvider();
+      if (window.voiceRecorderModule && window.voiceRecorderModule.refreshSttProvider) window.voiceRecorderModule.refreshSttProvider();
       if (window._updateSendBtnIcon) window._updateSendBtnIcon();
     } catch (e) { sttMsg.textContent = 'Failed to save'; sttMsg.style.color = 'var(--red)'; }
   }

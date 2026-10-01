@@ -29,6 +29,8 @@ Generic API integrations are cross-referenced in `integrations.md`. Model endpoi
 
 `src.settings` owns `data/settings.json` and `data/features.json`. Settings and features are merged over defaults and cached briefly. Missing, corrupt, unreadable, or non-object stores fall back to defaults.
 
+Secret-valued settings are listed once in `src.settings.SECRET_SETTING_KEYS` (search provider keys `brave_api_key`, `google_pse_key`, `tavily_api_key`, `serper_api_key`, legacy `search_api_key`, and `carddav_password`). `save_settings()` encrypts them with `src.secret_storage` (`enc:` prefix) and `load_settings()` returns plaintext, so readers are unchanged. Legacy plaintext values stay readable and are encrypted by the next save or by the one-shot `migrate_secret_settings()` rewrite at settings-route setup (raw file, defaults not materialized); the read path never writes. A value that cannot be decrypted (missing/rotated app key) reads as unset with one warning per key, and an empty save does not overwrite that ciphertext. If encryption fails the value is kept as plaintext with a warning. Legacy flat email passwords are read raw by other modules and are not in the list.
+
 `default_model_fallbacks` is a retired setting key. `src.settings.without_retired_settings()` removes it from loaded/API-visible settings, writes ignore it, and no migration treats it as consent for the owner-scoped `foreground_fallback_enabled` plus ordered `foreground_model_fallbacks` contract.
 
 `routes.prefs_routes` owns `data/user_prefs.json`. It supports:
@@ -55,11 +57,11 @@ Settings runtime:
 
 - `GET /api/auth/features` is public feature visibility metadata;
 - `POST /api/auth/features` is admin-only;
-- `GET /api/auth/settings` returns full settings to admins;
+- `GET /api/auth/settings` returns full settings to admins with set credentials replaced by `MASKED_SECRET` (`mask_settings()`; presence only, so the UI still shows "key set");
 - non-admin or unauthenticated `GET /api/auth/settings` returns `scrub_settings()` output;
-- `POST /api/auth/settings` is admin-only and only writes keys present in `DEFAULT_SETTINGS`.
+- `POST /api/auth/settings` is admin-only and only writes keys present in `DEFAULT_SETTINGS`; a posted `MASKED_SECRET` keeps the stored secret (the mask is never persisted) and the response is masked.
 
-`src.settings_scrub` owns deep secret-key scrubbing for non-admin settings reads, including snake_case and camelCase secret-like key names. It preserves structure while blanking secret-shaped string values.
+`src.settings_scrub` owns deep secret-key scrubbing for non-admin settings reads, including snake_case and camelCase secret-like key names. It preserves structure while blanking secret-shaped string values. `mask_settings()` is the admin variant; it masks credential-shaped keys but leaves capability handles such as `reminder_webhook_integration_id` visible.
 
 Admin gates inherit the auth contracts in `auth-security.md`: normal deployments require an admin user, while `AUTH_ENABLED=false`, first-run/setup mode, validated internal-tool loopback, and direct localhost bypass have explicit behavior in auth middleware/helpers.
 
@@ -114,7 +116,7 @@ The stale `app_api` prompt text that mentions `/api/settings` is not the canonic
 - feature flags;
 - per-user preferences.
 
-HTTP export is secret-bearing because it includes raw settings. Treat exported files as sensitive admin artifacts.
+HTTP export is secret-bearing because it includes settings with secrets decrypted (so a backup restores on an install with a different app key; import re-encrypts them). Treat exported files as sensitive admin artifacts.
 
 HTTP import is best-effort and section-based. It rejects invalid top-level JSON, ignores unrecognized or wrongly typed sections, merges recognized sections, and may partially write earlier sections before a later failure. Memory dedup is scoped to the importing user; imported memories/skills without owners are stamped to the caller, while explicit owner fields are preserved. Skill import writes through the disk-backed `SkillsManager.add_skill()` API, not the removed JSON-era `save()` shape.
 

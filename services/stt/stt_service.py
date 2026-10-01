@@ -2,6 +2,7 @@
 """Multi-provider Speech-to-Text service — dispatches to local Whisper, OpenAI-compatible API, or browser."""
 
 import io
+import re
 import logging
 import httpx
 import tempfile
@@ -9,6 +10,30 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
+
+_LANGUAGE_NAMES = {
+    "english": "en", "spanish": "es", "español": "es", "espanol": "es",
+    "french": "fr", "german": "de", "italian": "it", "portuguese": "pt",
+    "catalan": "ca", "japanese": "ja", "chinese": "zh",
+}
+
+
+def normalize_stt_language(value) -> str:
+    """Map the stt_language setting to what Whisper-style backends accept: a
+    bare ISO-639 code ('es'). BCP-47 tags ('es-ES', 'es_AR') keep their primary
+    subtag; ''/'auto' (or anything unrecognizable) means auto-detect."""
+    if not isinstance(value, str):
+        return ""
+    v = value.strip().lower().replace("_", "-")
+    if v in _LANGUAGE_NAMES:
+        return _LANGUAGE_NAMES[v]
+    if not v or v in ("auto", "detect", "auto-detect"):
+        return ""
+    primary = v.split("-", 1)[0]
+    if re.fullmatch(r"[a-z]{2,3}", primary):
+        return primary
+    logger.warning(f"Ignoring unrecognized stt_language {value!r}; using auto-detect")
+    return ""
 
 
 class STTService:
@@ -159,7 +184,7 @@ class STTService:
             return None
         provider = settings["stt_provider"]
         model = settings["stt_model"]
-        language = settings.get("stt_language", "")
+        language = normalize_stt_language(settings.get("stt_language", ""))
 
         if provider in ("disabled", "browser"):
             return None

@@ -21,6 +21,22 @@ logger = logging.getLogger(__name__)
 # tombstone boundary.
 RETIRED_SETTING_KEYS = frozenset({"default_model_fallbacks"})
 
+# Secret-valued settings, encrypted at rest in data/settings.json with the app
+# key (``src.secret_storage``, ``enc:`` prefix). This is the one list:
+# ``load_settings()`` hands readers plaintext, ``save_settings()`` encrypts, and
+# the settings API masks them. Only keys whose readers all go through
+# ``load_settings()`` / ``get_setting()`` belong here — the legacy flat email
+# passwords (imap_password / smtp_password) are read straight from the file by
+# the email MCP server and account seeding, so they stay out.
+SECRET_SETTING_KEYS = frozenset({
+    "brave_api_key",
+    "google_pse_key",
+    "tavily_api_key",
+    "serper_api_key",
+    "search_api_key",    # legacy shared search key, still a read fallback
+    "carddav_password",  # already written encrypted by routes/contacts
+})
+
 # Tiny TTL cache for settings/features. get_setting() is called on hot paths
 # (every chat, every preprocess); without this it re-parses the JSON each call.
 # Picks up edits within _CACHE_TTL seconds, which is fine for human-edited config.
@@ -251,6 +267,129 @@ DEFAULT_FEATURES = {
 }
 
 
+# ── Secret settings at rest ──
+
+_ENC_PREFIX = "enc:"
+_secret_warned: set[str] = set()
+
+
+def _warn_once(tag: str, message: str):
+    if tag not in _secret_warned:
+        _secret_warned.add(tag)
+        logger.warning(message)
+
+
+def _read_raw_settings() -> dict:
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        return saved if isinstance(saved, dict) else {}
+    except (FileNotFoundError, PermissionError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _is_undecryptable(value) -> bool:
+    if not (isinstance(value, str) and value.startswith(_ENC_PREFIX)):
+        return False
+    try:
+        from src.secret_storage import try_decrypt
+        return try_decrypt(value) is None
+    except Exception:
+        return True
+
+
+def _decrypt_secret_settings(settings: dict) -> dict:
+    """Decrypt SECRET_SETTING_KEYS in place. A value that cannot be decrypted
+    (missing/rotated app key, corrupt token) reads as unset, with one warning
+    per key per process — never an exception."""
+    for key in SECRET_SETTING_KEYS:
+        value = settings.get(key)
+        if not (isinstance(value, str) and value.startswith(_ENC_PREFIX)):
+            continue
+        try:
+            from src.secret_storage import try_decrypt
+            plain = try_decrypt(value)
+        except Exception:
+            plain = None
+        if plain is None:
+            _warn_once(f"decrypt:{key}", (
+                f"Setting '{key}' could not be decrypted (app key missing or rotated?); "
+                "treating it as unset. Re-enter it in Settings."
+            ))
+            plain = ""
+        settings[key] = plain
+    return settings
+
+
+def _encrypt_secret_settings(settings: dict) -> dict:
+    """Copy of ``settings`` ready for disk: SECRET_SETTING_KEYS encrypted.
+
+    - the admin mask placeholder keeps the stored value (never persisted);
+    - an empty value does not overwrite stored ciphertext that can't be
+      decrypted, so an unrelated save can't destroy a secret that restoring
+      the old app key would bring back;
+    - if encryption itself fails (unreadable/unwritable key file), the value
+      is kept as plaintext with a warning instead of failing the save.
+    """
+    from src.settings_scrub import MASKED_SECRET
+
+    out = dict(settings)
+    raw = None
+    for key in SECRET_SETTING_KEYS:
+        if key not in out:
+            continue
+        value = out[key]
+        if value == MASKED_SECRET or value == "":
+            if raw is None:
+                raw = _read_raw_settings()
+            stored = raw.get(key)
+            if value == MASKED_SECRET:
+                if stored is None:
+                    out.pop(key)
+                    continue
+                value = out[key] = stored
+            else:
+                if _is_undecryptable(stored):
+                    out[key] = stored
+                continue
+        if not isinstance(value, str) or not value or value.startswith(_ENC_PREFIX):
+            continue
+        try:
+            from src.secret_storage import encrypt
+            out[key] = encrypt(value)
+        except Exception as e:
+            _warn_once(f"encrypt:{key}", f"Could not encrypt setting '{key}' ({e}); storing it unencrypted.")
+    return out
+
+
+def migrate_secret_settings() -> bool:
+    """Encrypt plaintext SECRET_SETTING_KEYS already in data/settings.json.
+
+    Called once at startup (settings routes setup). Rewrites the raw file
+    atomically without materializing defaults; a no-op when nothing is
+    plaintext. Returns True when the file was rewritten. Never raises.
+    """
+    try:
+        raw = _read_raw_settings()
+        plaintext = [
+            k for k in SECRET_SETTING_KEYS
+            if isinstance(raw.get(k), str) and raw[k] and not raw[k].startswith(_ENC_PREFIX)
+        ]
+        if not plaintext:
+            return False
+        updated = _encrypt_secret_settings(raw)
+        if all(updated.get(k) == raw.get(k) for k in plaintext):
+            return False  # encryption unavailable; already warned
+        from core.atomic_io import atomic_write_json
+        atomic_write_json(SETTINGS_FILE, updated, indent=2)
+        _invalidate_caches()
+        logger.info(f"Encrypted {len(plaintext)} secret setting(s) at rest: {', '.join(sorted(plaintext))}")
+        return True
+    except Exception as e:
+        logger.warning(f"Secret settings migration skipped: {e}")
+        return False
+
+
 # ── Settings (data/settings.json) ──
 
 def load_settings() -> dict:
@@ -267,14 +406,17 @@ def load_settings() -> dict:
         merged = {**DEFAULT_SETTINGS, **saved}
     except (FileNotFoundError, PermissionError, json.JSONDecodeError, ValueError):
         merged = dict(DEFAULT_SETTINGS)
+    _decrypt_secret_settings(merged)
     _settings_cache = (now, merged)
     return merged
 
 
 def save_settings(settings: dict):
-    """Persist settings to disk (atomic; see core.atomic_io)."""
+    """Persist settings to disk (atomic; see core.atomic_io). Secret keys are
+    encrypted on the way out; plaintext left by older versions is migrated by
+    any save because callers pass the full settings dict."""
     from core.atomic_io import atomic_write_json
-    atomic_write_json(SETTINGS_FILE, settings, indent=2)
+    atomic_write_json(SETTINGS_FILE, _encrypt_secret_settings(settings), indent=2)
     _invalidate_caches()
 
 

@@ -15,10 +15,11 @@ from core.atomic_io import atomic_write_json, atomic_write_text
 from core.auth import AuthManager, RESERVED_USERNAMES, SetAdminResult, TOKEN_TTL
 from src.constants import DEEP_RESEARCH_DIR, MEMORY_FILE, PASSWORD_MIN_LENGTH, SKILLS_DIR
 from src.rate_limiter import RateLimiter
-from src.settings_scrub import scrub_settings
+from src.settings_scrub import MASKED_SECRET, mask_settings, scrub_settings
 from src.settings import (
     load_settings as _load_settings,
     save_settings as _save_settings,
+    migrate_secret_settings as _migrate_secret_settings,
     load_features as _load_features,
     save_features as _save_features,
     DEFAULT_SETTINGS,
@@ -714,13 +715,14 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
 
     @router.get("/settings")
     async def get_settings(request: Request):
-        """Returns app settings. Admins get the full set; non-admins get
-        a scrubbed copy with secret keys blanked. The frontend uses this
-        for keybinds + TTS prefs, so it stays callable without admin."""
+        """Returns app settings. Admins get the full set with stored secrets
+        masked (presence only — see MASKED_SECRET); non-admins get a scrubbed
+        copy with secret keys blanked. The frontend uses this for keybinds +
+        TTS prefs, so it stays callable without admin."""
         user = _get_current_user(request)
         settings = without_retired_settings(_load_settings())
         if user and auth_manager.is_admin(user):
-            return settings
+            return mask_settings(settings)
         return scrub_settings(settings)
 
     @router.post("/settings")
@@ -744,6 +746,8 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             if key not in body:
                 continue
             val = body[key]
+            if val == MASKED_SECRET:
+                continue  # UI echoed the mask back: keep the stored secret
             if key in _INT_RANGES:
                 lo, hi = _INT_RANGES[key]
                 try:
@@ -753,12 +757,15 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                 val = max(lo, min(val, hi))
             current[key] = val
         _save_settings(current)
-        return without_retired_settings(current)
+        return mask_settings(without_retired_settings(current))
 
     # ---- Integrations CRUD ----
 
     # Run migration on startup
     migrate_from_settings()
+    # Encrypt search/integration API keys left in plaintext by older versions
+    # (one controlled rewrite here instead of writing from the hot read path).
+    _migrate_secret_settings()
 
     @router.get("/integrations")
     async def list_integrations_route(request: Request):

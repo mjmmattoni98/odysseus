@@ -2,6 +2,7 @@
 """STT API routes — multi-provider (local Whisper, API endpoint, browser)."""
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi.concurrency import run_in_threadpool
 import logging
 
 from src.upload_limits import read_upload_limited, STT_MAX_AUDIO_BYTES
@@ -17,7 +18,7 @@ def setup_stt_routes(stt_service):
     async def get_stt_stats():
         """Get STT service statistics"""
         try:
-            return stt_service.get_stats()
+            return await run_in_threadpool(stt_service.get_stats)
         except Exception as e:
             logger.error(f"Failed to get STT stats: {e}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -26,7 +27,10 @@ def setup_stt_routes(stt_service):
     async def transcribe_audio(file: UploadFile = File(...)):
         """Transcribe uploaded audio file to text"""
         try:
-            if not stt_service.available:
+            # The first availability probe loads the Whisper model and
+            # transcription is CPU/GPU-bound: keep both off the event loop so
+            # a voice turn doesn't stall unrelated requests.
+            if not await run_in_threadpool(lambda: stt_service.available):
                 raise HTTPException(
                     status_code=503,
                     detail={"message": "STT service not available or set to browser mode"}
@@ -36,7 +40,7 @@ def setup_stt_routes(stt_service):
             if not audio_bytes:
                 raise HTTPException(status_code=400, detail={"message": "Empty audio file"})
 
-            text = stt_service.transcribe(audio_bytes)
+            text = await run_in_threadpool(stt_service.transcribe, audio_bytes)
             if text is None:
                 raise HTTPException(
                     status_code=500,

@@ -2,7 +2,8 @@
 secret_storage.py
 
 Fernet-based symmetric encryption for secrets stored in the SQLite DB
-(IMAP / SMTP passwords today; safe to extend). The key lives at
+(IMAP / SMTP passwords, endpoint API keys) and for the secret-valued keys of
+data/settings.json (`src.settings.SECRET_SETTING_KEYS`). The key lives at
 `data/.app_key`, mode 0o600, generated on first call. `data/` is
 gitignored so the key never ships with the repo.
 
@@ -81,6 +82,18 @@ def decrypt(value: str) -> str:
     except Exception as e:
         logger.error(f"Decrypt failure: {e}")
         return ""
+
+
+def try_decrypt(value: str) -> str | None:
+    """Like `decrypt()`, but returns None (and logs nothing) when an `enc:`
+    value cannot be decrypted, so callers can tell "unreadable" (missing or
+    rotated key, corrupt token) apart from "empty" and warn once themselves."""
+    if not value or not value.startswith(_PREFIX):
+        return value or ""
+    try:
+        return _get_fernet().decrypt(value[len(_PREFIX):].encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
 
 
 def is_encrypted(value: str) -> bool:

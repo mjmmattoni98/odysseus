@@ -22,6 +22,9 @@ let _browserTranscript = '';
 
 // Cached STT provider — refreshed on settings change
 let _sttProvider = 'disabled';
+// stt_language setting ('' = auto). Browser STT takes it as a BCP-47 tag;
+// server providers apply it themselves.
+let _sttLanguage = '';
 
 /**
  * Fetch current STT provider from server settings
@@ -32,6 +35,7 @@ async function refreshSttProvider() {
     if (res.ok) {
       const stats = await res.json();
       _sttProvider = stats.provider || 'disabled';
+      _sttLanguage = typeof stats.language === 'string' ? stats.language.trim() : '';
       // Notify the send button to update its icon
       if (window._updateSendBtnIcon) window._updateSendBtnIcon();
     }
@@ -80,7 +84,7 @@ function startBrowserSTT() {
   _recognition = new SpeechRecognition();
   _recognition.continuous = true;
   _recognition.interimResults = false;
-  _recognition.lang = '';
+  _recognition.lang = browserSttLang();
 
   _recognition.onresult = (event) => {
     for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -106,9 +110,18 @@ function stopBrowserSTT() {
 }
 
 /**
+ * Language for the Web Speech API: the stt_language setting, or '' (browser
+ * default) when unset/'auto'.
+ */
+export function browserSttLang() {
+  const lang = (_sttLanguage || '').replace('_', '-');
+  return !lang || lang.toLowerCase() === 'auto' ? '' : lang;
+}
+
+/**
  * Send audio to server for transcription
  */
-async function transcribeOnServer(audioBlob) {
+export async function transcribeOnServer(audioBlob) {
   const formData = new FormData();
   formData.append('file', audioBlob, 'audio.webm');
 
@@ -276,8 +289,13 @@ const voiceRecorderModule = {
   getIsRecording,
   init,
   refreshSttProvider,
+  transcribeOnServer,
+  browserSttLang,
   get _sttProvider() { return _sttProvider; },
   set _sttProvider(v) { _sttProvider = v; },
 };
+
+// settings.js updates the provider/language here after an STT settings save.
+window.voiceRecorderModule = voiceRecorderModule;
 
 export default voiceRecorderModule;

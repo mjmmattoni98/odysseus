@@ -249,6 +249,12 @@ class AITTSManager {
         }
     }
 
+    /** True while audio is playing or queued (used by conversation mode). */
+    isBusy() {
+        if (this.isPlaying || this._processing || this._queue.length > 0) return true;
+        return !!(this.useBrowserTTS && window.speechSynthesis && window.speechSynthesis.speaking);
+    }
+
     /**
      * Enqueue a message for auto-play. Plays sequentially — each message
      * finishes before the next starts. Stopping any message clears the queue.

@@ -42,7 +42,19 @@ def is_secret_key(name: str) -> bool:
         return False
     if n in _SENSITIVE_KEY_EXACT:
         return True
+    return _is_credential_name(n)
+
+
+def _is_credential_name(n: str) -> bool:
     return any(n.endswith(p) or n == p.lstrip("_") for p in _SECRET_KEY_PATTERNS)
+
+
+def is_credential_key(name: str) -> bool:
+    """Secret-shaped credential names (API keys, passwords, tokens). Unlike
+    ``is_secret_key`` this excludes non-secret capability handles such as
+    ``reminder_webhook_integration_id`` that admins still need to see."""
+    n = _canonical_key_name(name)
+    return n not in _SECRET_KEY_ALLOW and _is_credential_name(n)
 
 
 def _scrub_value(key, value):
@@ -68,3 +80,29 @@ def scrub_settings(settings: dict) -> dict:
     if not isinstance(settings, dict):
         return {}
     return {k: _scrub_value(k, v) for k, v in (settings or {}).items()}
+
+
+# Placeholder admins see instead of a stored secret. Non-empty on purpose: the
+# settings UI shows "key set" from a truthy value and posts the field back
+# unchanged, and ``save_settings`` / the settings POST treat this exact value as
+# "keep the stored secret" so the mask is never persisted.
+MASKED_SECRET = "\u2022" * 8
+
+
+def _mask_value(key, value):
+    if isinstance(value, dict):
+        return {k: _mask_value(k, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_mask_value(key, item) for item in value]
+    if is_credential_key(key) and isinstance(value, str) and value:
+        return MASKED_SECRET
+    return value
+
+
+def mask_settings(settings: dict) -> dict:
+    """Admin view: like ``scrub_settings`` but a set secret becomes
+    ``MASKED_SECRET`` (presence stays visible) instead of ``""``. Decrypted
+    secrets never leave the process through the settings API."""
+    if not isinstance(settings, dict):
+        return {}
+    return {k: _mask_value(k, v) for k, v in settings.items()}
