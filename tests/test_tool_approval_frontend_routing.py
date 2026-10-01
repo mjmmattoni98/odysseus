@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -99,5 +100,7 @@ def test_every_changed_approval_module_is_cache_busted_together():
     assert f"chatStream.js?v={version}" in chat
     assert f"compare/index.js?v={version}" in app
     assert f"stream.js?v={version}" in compare_index
-    # One chatRenderer instance, so the ask_user keydown listener binds once.
-    assert f"chatRenderer.js?v={version}" in compare_stream
+    # One chatRenderer instance, so the ask_user keydown listener binds once:
+    # every importer must use the same URL as index.html.
+    renderer_version = re.search(r"chatRenderer\.js\?v=([A-Za-z0-9_]+)", index).group(1)
+    assert f"chatRenderer.js?v={renderer_version}" in compare_stream

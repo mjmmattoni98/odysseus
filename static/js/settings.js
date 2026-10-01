@@ -831,7 +831,7 @@ async function initTtsSettings() {
   kokoroSelect.id = 'set-ttsKokoroVoiceSelect';
   kokoroSelect.className = 'settings-select';
   kokoroSelect.style.display = 'none';
-  voiceInput.parentNode.insertBefore(kokoroSelect, voiceInput);
+  if (voiceInput && voiceInput.parentNode) voiceInput.parentNode.insertBefore(kokoroSelect, voiceInput);
   var kokoroLoaded = false;
 
   function setKokoroVoice(value) {

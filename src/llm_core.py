@@ -507,21 +507,8 @@ _OLLAMA_RUNNER_CRASH_RE = re.compile(
 
 
 def _is_ollama_route(url: str) -> bool:
-    """True for native Ollama, or Ollama's ``/v1`` surface on its own port/host.
-
-    ``_is_ollama_openai_compat_url`` also matches any loopback ``/v1`` server,
-    so the ``/v1`` case additionally requires Ollama's default port or an
-    "ollama" host name; llama.cpp/vLLM on localhost keep neutral wording.
-    """
-    if _is_ollama_native_url(url or ""):
-        return True
-    if not _is_ollama_openai_compat_url(url or ""):
-        return False
-    try:
-        parsed = urlparse(url or "")
-        return parsed.port == 11434 or "ollama" in (parsed.hostname or "").lower()
-    except Exception:
-        return False
+    """True for native Ollama or Ollama's OpenAI-compatible ``/v1`` surface."""
+    return _is_ollama_native_url(url or "") or _is_ollama_openai_compat_url(url or "")
 
 
 def _ollama_error_status(detail: str) -> Optional[int]:
@@ -2372,7 +2359,9 @@ def list_model_ids(
         return model_ids
     except Exception:
         try:
-            if ":11434" in base_chat_url or "ollama" in base_chat_url.lower():
+            from src.ollama_capabilities import is_ollama_url
+
+            if is_ollama_url(base_chat_url) or "ollama" in base_chat_url.lower():
                 root = base_chat_url.replace("/v1/chat/completions", "").replace("/chat/completions", "").rstrip("/")
                 r = httpx.get(root + "/api/tags", timeout=timeout)
                 r.raise_for_status()

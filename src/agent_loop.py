@@ -936,7 +936,11 @@ def _is_ollama_openai_compat_url(endpoint_url: str) -> bool:
     except Exception:
         return False
     path = (parsed.path or "").rstrip("/")
-    return parsed.port == 11434 and (path == "/v1" or path.startswith("/v1/"))
+    if not (path == "/v1" or path.startswith("/v1/")):
+        return False
+    from src.ollama_capabilities import is_ollama_url
+
+    return is_ollama_url(endpoint_url)
 
 
 def _is_local_openai_compat_url(endpoint_url: str) -> bool:
@@ -1461,6 +1465,43 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("web")
     if has(r"\b(research|deep dive|investigate|look into)\b"):
         domains.add("web")
+    # Spanish. The tool index embeds descriptions with an English MiniLM, so
+    # Spanish requests score like unrelated tools (~0.1-0.25) and would get
+    # no domain tools without these keyword routes.
+    if has(r"\b(correos?|e-?mails?|bandeja(?: de entrada)?|buz[oó]n|reenv[ií]\w*|redact\w* (?:un |el )?correo|respond\w* (?:al|el|a este) correo)\b"):
+        domains.add("email")
+    if has(
+        r"\b(notas?|apunt[ae]\w*|anot[ae]\w*|recordatorios?|recu[eé]rd\w*|av[ií]sa\w*|tareas?|pendientes|"
+        r"lista de (?:la )?compra|lista de tareas)\b",
+        r"\b(cada (?:d[ií]a|mañana|tarde|noche|semana|lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)|"
+        r"todos los d[ií]as|autom[aá]ticamente|tarea programada)\b",
+        r"\b(calendario|eventos?|reuni[oó]n|reuniones|citas?|agenda\w*)\b",
+    ):
+        domains.add("notes_calendar_tasks")
+    if has(r"\b(documentos?|borrador|redact[ae]\w*|carta|poema|cuento|ensayo|reescrib\w*|corrig[ea]\w*)\b"):
+        domains.add("documents")
+    if "notes_calendar_tasks" not in domains and has(r"\bescrib[ea]\w*\b"):
+        domains.add("documents")
+    if has(
+        r"\b(busca\w*|b[uú]squeda|internet|en la web|noticias|actualidad|pron[oó]stico|precios? de|"
+        r"cotizaci[oó]n|p[aá]gina web|sitio web|investig\w*)\b",
+        r"\b(el tiempo|qu[eé] tiempo hace|temperatura)\b",
+    ):
+        domains.add("web")
+    if has(r"\b(abre|muestra|activa|desactiva|enciende|apaga|cambia (?:el |de )?modelo|ajustes|tema|panel)\b"):
+        domains.add("ui")
+    if has(r"\b(historial de (?:chats?|conversaciones)|renombr\w* (?:el |este )?chat|borr\w* (?:el |este )?chat|"
+           r"archiv\w* (?:el |este )?chat|mis chats|conversaciones anteriores)\b"):
+        domains.add("sessions")
+    if has(r"\b(archivos?|ficheros?|carpetas?|directorios?|repositorio|terminal|consola)\b"):
+        domains.add("files")
+    if has(r"\b(configuraci[oó]n|configur[ae]\w*|preferencias?)\b"):
+        domains.add("settings")
+    if has(r"\b(contactos?|tel[eé]fono|libreta de direcciones)\b"):
+        domains.add("contacts")
+    if has(r"\b(descarg\w* (?:el |un |otro )?modelo|serv\w* (?:el |un )?modelo|lanz\w* (?:el |un )?modelo|"
+           r"modelos? (?:cargados?|instalados?|disponibles)|qu[eé] modelos?)\b"):
+        domains.add("cookbook")
     if has(r"\b(open|show|toggle|turn on|turn off|disable|enable|switch model|change model|settings|theme|panel)\b"):
         domains.add("ui")
     if has(r"\b(session|chat history|rename chat|delete chat|archive chat|fork chat|list chats)\b"):
@@ -3540,10 +3581,15 @@ def _detect_runaway_call(call_freq, threshold=15):
 _LOCAL_TOOL_SCHEMA_COUNT_CEILING = 24
 _SMALL_CONTEXT_TOOL_COUNT_CEILING = 6
 _SMALL_CONTEXT_RETRIEVAL_K = 4
-_SMALL_CONTEXT_RETRIEVAL_MIN_SCORE = 0.3
+# Cosine scores from the default English MiniLM tool index: clearly relevant
+# English requests land around 0.28-0.56 ("remind me tomorrow…" -> manage_notes
+# 0.28, "check my inbox…" -> list_emails 0.55), unrelated tools around
+# 0.10-0.16. Non-English requests score low across the board, which is why the
+# keyword routes in _classify_agent_request cover them.
+_SMALL_CONTEXT_RETRIEVAL_MIN_SCORE = 0.2
 # Follow-up turns of a sticky conversation only add similarity-retrieved tools
 # above this score; explicit intent (keywords, domains, forced tools) always adds.
-_STICKY_RETRIEVAL_MIN_SCORE = 0.4
+_STICKY_RETRIEVAL_MIN_SCORE = 0.25
 
 # Priority tiers for the cap (lower = kept first).
 _TOOL_RANK_PINNED = 0      # always-on loop primitives and per-request forced tools

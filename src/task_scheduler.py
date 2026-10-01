@@ -2072,13 +2072,37 @@ class TaskScheduler:
         extraction_timeout = int(get_setting("research_extraction_timeout_seconds", 90) or 90)
         extraction_concurrency = int(get_setting("research_extraction_concurrency", 3) or 3)
 
+        # Same hardware preset as panel-launched research (see
+        # src/research_presets.py); scheduled runs keep their own 8-round and
+        # 10-minute bounds.
+        from src.research_presets import resolve_research_profile, research_round_limits
+        profile = await asyncio.to_thread(
+            resolve_research_profile, endpoint_url, model, max_report_tokens=max_tokens,
+        )
+        preset = profile.preset
+        _max_rounds, _min_rounds, _auto_rounds = research_round_limits(8, preset)
         researcher = DeepResearcher(
             llm_endpoint=endpoint_url,
             llm_model=model,
             llm_headers=headers,
-            max_rounds=8,
+            max_rounds=_max_rounds,
+            min_rounds=_min_rounds,
+            auto_rounds=_auto_rounds,
             max_time=600,  # 10 min for scheduled research
-            max_report_tokens=max_tokens,
+            max_urls_per_round=preset.urls_per_query,
+            max_content_chars=preset.page_chars,
+            max_report_tokens=preset.report_max_tokens,
+            synthesis_max_tokens=preset.synthesis_max_tokens,
+            synthesis_window=preset.synthesis_findings,
+            queries_first_round=preset.queries_first_round,
+            queries_per_round=preset.queries_per_round,
+            extraction_max_tokens=preset.extraction_max_tokens,
+            query_max_tokens=preset.query_max_tokens,
+            report_min_words=preset.report_min_words,
+            expand_below_words=preset.expand_below_words,
+            mechanical_think=preset.mechanical_think,
+            context_window=profile.context_window,
+            preset_label=preset.label,
             extraction_timeout=extraction_timeout,
             extraction_concurrency=extraction_concurrency,
         )

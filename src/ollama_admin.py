@@ -135,7 +135,7 @@ def _is_ollama_cloud(host: str) -> bool:
 
 
 def endpoint_looks_like_ollama(base_url: str, endpoint_kind: Optional[str] = None) -> bool:
-    """Minimal Ollama check for endpoint rows (kind, default port, or name)."""
+    """Ollama check for endpoint rows (kind, default port, name, or a known fingerprint)."""
     try:
         parsed = urlparse(str(base_url or ""))
         host = (parsed.hostname or "").lower()
@@ -146,7 +146,13 @@ def endpoint_looks_like_ollama(base_url: str, endpoint_kind: Optional[str] = Non
         return False
     if str(endpoint_kind or "").strip().lower() == "ollama":
         return True
-    return port == DEFAULT_OLLAMA_PORT or "ollama" in host
+    if port == DEFAULT_OLLAMA_PORT or "ollama" in host:
+        return True
+    # Cached /api/version fingerprint (e.g. a Cookbook-served daemon on
+    # 11435+); probe=False keeps this listing free of network calls.
+    from src.ollama_capabilities import is_ollama_url
+
+    return is_ollama_url(base_url, probe=False)
 
 
 def _running_in_container() -> bool:

@@ -72,11 +72,16 @@ def _normalize_sqlite_url(url: str) -> str:
 # Get database URL from environment, default to SQLite in DATA_DIR
 DATABASE_URL = _normalize_sqlite_url(os.getenv("DATABASE_URL", _default_database_url()))
 
-# Create engine
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-)
+# Create engine. An in-memory SQLite database lives inside one connection, and
+# SQLAlchemy's default pool for it keeps one connection per thread (evicting
+# old ones past its size), so worker-thread queries could see an empty or lost
+# database. StaticPool shares the single connection across threads.
+_engine_kwargs = {"connect_args": {"check_same_thread": False}} if "sqlite" in DATABASE_URL else {}
+_url = make_url(DATABASE_URL)
+if _url.get_backend_name() == "sqlite" and _url.database in (None, "", ":memory:"):
+    from sqlalchemy.pool import StaticPool
+    _engine_kwargs["poolclass"] = StaticPool
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
 
 
 # Sidecar files SQLite can create next to the main DB. -journal is the default
