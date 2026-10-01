@@ -62,7 +62,11 @@ Fallback candidates receive route-neutral context shaping. Only compaction perfo
 
 `routes.chat_helpers.build_chat_context()` owns the shared route pipeline: preset extraction, preprocessing, user-message persistence, incognito/no-memory/RAG/skills flags, prefetched compare search, YouTube transcript context, research-spinoff grounding, model normalization, and compaction.
 
-`src.chat_processor.ChatProcessor.build_context_preface()` owns source preface construction. It can add memory, RAG, web search, URL page content, and skills index context before the model call.
+`src.chat_processor.ChatProcessor.build_context_preface()` owns source preface construction. It can add memory, RAG, web search, and URL page content before the model call. It runs in a worker thread (`asyncio.to_thread`), so turn ContextVars (assistant preferences, search reports, citation registry) are copied into it and memory use counters are bumped back on the event loop. The skills index is injected only by the agent loop, and only when `manage_skills` is available.
+
+Prompt order is prefix-cache friendly: static system messages (preset, safety policy), then history, then this turn's context as one `untrusted_context_message` block with a `Source:` section per source (plus the date/time message in chat mode), then the latest user message. Local backends reuse their KV cache only for a byte-identical prefix. The per-turn block is never persisted, and it is shortened (or dropped) before history is trimmed when the window is too small. Agent-loop harness notes (retries, verifier findings, loop breaker) are trailing user-role messages prefixed `[Odysseus]`, never system messages.
+
+`/api/chat_stream` runs request validation, ownership, privilege, approval, and preset checks before responding, so those still return HTTP errors. It then returns the stream and builds the context inside it, emitting `context_status` events (`{stage, label}`: context, memory, documents, web_search, reading_pages) that the chat UI shows in its spinner. A context-build failure after that point is an in-stream `event: error` with a status.
 
 Chat preface enhances the model's context. It must not rewrite the user message or force literal-vs-fetch interpretation before the model sees the request. See [context-building.md](context-building.md).
 

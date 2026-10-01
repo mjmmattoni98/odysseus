@@ -261,7 +261,10 @@ class ChatHandler:
                             except Exception:
                                 vl_desc = None
                         if not vl_desc:
-                            vl_result = analyze_image_with_vl_result(file_info["path"], owner=owner)
+                            # Blocking model call — keep it off the event loop.
+                            vl_result = await asyncio.to_thread(
+                                lambda: analyze_image_with_vl_result(file_info["path"], owner=owner)
+                            )
                             vl_desc = vl_result.get("text", "")
                             vl_model = vl_result.get("model", "")
                             if vl_desc and not vl_desc.startswith("["):
@@ -281,7 +284,10 @@ class ChatHandler:
                             _m["vision"] = vl_desc
                             _m["vision_model"] = vl_model
 
-        user_content = build_user_content(
+        # Reads/encodes attachments and extracts PDF text: blocking file and
+        # CPU work, so it runs in a worker thread.
+        user_content = await asyncio.to_thread(
+            build_user_content,
             enhanced_message, effective_att_ids, UPLOAD_DIR, self.upload_handler,
             session_id=getattr(sess, "id", None),
             auto_opened_docs=auto_opened_docs,

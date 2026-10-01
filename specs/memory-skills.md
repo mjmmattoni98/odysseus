@@ -35,7 +35,7 @@ Chat memory behavior:
 - inserted memory is wrapped as untrusted context;
 - memory use counts are incremented after insertion.
 
-`services/memory/memory_extractor.py` owns LLM-assisted extraction, audit, and validation flows. It requests model behavior and writes through the memory manager; it does not own chat session persistence.
+`services/memory/memory_extractor.py` owns LLM-assisted extraction, audit, and validation flows. It requests model behavior and writes through the memory manager; it does not own chat session persistence. Post-chat memory and skill extraction (and chat auto-titles) use the local-model `utility` workload so they queue behind the user's next prompt; memory extraction and titles also send `think=False` (titles cap `max_tokens` at 64 on Ollama routes, where that is honoured).
 
 Extraction handles reasoning-model response shapes and records explicit dislike/drop preferences as `dislikes` rather than losing them to generic fact handling.
 

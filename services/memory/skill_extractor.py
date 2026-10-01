@@ -200,6 +200,9 @@ async def maybe_extract_skill(
             ],
             headers=headers,
             timeout=30,
+            # Yield to the user's next prompt on a local model; thinking is
+            # kept because distilling a reusable procedure benefits from it.
+            workload="utility",
         )
         logger.debug(
             "[skill-extract] LLM returned in %.1fs (len=%d, head=%r)",

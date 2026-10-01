@@ -50,6 +50,7 @@ def _run_loop(monkeypatch, texts, model="qwen3:14b", max_rounds=3):
         calls.append({
             "tools": kwargs.get("tools"),
             "system": [m.get("content") for m in messages if m.get("role") == "system"],
+            "last": dict(messages[-1]),
         })
         index = len(calls) - 1
         text = texts[index] if index < len(texts) else texts[-1]
@@ -75,10 +76,16 @@ def test_empty_native_round_retries_without_schemas_and_with_fenced_prompt(monke
     assert calls[0]["tools"], "round 1 should carry native schemas"
     assert not calls[1]["tools"], "retry must send no schemas (built-in or MCP)"
 
+    # The retry note is a trailing user-role harness message: a system-role
+    # note would be merged into the leading system prompt and invalidate the
+    # backend's cached prompt prefix.
+    note = calls[1]["last"]
+    assert note["role"] == "user"
+    assert note["content"].startswith("[Odysseus] TOOL MODE CHANGE")
+    assert "fenced code block" in note["content"]
+    assert "```web_search" in note["content"]
     joined = "\n".join(c for c in calls[1]["system"] if c)
-    assert "TOOL MODE CHANGE" in joined
-    assert "fenced code block" in joined
-    assert "```web_search" in joined
+    assert "TOOL MODE CHANGE" not in joined
 
 
 def test_salvage_fires_only_once(monkeypatch):

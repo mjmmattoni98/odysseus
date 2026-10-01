@@ -3223,6 +3223,15 @@ import { loadPanel } from './panels.js';
                   }
                 }, 500);
                 continue;
+              } else if (json.type === 'context_status') {
+                // The server is still gathering context (web search, pages,
+                // memories) before the model runs. Show the stage, and restart
+                // the first-token hints so they count from here.
+                if (!_isBg && !accumulated && spinner && spinner.element && json.data && json.data.label) {
+                  spinner.updateMessage(json.data.label);
+                }
+                _firstVisibleOutputSeen = false;
+                scheduleFirstTokenWaitMessages();
               } else if (json.type === 'search_status') {
                 _searchReports.push(json.data);
                 if (!_isBg) chatRenderer.updateSearchStatus(holder, _searchReports);

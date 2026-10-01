@@ -17,7 +17,12 @@ from src.endpoint_resolver import normalize_base
 from src.context_compactor import maybe_compact, trim_for_context
 from src.model_context import estimate_tokens, get_context_length
 from src.auth_helpers import effective_user
-from src.prompt_security import untrusted_context_message
+from src.prompt_security import (
+    merge_untrusted_context_messages,
+    untrusted_context_body,
+    untrusted_context_message,
+    with_untrusted_context_body,
+)
 from src.attachment_refs import attachment_ref
 from routes.prefs_routes import _load_for_user as load_prefs_for_user
 
@@ -239,6 +244,93 @@ def _enforce_chat_privileges(request, sess) -> None:
         raise HTTPException(429, f"Daily message limit reached ({cap}). Try again in 24 hours.")
 
 
+# Metadata flag on the per-turn untrusted context message (memory, RAG, web,
+# linked pages, transcripts) so later shaping steps can find it by identity.
+TURN_CONTEXT_MARKER = "turn_context"
+# A shortened turn context below this many tokens is dropped instead: a
+# sliver of retrieved text is more misleading than none.
+_MIN_TURN_CONTEXT_TOKENS = 256
+
+
+def insert_before_latest_user(messages: list, extra: list) -> list:
+    """Return ``messages`` with ``extra`` placed right before the latest user turn.
+
+    Per-turn context goes here, not at the front: local backends (Ollama,
+    llama.cpp) reuse their KV cache only for a byte-identical prompt prefix,
+    so everything that changes every turn must follow the stable system
+    prompt and history. Appends when there is no user message.
+    """
+    if not extra:
+        return list(messages)
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].get("role") == "user":
+            return list(messages[:idx]) + list(extra) + list(messages[idx:])
+    return list(messages) + list(extra)
+
+
+def bundle_turn_context(messages: list) -> list:
+    """Merge this turn's untrusted context blocks into one guarded message.
+
+    Each block keeps its ``Source:`` label; the header is sent once. Messages
+    that are not ``untrusted_context_message`` results pass through first.
+    """
+    parts = [m for m in messages if untrusted_context_body(m) is not None]
+    others = [m for m in messages if untrusted_context_body(m) is None]
+    if not parts:
+        return others
+    if len(parts) == 1:
+        bundle = dict(parts[0])
+        bundle["metadata"] = dict(parts[0].get("metadata") or {})
+    else:
+        bundle = merge_untrusted_context_messages(parts)
+    bundle["metadata"][TURN_CONTEXT_MARKER] = True
+    return others + [bundle]
+
+
+def fit_turn_context(messages: list, context_length: int, reserve_tokens: int = 512) -> list:
+    """Shrink the per-turn context before generic trimming drops history.
+
+    The turn context sits among the most recent messages, which
+    ``trim_for_context`` protects; without this an oversized web/RAG block
+    would push out the conversation and finally truncate the user's own
+    message. Uses the same reserve as ``trim_for_context``.
+    """
+    if not context_length:
+        return messages
+    idx = next(
+        (i for i, m in enumerate(messages) if (m.get("metadata") or {}).get(TURN_CONTEXT_MARKER)),
+        None,
+    )
+    if idx is None:
+        return messages
+    original_tokens = None
+    # Token counts are not linear in characters, so shrink proportionally and
+    # re-measure a few times rather than leave the overflow to history trimming.
+    for _ in range(4):
+        over = estimate_tokens(messages) - (context_length - reserve_tokens)
+        if over <= 0:
+            break
+        bundle = messages[idx]
+        body = untrusted_context_body(bundle)
+        bundle_tokens = max(estimate_tokens([bundle]), 1)
+        original_tokens = original_tokens or bundle_tokens
+        keep_tokens = bundle_tokens - over - 16  # small slack for estimate drift
+        if body is None or keep_tokens < _MIN_TURN_CONTEXT_TOKENS:
+            logger.info("Dropped per-turn context (%s tokens) to fit context window", original_tokens)
+            return messages[:idx] + messages[idx + 1:]
+        marker = "\n[Truncated to fit the model context]"
+        body = body[:-len(marker)] if body.endswith(marker) else body
+        keep_chars = int(len(body) * keep_tokens / bundle_tokens)
+        shortened = body[:keep_chars].rstrip() + marker
+        messages = messages[:idx] + [with_untrusted_context_body(bundle, shortened)] + messages[idx + 1:]
+    if original_tokens:
+        logger.info(
+            "Shortened per-turn context %s -> %s tokens to fit context window",
+            original_tokens, estimate_tokens([messages[idx]]),
+        )
+    return messages
+
+
 def needs_auto_name(name: str) -> bool:
     """Check if a session still has its default/placeholder name."""
     if not name:
@@ -254,7 +346,11 @@ def needs_auto_name(name: str) -> bool:
 async def auto_name_session(session_manager, sess):
     """Generate a short title for a session from its first user message."""
     try:
-        from src.llm_core import llm_call_async
+        from src.llm_core import (
+            _is_ollama_native_url,
+            _is_ollama_openai_compat_url,
+            llm_call_async,
+        )
         from src.task_endpoint import resolve_task_endpoint
 
         # Find first user message
@@ -281,11 +377,15 @@ async def auto_name_session(session_manager, sess):
             logger.debug("[auto-name] No model provided, skipping")
             return
 
-        # max_tokens big enough that reasoning models (Minimax M2,
-        # DeepSeek R1, QwQ, etc.) have headroom for <think>…</think>
-        # plus the actual title — 200 used to clip them mid-reasoning
-        # so strip_think left an empty string and no rename happened.
-        # Timeout matches: 60s gives slow local reasoners room to finish.
+        # Ollama routes honour think=False, so the title needs only a few
+        # tokens. Elsewhere thinking cannot be switched off per call and
+        # max_tokens must leave reasoning models (Minimax M2, DeepSeek R1,
+        # QwQ, etc.) headroom for <think>…</think> plus the title — 200 used
+        # to clip them mid-reasoning so strip_think left an empty string and
+        # no rename happened. The "utility" workload queues the title behind
+        # the user's next prompt on a local model instead of ahead of it.
+        # Timeout: 60s gives slow local reasoners room to finish.
+        thinking_off = _is_ollama_native_url(t_url) or _is_ollama_openai_compat_url(t_url)
         title = await llm_call_async(
             t_url,
             t_model,
@@ -294,9 +394,11 @@ async def auto_name_session(session_manager, sess):
                 {"role": "user", "content": first_msg},
             ],
             temperature=0.3,
-            max_tokens=4096,
+            max_tokens=64 if thinking_off else 4096,
             headers=t_headers,
             timeout=60,
+            workload="utility",
+            think=False,
         )
 
         title = title.strip().strip('"\'').strip()
@@ -626,11 +728,19 @@ async def build_chat_context(
     defer_context_shaping: bool = False,
     continuation_context_message: str | None = None,
     persist_user_message: bool = True,
+    progress=None,
 ) -> ChatContext:
     """Build the full context (preface + messages) for an LLM call.
 
     This is the shared logic between /chat and /chat_stream — preset extraction,
     message preprocessing, memory/RAG/web injection, compaction, normalization.
+
+    Message order is ``static system prompt + history + per-turn context +
+    latest user message`` so the cached prompt prefix survives across turns.
+    Blocking work (web search, page fetches, memory/RAG retrieval, model
+    probes) runs in worker threads. ``progress`` receives preface stage names
+    (see ``ChatProcessor.build_context_preface``) and may be called from a
+    worker thread.
     """
     # Preset
     preset = extract_preset(chat_handler, preset_id)
@@ -742,10 +852,29 @@ async def build_chat_context(
     )
     if use_rag is not None or is_research_spinoff or casual_low_signal:
         _preface_kwargs["use_rag"] = use_rag_val
-    preface, rag_sources, web_sources = chat_processor.build_context_preface(**_preface_kwargs)
+    if progress is not None:
+        _preface_kwargs["progress"] = progress
+    record_memory_uses = getattr(chat_processor, "record_memory_uses", None)
+    if callable(record_memory_uses):
+        _preface_kwargs["defer_memory_uses"] = True
 
-    # Capture used memories immediately
-    used_memories = getattr(chat_processor, '_last_used_memories', [])
+    def _build_preface():
+        # Runs in a worker thread with a copy of this context, so the turn's
+        # assistant preferences, search-report list and citation registry
+        # (shared objects held in ContextVars) are the ones recorded into.
+        result = chat_processor.build_context_preface(**_preface_kwargs)
+        return (
+            *result,
+            list(getattr(chat_processor, "_last_used_memories", None) or []),
+            list(getattr(chat_processor, "_last_used_memory_ids", None) or []),
+        )
+
+    # Web search, page fetches, embeddings/Chroma and (legacy profile) a
+    # query-rewrite model call are all synchronous; on the event loop they
+    # stalled every other request for the whole preface build.
+    preface, rag_sources, web_sources, used_memories, used_memory_ids = await asyncio.to_thread(_build_preface)
+    if callable(record_memory_uses):
+        record_memory_uses(used_memory_ids)
 
     # Inject pre-fetched search context (compare mode)
     if search_context and allow_tool_preprocessing and not casual_low_signal:
@@ -756,8 +885,10 @@ async def build_chat_context(
         preface.append(untrusted_context_message("youtube transcript", transcript))
 
     # Normalize model ID. Prefer cached endpoint models so group chat does not
-    # re-hit slow local /models endpoints on every participant turn.
-    norm = _normalize_model_id_from_cache(sess) or normalize_model_id(
+    # re-hit slow local /models endpoints on every participant turn; the live
+    # probe is a blocking HTTP call, so it runs off the event loop.
+    norm = _normalize_model_id_from_cache(sess) or await asyncio.to_thread(
+        normalize_model_id,
         sess.endpoint_url,
         sess.model,
         owner=getattr(sess, "owner", None),
@@ -768,27 +899,27 @@ async def build_chat_context(
     # Build messages. In Nobody/incognito mode, never read saved session
     # history: the session id may be a temporary wrapper or, in buggy clients, a
     # stale normal session id. Only the ephemeral incognito transcript is safe.
-    messages = preface + (_incognito_messages(session_id) if incognito else sess.get_context_messages())
+    history = _incognito_messages(session_id) if incognito else sess.get_context_messages()
 
-    # Current date/time — injected as a standalone *user*-role context message
-    # placed immediately before the latest user turn, NOT folded into the
-    # system prompt. Its text changes every minute, and local OpenAI-compatible
-    # backends (llama.cpp / LM Studio) key their KV-cache prefix off the
-    # system message byte-for-byte; mixing ever-changing timestamp text into
-    # it would invalidate the cached prefix on every request (issue #2927).
-    # Placing it at the tail also keeps it out of the stable
-    # preface+history prefix, so that prefix stays byte-identical turn over
-    # turn (modulo the genuinely new history entries) and the cache survives.
+    # Only the static system messages (preset, safety policy) lead the prompt.
+    # Everything retrieved for this turn — memory, RAG, web results, linked
+    # pages, transcripts — is one user-role untrusted block placed right
+    # before the latest user message, so the system prompt + history prefix
+    # stays byte-identical across turns and local backends reuse their KV
+    # cache (issue #2927). The preface is never persisted to history.
+    static_preface = [m for m in preface if m.get("role") == "system"]
+    turn_context = bundle_turn_context([m for m in preface if m.get("role") != "system"])
+
+    # Current date/time — a standalone *user*-role context message, NOT folded
+    # into the system prompt: its text changes every minute and would
+    # invalidate the cached prefix on every request.
     if not agent_mode:
         try:
             from src.user_time import current_datetime_context_message
-            _dt_msg = current_datetime_context_message()
-            if messages and messages[-1].get("role") == "user":
-                messages.insert(len(messages) - 1, _dt_msg)
-            else:
-                messages.append(_dt_msg)
+            turn_context.append(current_datetime_context_message())
         except Exception:
             logger.debug("Failed to add current date/time context", exc_info=True)
+    messages = insert_before_latest_user(static_preface + list(history), turn_context)
 
     route_messages = list(messages)
     # Explicit fallback routing must shape from the same route-neutral prompt
@@ -796,7 +927,7 @@ async def build_chat_context(
     # session history before we know which route can answer and would make a
     # later larger-context candidate unable to recover discarded history.
     if defer_context_shaping:
-        context_length = get_context_length(sess.endpoint_url, sess.model)
+        context_length = await asyncio.to_thread(get_context_length, sess.endpoint_url, sess.model)
         was_compacted = False
     else:
         messages, context_length, was_compacted = await maybe_compact(
@@ -805,7 +936,7 @@ async def build_chat_context(
     _before_trim_messages = len(messages)
     _before_trim_tokens = estimate_tokens(messages)
     if not defer_context_shaping:
-        messages = trim_for_context(messages, context_length)
+        messages = trim_for_context(fit_turn_context(messages, context_length), context_length)
     _after_trim_messages = len(messages)
     _after_trim_tokens = estimate_tokens(messages)
     _context_trimmed = _after_trim_messages < _before_trim_messages or _after_trim_tokens < _before_trim_tokens

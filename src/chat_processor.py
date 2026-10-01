@@ -4,13 +4,33 @@ import math
 import re
 import time
 from collections import Counter
-from typing import List, Dict, Any, Optional, Tuple
+from contextvars import ContextVar
+from typing import Callable, List, Dict, Any, Optional, Tuple
 from src.chat_helpers import extract_urls
 from src.youtube_handler import is_youtube_url
 from src.search import comprehensive_web_search, fetch_webpage_content
 from src.prompt_security import UNTRUSTED_CONTEXT_POLICY, untrusted_context_message
 
 logger = logging.getLogger(__name__)
+
+# Memories injected by the latest build_context_preface in this context, as
+# (used memory summaries, used memory ids). Context-local rather than an
+# instance attribute: the shared ChatProcessor builds prefaces for concurrent
+# turns in worker threads (asyncio.to_thread copies the caller's context), so
+# one turn must never read another turn's injected memories.
+_LAST_PREFACE_MEMORIES: ContextVar[Optional[Tuple[list, list]]] = ContextVar(
+    "chat_processor_last_preface_memories", default=None,
+)
+
+
+def _report_progress(progress: Optional[Callable[[str], None]], stage: str) -> None:
+    """Tell the caller which slow preface stage is starting; never fails."""
+    if progress is None:
+        return
+    try:
+        progress(stage)
+    except Exception:
+        logger.debug("Context progress callback failed", exc_info=True)
 
 
 def _clean_search_query(query: str, max_len: int = 200) -> str:
@@ -91,6 +111,27 @@ class ChatProcessor:
     RAG_SIMILARITY_THRESHOLD = 0.35
     MEMORY_CONTEXT_LIMIT = 5
     PINNED_MEMORY_LIMIT = MEMORY_CONTEXT_LIMIT
+
+    @property
+    def _last_used_memories(self) -> list:
+        """Memories injected by this context's latest ``build_context_preface``."""
+        state = _LAST_PREFACE_MEMORIES.get()
+        return state[0] if state else []
+
+    @property
+    def _last_used_memory_ids(self) -> list:
+        """Ids of those memories; use counters are bumped from these."""
+        state = _LAST_PREFACE_MEMORIES.get()
+        return state[1] if state else []
+
+    def record_memory_uses(self, ids: list) -> None:
+        """Bump use counters for memories that were injected into a prompt."""
+        if not ids or not hasattr(self.memory_manager, "increment_uses"):
+            return
+        try:
+            self.memory_manager.increment_uses(ids)
+        except Exception as _e:
+            logger.warning("Failed to increment memory uses: %s", _e)
 
     def _is_core_memory(self, memory: Dict[str, Any]) -> bool:
         """Return whether a pinned memory is safe to keep globally available."""
@@ -274,11 +315,23 @@ class ChatProcessor:
         agent_mode: bool = False,
         incognito: bool = False,
         use_skills: bool = True,
+        progress: Optional[Callable[[str], None]] = None,
+        defer_memory_uses: bool = False,
     ) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]], List[Dict[str, str]]]:
         """Build the context preface for LLM calls.
 
         Returns:
-            Tuple of (preface messages, rag_sources list)
+            Tuple of (preface messages, rag_sources list, web_sources list)
+
+        ``progress`` is called with a stage name ("memory", "documents",
+        "web_search", "reading_pages") before each slow step so a streaming
+        caller can show what it is waiting for; it may be called from a worker
+        thread. With ``defer_memory_uses`` the memory use counters are not
+        bumped here; the caller passes ``_last_used_memory_ids`` to
+        ``record_memory_uses`` from the thread that owns the memory store.
+        ``agent_mode``/``incognito``/``use_skills`` are accepted for callers
+        but unused: the skills index is injected once, by the agent loop,
+        only when the ``manage_skills`` tool is actually available.
 
         Note on KV-cache friendliness: the ``system``-role messages assembled
         here are later concatenated into a single system message and sent as
@@ -308,14 +361,16 @@ class ChatProcessor:
         })
 
         # Memory: core pinned facts + relevant pinned/extended recall.
-        self._last_used_memories = []  # track what was injected
+        used_memories: list = []  # track what was injected
+        _used_ids: list = []
+        _LAST_PREFACE_MEMORIES.set((used_memories, _used_ids))
         if use_memory:
+            _report_progress(progress, "memory")
             mem_entries = self.memory_manager.load(owner=owner)
 
             pinned = [m for m in mem_entries if m.get("pinned")]
             extended = [m for m in mem_entries if not m.get("pinned")]
 
-            _used_ids: list = []
             selected_pinned = self._select_pinned_memories(message, pinned)
             if selected_pinned:
                 pinned_text = "\n- ".join([m["text"] for m in selected_pinned])
@@ -327,11 +382,11 @@ class ChatProcessor:
                     ),
                 ))
                 for m in selected_pinned:
-                    self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "pinned"})
+                    used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "pinned"})
                     if m.get("id"):
                         _used_ids.append(m["id"])
 
-            remaining_memory_slots = max(self.MEMORY_CONTEXT_LIMIT - len(self._last_used_memories), 0)
+            remaining_memory_slots = max(self.MEMORY_CONTEXT_LIMIT - len(used_memories), 0)
             if extended and remaining_memory_slots:
                 relevant = self._hybrid_retrieve(message, extended, k=remaining_memory_slots)
                 if relevant:
@@ -344,25 +399,22 @@ class ChatProcessor:
                         ),
                     ))
                     for m in relevant:
-                        self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "recalled"})
+                        used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "recalled"})
                         if m.get("id"):
                             _used_ids.append(m["id"])
 
             # Bump usage counters for the memories that were actually injected.
-            if _used_ids and hasattr(self.memory_manager, "increment_uses"):
-                try:
-                    self.memory_manager.increment_uses(_used_ids)
-                except Exception as _e:
-                    logger.warning("Failed to increment memory uses: %s", _e)
-
-            # (skills index injection moved out — see below; only fires in
-            # agent mode so chat mode and incognito stay clean.)
+            # A threaded caller defers this: the memory store is a JSON file
+            # rewritten without locking, so it must be updated from one thread.
+            if not defer_memory_uses:
+                self.record_memory_uses(_used_ids)
 
         # RAG: search if enabled and rag_manager available, inject only above threshold
         if use_rag:
             try:
                 rag_manager = getattr(self.personal_docs_manager, 'rag_manager', None)
                 if rag_manager:
+                    _report_progress(progress, "documents")
                     results = rag_manager.search(message, k=5, owner=owner)
                     # Filter by similarity threshold
                     relevant = [r for r in results if r.get("similarity", 0) >= self.RAG_SIMILARITY_THRESHOLD]
@@ -391,6 +443,7 @@ class ChatProcessor:
         # Add web search if enabled
         web_sources = []
         if use_web:
+            _report_progress(progress, "web_search")
             try:
                 from src.llm_core import llm_call
 
@@ -455,7 +508,13 @@ class ChatProcessor:
                 logger.error(f"Web search failed: {e}")
                 from src.assistant_preferences import record_search_report
                 record_search_report({"state": "failed", "results": 0, "pages_read": 0})
-                preface.append({"role": "system", "content": "Web search encountered an error and could not retrieve results."})
+                # Per-turn status, so it rides with the other per-turn context
+                # instead of changing the cached system prefix.
+                preface.append(untrusted_context_message(
+                    "web search status",
+                    "Web search encountered an error and could not retrieve results.",
+                    arm_tool_gate=False,
+                ))
 
         # Process non-YouTube URLs in message (YouTube handled by preprocess_message)
         # Skip auto-fetch for long pastes (the user already pasted the content —
@@ -469,6 +528,8 @@ class ChatProcessor:
         non_yt_urls = [u for u in urls if not is_youtube_url(u)]
         skip_url_fetch = len(message) > 2000 or len(non_yt_urls) > 3
         if not skip_url_fetch:
+            if non_yt_urls:
+                _report_progress(progress, "reading_pages")
             for url in non_yt_urls:
                 try:
                     result = fetch_webpage_content(url)
@@ -511,31 +572,5 @@ class ChatProcessor:
                         "web page fetch failure",
                         f"A linked page was not read: {status}.",
                     ))
-
-        # Skills index — progressive disclosure. Only injected when the
-        # model has the `manage_skills` tool available (agent_mode), and
-        # never in incognito mode (the user has explicitly opted out of
-        # context retention this turn). In plain chat mode the model can't
-        # call the tool anyway, so the index would be noise.
-        if agent_mode and not incognito and use_skills and self.skills_manager:
-            try:
-                idx = self.skills_manager.index_for(owner=owner)
-            except Exception as e:
-                logger.debug(f"Skills index unavailable: {e}")
-                idx = []
-            if idx:
-                by_cat: Dict[str, list] = {}
-                for s in idx:
-                    by_cat.setdefault(s.get("category") or "general", []).append(s)
-                lines = ["[Available skills — call manage_skills(action='view', name='...') to load one when relevant]"]
-                for cat in sorted(by_cat):
-                    lines.append(f"  {cat}:")
-                    for s in sorted(by_cat[cat], key=lambda x: x["name"]):
-                        desc = s.get("description") or ""
-                        lines.append(f"    - {s['name']}: {desc}" if desc else f"    - {s['name']}")
-                preface.append(untrusted_context_message(
-                    "available skills index",
-                    "\n".join(lines),
-                ))
 
         return preface, rag_sources, web_sources

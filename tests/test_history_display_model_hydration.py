@@ -1,6 +1,7 @@
 """Display pagination must stay separate from full model-context hydration."""
 
 import json
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 
 import pytest
@@ -395,6 +396,9 @@ class _ToolPolicy:
     def blocks(self, _tool_name):
         return False
 
+    def all_disabled_names(self):
+        return set()
+
 
 class _ChatHandler:
     async def handle_memory_command(self, _session, _message):
@@ -425,6 +429,8 @@ def _json_request(path, payload):
         "headers": [(b"content-type", b"application/json")],
         "client": ("127.0.0.1", 1234),
         "server": ("testserver", 80),
+        # Privilege gates read request.app.state before the stream starts.
+        "app": SimpleNamespace(state=SimpleNamespace()),
     }
     return Request(scope, receive)
 
@@ -523,12 +529,17 @@ async def test_model_send_routes_hydrate_before_context_build(monkeypatch, path)
                 ChatRequest(message="hello", session="session-1"),
             )
         else:
-            await endpoint(
+            # The stream route builds context after the response starts, so
+            # the build failure arrives as an in-stream error event.
+            response = await endpoint(
                 _json_request(
                     path,
                     {"message": "hello", "session": "session-1"},
                 )
             )
+            body = "".join([chunk async for chunk in response.body_iterator])
+            assert "event: error" in body
+            raise _ContextBuildReached
 
     try:
         with pytest.raises(_ContextBuildReached):

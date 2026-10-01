@@ -96,7 +96,7 @@ Guide-only/no-tools policy can suppress context acquisition before the model cal
 
 ## Current Call Sites Include
 
-- `ChatProcessor.build_context_preface()` for memory, RAG, web search, URL content, and skills index;
+- `ChatProcessor.build_context_preface()` for memory, RAG, web search, and URL content (merged by `routes/chat_helpers.py` into one per-turn untrusted block placed before the latest user message);
 - `ChatHandler.preprocess_message()` and the canonical `services.youtube.youtube_handler` import path for YouTube fetch/format, then `routes/chat_helpers.py` for wrapping prefetched search/Youtube context;
 - `routes/chat_routes.py` research context injection;
 - `src.agent_loop` for active editor document, skill context, and tool-result reinsertion;

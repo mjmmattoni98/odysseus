@@ -65,6 +65,8 @@ from routes.chat_helpers import (
     run_post_response_tasks,
     accumulate_token_usage,
     clean_thinking_for_save,
+    fit_turn_context,
+    insert_before_latest_user,
     _allowed_models_for_request,
     _enforce_chat_privileges,
 )
@@ -181,6 +183,60 @@ async def _tool_approval_resolution_stream(decision: str) -> AsyncGenerator[str,
     yield "data: [DONE]\n\n"
 
 
+_CONTEXT_STATUS_LABELS = {
+    "context": "Preparing context…",
+    "memory": "Recalling memories…",
+    "documents": "Searching your documents…",
+    "web_search": "Searching the web…",
+    "reading_pages": "Reading pages…",
+}
+_CONTEXT_STATUS_HEARTBEAT_S = 10.0
+
+
+def _context_status_event(stage: str) -> str:
+    label = _CONTEXT_STATUS_LABELS.get(stage, _CONTEXT_STATUS_LABELS["context"])
+    return f"data: {json.dumps({'type': 'context_status', 'data': {'stage': stage, 'label': label}})}\n\n"
+
+
+async def _stream_context_build(build, result: Dict[str, Any]) -> AsyncGenerator[str, None]:
+    """Run ``build(progress)`` while streaming ``context_status`` events.
+
+    ``build`` returns the context-building coroutine; ``progress`` may be
+    called from worker threads. The built context is stored in
+    ``result["ctx"]``; a build failure propagates to the caller. Heartbeat
+    comments keep the connection alive through long searches.
+    """
+    loop = asyncio.get_running_loop()
+    stages: asyncio.Queue = asyncio.Queue()
+
+    def progress(stage: str) -> None:
+        loop.call_soon_threadsafe(stages.put_nowait, stage)
+
+    yield _context_status_event("context")
+    task = asyncio.create_task(build(progress))
+    next_stage = None
+    try:
+        while not task.done():
+            if next_stage is None or next_stage.done():
+                next_stage = asyncio.ensure_future(stages.get())
+            done, _ = await asyncio.wait(
+                {task, next_stage},
+                timeout=_CONTEXT_STATUS_HEARTBEAT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if next_stage in done:
+                if not task.done():
+                    yield _context_status_event(next_stage.result())
+            elif not done:
+                yield ": heartbeat\n\n"
+        result["ctx"] = task.result()
+    finally:
+        if next_stage is not None and not next_stage.done():
+            next_stage.cancel()
+        if not task.done():
+            task.cancel()
+
+
 def _chat_candidate_request_factory(
     messages,
     fallback_context_length: int = 0,
@@ -212,7 +268,10 @@ def _chat_candidate_request_factory(
         )
         if not context_length:
             context_length = fallback_context_length
-        request_messages = trim_for_context(candidate_messages, context_length)
+        request_messages = trim_for_context(
+            fit_turn_context(candidate_messages, context_length),
+            context_length,
+        )
         state["requests"][index] = request_messages
         state["context_lengths"][index] = context_length
         state["compactions"][index] = compaction_state
@@ -860,11 +919,12 @@ def setup_chat_routes(
                     message, _r_ep, _r_model, llm_headers=_r_headers
                 )
                 research_message = untrusted_context_message("research context", research_ctx)
-                ctx.messages.insert(len(ctx.preface), research_message)
-                if foreground_policy.enabled:
-                    getattr(ctx, "route_messages", ctx.messages).insert(
-                        len(ctx.preface),
-                        research_message,
+                # Per-turn context: next to the request, after the cached prefix.
+                ctx.messages = insert_before_latest_user(ctx.messages, [research_message])
+                if foreground_policy.enabled and getattr(ctx, "route_messages", None):
+                    ctx.route_messages = insert_before_latest_user(
+                        ctx.route_messages,
+                        [research_message],
                     )
             except Exception as e:
                 logger.error(f"Research failed: {e}")
@@ -1391,9 +1451,17 @@ def setup_chat_routes(
             allowed_models=_allowed_models_for_request(request),
         )
 
-        # Build shared context (stream path uses enhanced_message for context preface)
-        with assistant_turn(assistant_options, sess.endpoint_url, turn_reports, turn_sources):
-            ctx = await build_chat_context(
+        # An invalid preset is a request error: check it before the response
+        # starts, since the context itself is built inside the stream.
+        if preset_id:
+            chat_handler.validate_and_extract_preset(preset_id)
+
+        def _build_context(progress):
+            # Built inside the stream (see stream_with_save) so the response
+            # headers go out at once and the browser can show what the
+            # context build is waiting for. The stream path uses
+            # enhanced_message for the context preface.
+            return build_chat_context(
                 sess, request, chat_handler, chat_processor,
                 message=message,
                 session_id=session,
@@ -1408,9 +1476,6 @@ def setup_chat_routes(
                 compare_mode=compare_mode,
                 webhook_manager=webhook_manager,
                 use_enhanced_message=True,
-                # Skills index only ships when the model can actually call
-                # manage_skills (agent mode). In plain chat or incognito the
-                # index would be useless / unwanted noise.
                 agent_mode=(chat_mode == "agent"),
                 allow_tool_preprocessing=allow_tool_preprocessing,
                 defer_context_shaping=foreground_policy.enabled,
@@ -1422,98 +1487,103 @@ def setup_chat_routes(
                     else None
                 ),
                 persist_user_message=not tool_approval_continuation,
+                progress=progress,
             )
 
         _research_flags = {"do": do_research}  # Mutable container for generator scope
 
-        # Query active document — prefer explicit ID from frontend, fall back to session lookup
-        active_doc = None
-        _doc_db = SessionLocal()
-        try:
-            if active_doc_id:
-                logger.info(f"[doc-inject] active_doc_id from frontend: {active_doc_id}")
-                # Scope to the caller's documents. The session and in-memory
-                # fallbacks below are already owner/session-bound; this
-                # explicit-id path looked up by id alone, so a user could
-                # inject another user's document by passing its id.
-                _doc_q = _doc_db.query(DBDocument).filter(DBDocument.id == active_doc_id)
-                active_doc = _owner_session_filter(_doc_q, ctx.user).first()
-                if active_doc:
-                    doc_session = active_doc.session_id
-                    doc_owner = getattr(active_doc, "owner", None)
-                    if doc_owner and ctx.user and doc_owner != ctx.user:
-                        logger.warning(
-                            "[doc-inject] ignoring active_doc_id %s owned by another user",
-                            active_doc_id,
-                        )
-                        active_doc = None
-                    else:
-                        # NOTE: previously dropped the doc when doc.session_id
-                        # != current chat session — but that broke the common
-                        # case of "open an email draft from one chat, ask a
-                        # different chat to write into it". The frontend only
-                        # sends active_doc_id for docs currently visible in
-                        # the UI, and we already owner-checked above, so trust
-                        # the explicit signal. We just log the mismatch and
-                        # re-bind the doc to the current session so future
-                        # turns find it via the session-fallback path too.
-                        if doc_session and doc_session != session:
-                            logger.info(
-                                "[doc-inject] cross-session active_doc_id %s (was session %s, now %s) — accepting and rebinding",
-                                active_doc_id, doc_session, session,
+        # Query active document — prefer explicit ID from frontend, fall back to session lookup.
+        # Runs after the context build: preprocessing can auto-create the
+        # document this turn should edit (e.g. an attached fillable PDF).
+        def _load_active_doc(ctx):
+            active_doc = None
+            _doc_db = SessionLocal()
+            try:
+                if active_doc_id:
+                    logger.info(f"[doc-inject] active_doc_id from frontend: {active_doc_id}")
+                    # Scope to the caller's documents. The session and in-memory
+                    # fallbacks below are already owner/session-bound; this
+                    # explicit-id path looked up by id alone, so a user could
+                    # inject another user's document by passing its id.
+                    _doc_q = _doc_db.query(DBDocument).filter(DBDocument.id == active_doc_id)
+                    active_doc = _owner_session_filter(_doc_q, ctx.user).first()
+                    if active_doc:
+                        doc_session = active_doc.session_id
+                        doc_owner = getattr(active_doc, "owner", None)
+                        if doc_owner and ctx.user and doc_owner != ctx.user:
+                            logger.warning(
+                                "[doc-inject] ignoring active_doc_id %s owned by another user",
+                                active_doc_id,
                             )
-                            try:
-                                active_doc.session_id = session
-                                _doc_db.commit()
-                            except Exception as _e:
-                                _doc_db.rollback()
-                                logger.warning(f"[doc-inject] session rebind failed: {_e}")
-                        logger.info(f"[doc-inject] found by ID: title={active_doc.title!r}, lang={active_doc.language!r}, is_active={active_doc.is_active}, content_len={len(active_doc.current_content or '')}")
-                else:
-                    logger.warning(f"[doc-inject] NOT FOUND by ID {active_doc_id}")
-            if not active_doc:
-                _email_doc_q = _doc_db.query(DBDocument).filter(
-                    DBDocument.session_id == session,
-                    DBDocument.is_active == True,
-                    DBDocument.language == "email",
-                )
-                active_doc = _owner_session_filter(_email_doc_q, ctx.user).order_by(DBDocument.updated_at.desc()).first()
+                            active_doc = None
+                        else:
+                            # NOTE: previously dropped the doc when doc.session_id
+                            # != current chat session — but that broke the common
+                            # case of "open an email draft from one chat, ask a
+                            # different chat to write into it". The frontend only
+                            # sends active_doc_id for docs currently visible in
+                            # the UI, and we already owner-checked above, so trust
+                            # the explicit signal. We just log the mismatch and
+                            # re-bind the doc to the current session so future
+                            # turns find it via the session-fallback path too.
+                            if doc_session and doc_session != session:
+                                logger.info(
+                                    "[doc-inject] cross-session active_doc_id %s (was session %s, now %s) — accepting and rebinding",
+                                    active_doc_id, doc_session, session,
+                                )
+                                try:
+                                    active_doc.session_id = session
+                                    _doc_db.commit()
+                                except Exception as _e:
+                                    _doc_db.rollback()
+                                    logger.warning(f"[doc-inject] session rebind failed: {_e}")
+                            logger.info(f"[doc-inject] found by ID: title={active_doc.title!r}, lang={active_doc.language!r}, is_active={active_doc.is_active}, content_len={len(active_doc.current_content or '')}")
+                    else:
+                        logger.warning(f"[doc-inject] NOT FOUND by ID {active_doc_id}")
+                if not active_doc:
+                    _email_doc_q = _doc_db.query(DBDocument).filter(
+                        DBDocument.session_id == session,
+                        DBDocument.is_active == True,
+                        DBDocument.language == "email",
+                    )
+                    active_doc = _owner_session_filter(_email_doc_q, ctx.user).order_by(DBDocument.updated_at.desc()).first()
+                    if active_doc:
+                        logger.info(f"[doc-inject] found email draft by session fallback: title={active_doc.title!r}")
+                if not active_doc:
+                    _session_doc_q = _doc_db.query(DBDocument).filter(
+                        DBDocument.session_id == session,
+                        DBDocument.is_active == True
+                    )
+                    active_doc = _owner_session_filter(_session_doc_q, ctx.user).order_by(DBDocument.updated_at.desc()).first()
+                    if active_doc:
+                        logger.info(f"[doc-inject] found by session fallback: title={active_doc.title!r}")
+                # Last resort: the document the agent itself just created/edited
+                # (tracked in-memory by the tool layer). This rescues docs that
+                # got orphaned from their session (session_id NULL) — otherwise
+                # neither lookup above can associate them with this conversation,
+                # so the agent never sees what it just wrote. Guarded so we never
+                # leak a doc that belongs to a DIFFERENT session.
+                if not active_doc:
+                    try:
+                        from src.agent_tools.document_tools import get_active_document
+                        _mem_id = get_active_document()
+                        if _mem_id:
+                            _mem_q = _doc_db.query(DBDocument).filter(DBDocument.id == _mem_id)
+                            cand = _owner_session_filter(_mem_q, ctx.user).first()
+                            if cand and (not cand.session_id or cand.session_id == session):
+                                active_doc = cand
+                                logger.info(f"[doc-inject] found by in-memory active id: title={active_doc.title!r} (session_id={cand.session_id!r})")
+                    except Exception as _e:
+                        logger.debug(f"[doc-inject] in-memory fallback failed: {_e}")
+                if not active_doc:
+                    logger.info(f"[doc-inject] no active doc for session {session}")
                 if active_doc:
-                    logger.info(f"[doc-inject] found email draft by session fallback: title={active_doc.title!r}")
-            if not active_doc:
-                _session_doc_q = _doc_db.query(DBDocument).filter(
-                    DBDocument.session_id == session,
-                    DBDocument.is_active == True
-                )
-                active_doc = _owner_session_filter(_session_doc_q, ctx.user).order_by(DBDocument.updated_at.desc()).first()
-                if active_doc:
-                    logger.info(f"[doc-inject] found by session fallback: title={active_doc.title!r}")
-            # Last resort: the document the agent itself just created/edited
-            # (tracked in-memory by the tool layer). This rescues docs that
-            # got orphaned from their session (session_id NULL) — otherwise
-            # neither lookup above can associate them with this conversation,
-            # so the agent never sees what it just wrote. Guarded so we never
-            # leak a doc that belongs to a DIFFERENT session.
-            if not active_doc:
-                try:
-                    from src.agent_tools.document_tools import get_active_document
-                    _mem_id = get_active_document()
-                    if _mem_id:
-                        _mem_q = _doc_db.query(DBDocument).filter(DBDocument.id == _mem_id)
-                        cand = _owner_session_filter(_mem_q, ctx.user).first()
-                        if cand and (not cand.session_id or cand.session_id == session):
-                            active_doc = cand
-                            logger.info(f"[doc-inject] found by in-memory active id: title={active_doc.title!r} (session_id={cand.session_id!r})")
-                except Exception as _e:
-                    logger.debug(f"[doc-inject] in-memory fallback failed: {_e}")
-            if not active_doc:
-                logger.info(f"[doc-inject] no active doc for session {session}")
-            if active_doc:
-                _doc_db.expunge(active_doc)
-        except Exception as e:
-            logger.warning(f"Failed to query active document: {e}")
-        finally:
-            _doc_db.close()
+                    _doc_db.expunge(active_doc)
+            except Exception as e:
+                logger.warning(f"Failed to query active document: {e}")
+            finally:
+                _doc_db.close()
+            return active_doc
 
         # Build disabled-tools set from frontend toggles + user privileges
         disabled_tools = set()
@@ -1584,7 +1654,7 @@ def setup_chat_routes(
 
         # Enforce per-user privileges
         _privs = {}
-        _user = ctx.user
+        _user = effective_user(request)
         if _user and hasattr(request.app.state, 'auth_manager') and request.app.state.auth_manager:
             _privs = request.app.state.auth_manager.get_privileges(_user)
         if _privs:
@@ -1669,10 +1739,31 @@ def setup_chat_routes(
             # _effective_mode is read-only here; closure captures it from
             # the outer scope. (Was `nonlocal` but never reassigned.)
             research_sources = None
-            web_sources = ctx.web_sources
 
             # Register active stream for partial-save safety net
             _active_streams[session] = {"status": "streaming", "partial": "", "query": message, "is_research": effective_do_research, "mode": _effective_mode}
+
+            _built = {}
+            try:
+                async for _status_event in _stream_context_build(_build_context, _built):
+                    yield _status_event
+            except Exception as _build_err:
+                # Headers are already sent, so a context failure becomes the
+                # in-stream error event the chat UI renders as a failed turn.
+                _status = getattr(_build_err, "status_code", None)
+                _status = _status if isinstance(_status, int) and 400 <= _status < 600 else 500
+                if _status >= 500:
+                    logger.error("[chat_stream] context build failed for session %s", session, exc_info=True)
+                    _error_text = "Could not prepare the conversation context."
+                else:
+                    _error_text = str(getattr(_build_err, "detail", "") or "Invalid request")
+                _stream_set(session, status="error")
+                yield f"event: error\ndata: {json.dumps({'error': _error_text, 'status': _status})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            ctx = _built["ctx"]
+            active_doc = _load_active_doc(ctx)
+            web_sources = ctx.web_sources
 
             # The client sent a workspace the server refused to bind (deleted
             # folder, file path, sensitive dir, filesystem root). Tell it up

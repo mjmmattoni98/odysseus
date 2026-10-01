@@ -94,7 +94,7 @@ Search does not have one canonical result shape yet. Current shapes include:
 
 - `/api/search`: `{context, sources, error?}`;
 - `/api/search/query`: `{results, provider, time, error?}`;
-- `comprehensive_web_search(return_sources=True)`: formatted context plus `{url, title}` sources;
+- `comprehensive_web_search(return_sources=True)`: formatted context (each source listed once in the summary with its citation number, then `[CONTENT i]` blocks) plus `{url, title}` sources;
 - `SearchService.search()`: service result rows;
 - agent `web_search`: tool output text plus a hidden sources marker stripped by the agent loop;
 - agent `web_fetch`: fetched page text or tool error;

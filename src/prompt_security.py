@@ -97,3 +97,82 @@ def untrusted_context_message(
         ),
         "metadata": metadata,
     }
+
+
+_WRAPPED_PREFIX = f"{UNTRUSTED_CONTEXT_HEADER}\n{GUARD_OPEN}\n"
+_WRAPPED_SUFFIX = f"\n{GUARD_CLOSE}"
+
+
+def untrusted_context_body(message: Any) -> str | None:
+    """Return the guarded body of an ``untrusted_context_message`` result.
+
+    The body is the already-escaped ``Source: <label>\\n<text>`` section.
+    Returns ``None`` for anything that is not exactly in that wrapper format,
+    so callers never re-wrap text they cannot prove was escaped.
+    """
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("trusted") is not False:
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    if not content.startswith(_WRAPPED_PREFIX) or not content.endswith(_WRAPPED_SUFFIX):
+        return None
+    body = content[len(_WRAPPED_PREFIX):-len(_WRAPPED_SUFFIX)]
+    if GUARD_OPEN in body or GUARD_CLOSE in body:
+        return None
+    return body
+
+
+def with_untrusted_context_body(message: Dict[str, Any], body: str) -> Dict[str, Any]:
+    """Copy of a wrapped message with a replacement (e.g. shortened) body.
+
+    ``body`` must be derived from ``untrusted_context_body`` (already escaped);
+    guard markers are rejected so the replacement cannot break out.
+    """
+    if GUARD_OPEN in body or GUARD_CLOSE in body:
+        raise ValueError("untrusted context body contains guard markers")
+    out = dict(message)
+    out["metadata"] = dict(message.get("metadata") or {})
+    out["content"] = _WRAPPED_PREFIX + body + _WRAPPED_SUFFIX
+    return out
+
+
+def merge_untrusted_context_messages(messages: list, *, bodies: list | None = None) -> Dict[str, Any]:
+    """Combine ``untrusted_context_message`` results into one guarded block.
+
+    Every section keeps its own ``Source:`` label inside a single guard, so
+    the model still sees per-source provenance while the prompt carries the
+    header once. Taint is the union of the parts: the merged message arms the
+    tool gate when any part does and is ``external`` when any part is.
+    ``bodies`` optionally replaces the section bodies (e.g. shortened ones);
+    they must come from ``untrusted_context_body`` or be escaped by the caller.
+    """
+    sections = bodies if bodies is not None else [untrusted_context_body(m) for m in messages]
+    if any(section is None for section in sections):
+        raise ValueError("merge_untrusted_context_messages needs untrusted_context_message parts")
+    labels = [str((m.get("metadata") or {}).get("source") or "") for m in messages]
+    origins = {
+        (m.get("metadata") or {}).get("provenance_origin")
+        for m in messages
+    } - {None}
+    metadata: Dict[str, Any] = {
+        "trusted": False,
+        "source": "; ".join(label for label in labels if label),
+        "sources": labels,
+        "tool_gate_untrusted": any(
+            (m.get("metadata") or {}).get("tool_gate_untrusted", True) is not False
+            for m in messages
+        ),
+    }
+    if "external" in origins:
+        metadata["provenance_origin"] = "external"
+    elif len(origins) == 1:
+        metadata["provenance_origin"] = next(iter(origins))
+    return {
+        "role": "user",
+        "content": _WRAPPED_PREFIX + "\n\n".join(sections) + _WRAPPED_SUFFIX,
+        "metadata": metadata,
+    }

@@ -30,7 +30,11 @@ from src.context_compactor import (
     maybe_compact,
 )
 from src.settings import get_setting
-from src.prompt_security import untrusted_context_message
+from src.prompt_security import (
+    merge_untrusted_context_messages,
+    untrusted_context_body,
+    untrusted_context_message,
+)
 from src.tool_security import (
     blocked_tools_for_owner,
     delegated_credential_blocked_tools,
@@ -2830,20 +2834,24 @@ def _build_system_prompt(
     if _doc_message:
         merged.insert(last_user_idx, _doc_message)
         last_user_idx += 1  # the document message is now at last_user_idx
-    if _email_message:
-        merged.insert(last_user_idx, _email_message)
-        last_user_idx += 1
-    if _email_style_message:
-        merged.insert(last_user_idx, _email_style_message)
-        last_user_idx += 1
-    if _integ_message:
-        merged.insert(last_user_idx, _integ_message)
-        last_user_idx += 1
-    if _mcp_desc_message:
-        merged.insert(last_user_idx, _mcp_desc_message)
-        last_user_idx += 1
-    if _skills_message:
-        merged.insert(last_user_idx, _skills_message)
+    # This turn's untrusted agent context (email, integrations, MCP tool
+    # descriptions, skills) ships as one guarded block: every part keeps its
+    # "Source:" label and the merged taint, but the wrapper header is sent once.
+    _context_parts = [
+        m for m in (
+            _email_message,
+            _email_style_message,
+            _integ_message,
+            _mcp_desc_message,
+            _skills_message,
+        ) if m
+    ]
+    if len(_context_parts) > 1 and all(untrusted_context_body(m) is not None for m in _context_parts):
+        _context_bundle = merge_untrusted_context_messages(_context_parts)
+        _context_bundle["_agent_injected"] = "context"
+        _context_parts = [_context_bundle]
+    for injected in _context_parts:
+        merged.insert(last_user_idx, injected)
         last_user_idx += 1
     if _datetime_message:
         merged.insert(last_user_idx, _datetime_message)
@@ -2919,8 +2927,16 @@ def _build_base_prompt(
     # index block is returned SEPARATELY (not appended to agent_prompt).
     # The caller wraps it in untrusted_context_message and ships it as a
     # user-role message — same treatment as the matched-skills block.
+    #
+    # The index is the only skills catalogue in the prompt (chat context no
+    # longer adds its own) and is omitted when the model cannot call
+    # `manage_skills` — disabled (read-only profiles, incognito, privileges)
+    # or not among this turn's selected tools.
     skill_index_block = ""
-    if not suppress_local_context and not suppress_skills:
+    skills_tool_available = "manage_skills" not in disabled and (
+        relevant_tools is None or "manage_skills" in tool_names
+    )
+    if not suppress_local_context and not suppress_skills and skills_tool_available:
         try:
             from services.memory.skills import SkillsManager
             from src.constants import DATA_DIR
@@ -5393,9 +5409,9 @@ async def stream_agent_loop(
                 if not tool_blocks:
                     _force_answer = True
                     messages.append({
-                        "role": "system",
+                        "role": "user",
                         "content": (
-                            "Answer the user's identity/personal-memory question from the compact "
+                            "[Odysseus] Answer the user's identity/personal-memory question from the compact "
                             "saved memory facts already provided. Do not call manage_memory or any tool."
                         ),
                     })
@@ -5537,10 +5553,14 @@ async def stream_agent_loop(
                     "[agent] native tool round %s produced no content; retrying without schemas",
                     round_num,
                 )
+                # Harness notes are appended as user-role messages: system
+                # messages are merged into the leading system prompt, which
+                # would change the cached prompt prefix mid-turn and force a
+                # local backend to re-process the whole prompt.
                 messages.append({
-                    "role": "system",
+                    "role": "user",
                     "content": (
-                        "TOOL MODE CHANGE — tool schemas are no longer available in this "
+                        "[Odysseus] TOOL MODE CHANGE — tool schemas are no longer available in this "
                         "request. Your previous reply was empty. Retry the task now: to use "
                         "a tool, emit a fenced code block with the tool name as the language "
                         "tag:\n\n"
@@ -5583,9 +5603,9 @@ async def stream_agent_loop(
                     yield f'data: {json.dumps({"delta": _note})}\n\n'
                     full_response += _note
                     messages.append({
-                        "role": "system",
+                        "role": "user",
                         "content": (
-                            "An independent verifier reviewed your work against the "
+                            "[Odysseus] An independent verifier reviewed your work against the "
                             "original request and found issues that must be fixed before "
                             "this is actually done:\n- " + "\n- ".join(_vfail) +
                             "\n\nFix these now using tools, then finish."
@@ -5630,9 +5650,9 @@ async def stream_agent_loop(
                         "\"check logs\" when those tools are available."
                     )
                 messages.append({
-                    "role": "system",
+                    "role": "user",
                     "content": (
-                        f"You just wrote: \"{_matched_phrase}\" — but ended the "
+                        f"[Odysseus] You just wrote: \"{_matched_phrase}\" — but ended the "
                         "turn without making the actual tool call. The user can "
                         "see you announced the action but didn't run it, which "
                         "is the most frustrating thing you can do. "
@@ -5732,9 +5752,9 @@ async def stream_agent_loop(
                          f"you needed it.)" if _off else "")
             _force_answer = True
             messages.append({
-                "role": "system",
+                "role": "user",
                 "content": (
-                    "You're repeating tool calls without converging. STOP calling "
+                    "[Odysseus] You're repeating tool calls without converging. STOP calling "
                     "tools and end the turn one of two ways: (a) write your best "
                     "final answer NOW from the information already gathered, or "
                     "(b) if you're genuinely blocked, say plainly what's blocking "

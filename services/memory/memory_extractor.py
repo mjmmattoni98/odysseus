@@ -367,6 +367,12 @@ async def extract_and_store(
                 # enough once thinking has room.
                 max_tokens=4096,
                 headers=headers,
+                # Short internal call for the current user: queue behind the
+                # user's next prompt on a local model, and skip thinking on
+                # Ollama — pulling facts out of a transcript into JSON does
+                # not need it and it multiplies the GPU time spent here.
+                workload="utility",
+                think=False,
             )
 
             # Parse JSON, tolerating reasoning-model noise (<think> blocks, a

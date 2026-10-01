@@ -407,19 +407,9 @@ def comprehensive_web_search(
 
     logger.info(f"Successfully fetched content from {len(fetched_content)} pages")
 
-    # Format results
+    # Format results. Each source is listed once, in the summary below, with
+    # the citation number the model uses and the UI's sources list shows.
     output_parts = []
-
-    if search_results:
-        output_parts.append("```sources")
-        for i, result in enumerate(search_results, 1):
-            i = _url_index.get(result.get("url"), i)
-            output_parts.append(f"[{i}] {result['title']}")
-            output_parts.append(f"    {result['url']}")
-            if result.get("age"):
-                output_parts.append(f"    {result['age']}")
-        output_parts.append("```")
-        output_parts.append("")
 
     output_parts.append("=" * 70)
     output_parts.append("WEB SEARCH RESULTS AND FETCHED CONTENT")
