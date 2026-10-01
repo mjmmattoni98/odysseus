@@ -394,6 +394,103 @@ def _append_local_ollama_download_command_lines(
     lines.append('if [ -z "$ODYSSEUS_OLLAMA_PULL_CMD" ]; then echo "ERROR: Ollama not found on this server. Install Ollama or start an ollama-rocm/ollama-test container."; exit 127; fi')
 
 
+_OLLAMA_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,39}$")
+
+
+def _llm_endpoint_base_url(cmd: str | None, remote: str | None, *, ollama_url: str | None = None) -> tuple[str, bool]:
+    """Return ``(base_url, is_ollama)`` for a Cookbook-served LLM endpoint.
+
+    Ollama serves register against the native API root (``http://host:port``,
+    no ``/v1``) so chat uses ``/api/chat``; other engines are
+    OpenAI-compatible at ``/v1``. ``ollama_url`` is the already-running daemon
+    a serve reused instead of starting a second one.
+    """
+    cmd = cmd or ""
+    is_ollama = "ollama" in cmd.lower()
+    if is_ollama and ollama_url:
+        return ollama_url.rstrip("/"), True
+    # Port: ordered fallbacks so we match whatever the user actually
+    # asked for, not a hardcoded default:
+    #   1. explicit `--port N`  (vllm / sglang / llama-server)
+    #   2. `OLLAMA_HOST=host:port`  (the way Ollama specifies its bind)
+    #   3. fallback by backend (11434 ollama / 8080 llama.cpp)
+    port_match = re.search(r"--port(?:=|\s+)(\d+)", cmd)
+    ollama_host_match = re.search(r"OLLAMA_HOST=[^\s]*?:(\d+)", cmd)
+    if port_match:
+        port = int(port_match.group(1))
+    elif ollama_host_match:
+        port = int(ollama_host_match.group(1))
+    elif is_ollama:
+        port = 11434
+    else:
+        port = 8080  # llama.cpp's llama-server default — the Apple Silicon path
+    # The cookbook tmux for local serves runs INSIDE the odysseus container,
+    # so the in-container backend reaches it at `localhost`. The Ollama
+    # sidecar containers live on the Docker host. Remote serves use the SSH
+    # host alias.
+    if remote:
+        host = remote.split("@")[-1] if "@" in remote else remote
+    elif re.search(r"\bdocker\s+exec\s+(?:ollama-rocm|ollama-test)\b", cmd):
+        host = "host.docker.internal"
+    else:
+        host = "localhost"
+    if is_ollama:
+        return f"http://{host}:{port}", True
+    return f"http://{host}:{port}/v1", False
+
+
+async def _detect_existing_ollama(remote: str | None, ssh_port: str | None, port: int) -> dict | None:
+    """Find an Ollama daemon already answering on the serve target.
+
+    Returns ``{"url", "version"}`` when Odysseus can reach it over HTTP,
+    ``{"url": "", "version", "loopback_only": True}`` when a remote daemon
+    only answers on the remote's loopback (seen over SSH), else ``None``.
+    Starting a second ``ollama serve`` next to it would compete for VRAM.
+    """
+    from src import ollama_admin
+    if not remote:
+        roots = [f"http://127.0.0.1:{port}"]
+        if running_in_container():
+            roots.append(f"http://host.docker.internal:{port}")
+        return await ollama_admin.find_running_daemon(roots)
+    host = remote.split("@")[-1] if "@" in remote else remote
+    found = await ollama_admin.find_running_daemon([ollama_admin.ollama_root(f"http://{host}:{port}")])
+    if found:
+        return found
+    port_args = ["-p", str(ssh_port)] if ssh_port and str(ssh_port) != "22" else []
+    probe = (
+        f"curl -fsS --max-time 2 http://127.0.0.1:{int(port)}/api/version 2>/dev/null "
+        f"|| wget -qO- -T 2 http://127.0.0.1:{int(port)}/api/version 2>/dev/null"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+            *port_args, remote, probe,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        version = (json.loads(stdout.decode("utf-8", "replace") or "{}") or {}).get("version")
+    except Exception:
+        return None
+    if not version:
+        return None
+    return {"url": "", "version": str(version), "loopback_only": True}
+
+
+def _append_reused_ollama_runner_lines(lines: list[str], existing: dict, port: int) -> None:
+    """Runner body that attaches the task to an existing Ollama daemon."""
+    url = existing.get("url") or ""
+    version = str(existing.get("version") or "")
+    if not _OLLAMA_VERSION_RE.fullmatch(version):
+        version = "unknown"
+    lines.append(f"echo '[odysseus] Ollama {_bash_squote(version)} is already running at {_bash_squote(url)}.'")
+    lines.append("echo '[odysseus] Reusing it instead of starting a second daemon (two daemons would compete for VRAM).'")
+    lines.append("echo '[odysseus] Manage its models in Cookbook > Ollama. Stopping this task unloads the model but leaves that daemon running.'")
+    lines.append(f"echo 'Ollama API ready on port {int(port)}: {_bash_squote(url)}'")
+    lines.append("while true; do sleep 3600; done")
+
+
 def setup_cookbook_routes() -> APIRouter:
     router = APIRouter(tags=["cookbook"])
     _cookbook_state_path = Path(COOKBOOK_STATE_FILE)
@@ -1756,16 +1853,18 @@ def setup_cookbook_routes() -> APIRouter:
             return
         logger.debug(f"crash-watchdog: no exit marker for {session_id} within window; leaving endpoint {endpoint_id}")
 
-    def _auto_register_llm_endpoint(req: ServeRequest, remote: str | None) -> str | None:
+    def _auto_register_llm_endpoint(
+        req: ServeRequest, remote: str | None, *, ollama_url: str | None = None,
+    ) -> str | None:
         """Register a freshly-served LLM as a model endpoint so it appears in the
         model picker without a manual /setup step — the text-model sibling of
         _auto_register_image_endpoint.
 
-        Cookbook serve commands launch an OpenAI-compatible server (llama.cpp's
-        llama-server, vLLM, SGLang, or Ollama) on a known port. We point an
-        endpoint at that server's /v1; the picker auto-discovers the model id by
-        probing /v1/models and dims the endpoint until the server is reachable,
-        so registering immediately (before the server finishes loading) is safe.
+        Cookbook serve commands launch llama.cpp's llama-server, vLLM, SGLang
+        (OpenAI-compatible, registered at /v1) or Ollama (registered at its
+        native API root with endpoint_kind="ollama"). The picker auto-discovers
+        the model ids and dims the endpoint until the server is reachable, so
+        registering immediately (before the server finishes loading) is safe.
         """
         logger.info(
             f"_auto_register_llm_endpoint: ENTRY repo_id={req.repo_id!r} "
@@ -1774,43 +1873,9 @@ def setup_cookbook_routes() -> APIRouter:
         import re
         from core.database import SessionLocal, ModelEndpoint
 
-        # Port: ordered fallbacks so we match whatever the user actually
-        # asked for, not a hardcoded default:
-        #   1. explicit `--port N`  (vllm / sglang / llama-server)
-        #   2. `OLLAMA_HOST=host:port`  (the way Ollama specifies its bind)
-        #   3. fallback by backend (11434 ollama / 8080 llama.cpp)
-        # Previously the OLLAMA_HOST form was silently ignored and we
-        # registered every Ollama endpoint at 11434 — even if the user
-        # set OLLAMA_HOST=0.0.0.0:11435 to avoid colliding with an
-        # existing systemd Ollama, the registered endpoint pointed at
-        # the OLD port and showed as offline.
-        port_match = re.search(r'--port\s+(\d+)', req.cmd)
-        ollama_host_match = re.search(r'OLLAMA_HOST=[^\s]*?:(\d+)', req.cmd)
-        if port_match:
-            port = int(port_match.group(1))
-        elif ollama_host_match:
-            port = int(ollama_host_match.group(1))
-        elif "ollama" in req.cmd:
-            port = 11434
-        else:
-            port = 8080  # llama.cpp's llama-server default — the Apple Silicon path
-
-        # Determine host. The cookbook tmux for `local=true` serves runs INSIDE
-        # the odysseus container — so the right URL for the in-container
-        # backend to reach it is `localhost`, NOT `host.docker.internal`
-        # (the latter points at the docker HOST, which doesn't have a server
-        # on that port). The previous host.docker.internal fallback only made
-        # sense for /setup-added external services like systemd Ollama on the
-        # host — and those go through manual setup, not this auto-register
-        # code path. For remote serves we still use the SSH host alias.
-        if remote:
-            host = remote.split("@")[-1] if "@" in remote else remote
-        elif re.search(r"\bdocker\s+exec\s+(?:ollama-rocm|ollama-test)\b", req.cmd or ""):
-            host = "host.docker.internal"
-        else:
-            host = "localhost"
-
-        base_url = f"http://{host}:{port}/v1"
+        # OLLAMA_HOST=host:port is honoured, so a user who moved Ollama to
+        # 11435 to avoid a systemd Ollama gets the port they asked for.
+        base_url, is_ollama_endpoint = _llm_endpoint_base_url(req.cmd, remote, ollama_url=ollama_url)
 
         short_name = req.repo_id.split("/")[-1] if "/" in req.repo_id else req.repo_id
         display_name = short_name or "Local model"
@@ -1827,7 +1892,6 @@ def setup_cookbook_routes() -> APIRouter:
 
         # If the serve command opts models into OpenAI tool-calling, record it so
         # agent_loop trusts emitted tool_calls instead of the name heuristic.
-        is_ollama_endpoint = "ollama" in (req.cmd or "").lower()
         supports_tools = True if "--enable-auto-tool-choice" in req.cmd else None
         # Pin the model the user launched for every Cookbook-created LLM
         # endpoint, not just Ollama. Some OpenAI-compatible servers report a
@@ -1840,10 +1904,26 @@ def setup_cookbook_routes() -> APIRouter:
         try:
             # Reuse an endpoint already pointed at this URL instead of duplicating.
             existing = db.query(ModelEndpoint).filter(ModelEndpoint.base_url == base_url).first()
+            if existing is None and is_ollama_endpoint:
+                # Same Ollama server registered through its /v1 surface (e.g. a
+                # hand-added http://host.docker.internal:11434/v1). Reuse that
+                # row as-is; existing endpoints are not migrated automatically.
+                from src.ollama_admin import ollama_root as _ollama_root
+                _root = _ollama_root(base_url)
+                existing = next(
+                    (row for row in db.query(ModelEndpoint).all()
+                     if (row.model_type or "llm") != "image" and _ollama_root(row.base_url) == _root),
+                    None,
+                )
+                if existing is not None:
+                    base_url = existing.base_url
             if existing:
                 existing.is_enabled = True
                 existing.model_type = "llm"
-                existing.name = display_name
+                # Keep the label of a hand-added row (e.g. the user's own
+                # Ollama endpoint a serve reused); rename Cookbook rows only.
+                if str(existing.id or "").startswith("local-"):
+                    existing.name = display_name
                 existing.endpoint_kind = "local"
                 existing.model_refresh_mode = "auto"
                 if pinned_models:
@@ -2043,7 +2123,29 @@ def setup_cookbook_routes() -> APIRouter:
         # `docker exec ollama-test ollama-import …` get wrapped as if they
         # were native `ollama serve`, prepending OLLAMA_HOST=… and then
         # running the ollama-not-found preflight which exits 127.
-        if re.search(r"\bollama\s+serve\b", req.cmd) and "OLLAMA_HOST=" not in req.cmd:
+        # Before starting `ollama serve`, look for a daemon already answering
+        # on the target (typically the user's systemd/desktop Ollama on
+        # 11434). Reuse it instead of launching a second daemon beside it —
+        # two daemons fight over VRAM. Bash runners only; remote Windows keeps
+        # the old start-a-daemon path.
+        reused_ollama = None
+        is_ollama_serve = bool(re.search(r"\bollama\s+serve\b", req.cmd))
+        if is_ollama_serve and not is_windows and not (IS_WINDOWS and not remote):
+            _, _probe_port = _ollama_bind_from_cmd(req.cmd)
+            reused_ollama = await _detect_existing_ollama(remote, req.ssh_port, int(_probe_port))
+            if reused_ollama and reused_ollama.get("loopback_only"):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Ollama {reused_ollama.get('version') or ''} is already running on {remote} "
+                        f"(127.0.0.1:{_probe_port}) but only listens on that host's loopback, so Odysseus "
+                        "cannot reach it. Starting a second daemon would compete for VRAM. Set "
+                        "OLLAMA_HOST=0.0.0.0 in that Ollama's service environment (trusted networks only) "
+                        "and restart it, or stop it before serving from Cookbook."
+                    ).replace("  ", " "),
+                    "session_id": session_id,
+                }
+        if is_ollama_serve and reused_ollama is None and "OLLAMA_HOST=" not in req.cmd:
             _ollama_bind_host = "0.0.0.0" if remote else "127.0.0.1"
             _ollama_chosen_port = _pick_free_port_for_ollama(
                 remote, req.ssh_port, start_port=11434, max_offset=10,
@@ -2290,6 +2392,13 @@ def setup_cookbook_routes() -> APIRouter:
                 runner_lines.append('    ODYSSEUS_PREFLIGHT_EXIT=127')
                 runner_lines.append('  fi')
                 runner_lines.append('fi')
+            elif is_ollama_serve and reused_ollama:
+                handled_ollama_serve = True
+                _append_reused_ollama_runner_lines(
+                    runner_lines,
+                    reused_ollama,
+                    int(_ollama_bind_from_cmd(req.cmd)[1]),
+                )
             elif re.search(r"\bollama\s+serve\b", req.cmd):
                 handled_ollama_serve = True
                 _ollama_default_host = "0.0.0.0" if remote else "127.0.0.1"
@@ -2789,7 +2898,9 @@ def setup_cookbook_routes() -> APIRouter:
         if is_image_endpoint:
             endpoint_id = _auto_register_image_endpoint(req, remote)
         elif not is_pip_install:
-            endpoint_id = _auto_register_llm_endpoint(req, remote)
+            endpoint_id = _auto_register_llm_endpoint(
+                req, remote, ollama_url=(reused_ollama or {}).get("url") or None,
+            )
 
         # Crash watchdog: the auto-register above writes the endpoint row
         # IMMEDIATELY (before the server has even bound its port) so the
@@ -2825,8 +2936,14 @@ def setup_cookbook_routes() -> APIRouter:
         except Exception:
             pass
 
-        return {"ok": True, "session_id": session_id, "remote": remote or "local",
-                "endpoint_id": endpoint_id}
+        result = {"ok": True, "session_id": session_id, "remote": remote or "local",
+                  "endpoint_id": endpoint_id}
+        if reused_ollama:
+            result["reused_ollama"] = {
+                "url": reused_ollama.get("url") or "",
+                "version": reused_ollama.get("version") or "",
+            }
+        return result
 
     # ── Server setup (install deps on remote) ──
 

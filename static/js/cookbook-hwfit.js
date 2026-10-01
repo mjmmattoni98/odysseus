@@ -36,6 +36,8 @@ import uiModule from './ui.js';
 import spinnerModule from './spinner.js';
 import { _loadTasks, _tmuxGracefulKill, _nextAvailablePort, _taskPort } from './cookbookRunning.js';
 import { openCookbookDependencies } from './cookbook-diagnosis.js';
+import { fetchInstalledForHost, pullViaApiForHost } from './cookbookOllama.js';
+import { findInstalled, allocatedContext, installedFootprintGb } from './cookbookOllamaFormat.js';
 
 // Map a serve-backend code (vllm / sglang / llamacpp / mlx) → the package name
 // the Dependencies API reports. Used to look up "is this backend installed
@@ -607,9 +609,20 @@ function _olParseSize(s) {
   if (m) return parseFloat(m[1]) / 1000;
   return null;
 }
-function _ollamaToHwfitRows(libModels, vramAvail, ramAvail) {
+// `installedInfo` is /api/cookbook/ollama/models for the Ollama server behind
+// the scanned host ({ models, default_context }) or null. Installed tags use
+// their real size on disk plus a KV-cache estimate for the allocated context
+// (preset num_ctx, else the app's default local context):
+//   KV bytes ≈ Σ_layers kv_heads × (key_len + value_len) × 2 × cached_tokens
+// where cached_tokens = ctx for full-attention layers and min(ctx, window)
+// for sliding-window layers (f16 upper bound; per-layer terms computed
+// server-side from /api/show model_info).
+// Other tags keep the rough 0.6 GB × params estimate.
+function _ollamaToHwfitRows(libModels, vramAvail, ramAvail, installedInfo = null) {
   const out = [];
   if (!Array.isArray(libModels)) return out;
+  const installed = Array.isArray(installedInfo?.models) ? installedInfo.models : [];
+  const defaultCtx = Number(installedInfo?.default_context) || 0;
   const _ramFitLevel = (need, budget) => {
     if (!need || !budget || need > budget) return 'too_tight';
     const ratio = need / budget;
@@ -617,39 +630,60 @@ function _ollamaToHwfitRows(libModels, vramAvail, ramAvail) {
     if (ratio <= 0.78) return 'good';
     return 'marginal';
   };
+  const _fitLevel = (vramGb) => {
+    let fitLevel = 'no_fit';
+    if (vramGb && vramAvail) {
+      if (vramGb <= vramAvail * 0.6) fitLevel = 'perfect';
+      else if (vramGb <= vramAvail) fitLevel = 'good';
+      else if (ramAvail && vramGb <= ramAvail) fitLevel = _ramFitLevel(vramGb, ramAvail);
+      else fitLevel = 'too_tight';
+    } else if (vramGb && ramAvail && vramGb <= ramAvail) {
+      fitLevel = _ramFitLevel(vramGb, ramAvail);
+    }
+    return fitLevel;
+  };
+  const _paramsLabel = (params) => params
+    ? (params >= 1 ? params.toFixed(params >= 10 ? 0 : 1) + 'B' : (params * 1000).toFixed(0) + 'M')
+    : '?';
+  // A modest score so Ollama rows still sort sensibly in the default
+  // score view — bigger models get a slightly higher base, but they
+  // always come in below well-scored HF results. Sort by Fit or VRAM
+  // to surface them more aggressively.
+  const _score = (params) => params ? Math.min(30 + params * 0.3, 60) : 25;
+  const _installedRow = (row, inst) => {
+    const ctx = allocatedContext(inst, defaultCtx);
+    const vramGb = installedFootprintGb(inst, ctx);
+    const params = parseFloat(String(inst.parameter_size || '').replace(/[^0-9.]/g, '')) || row.params_b || 0;
+    return {
+      ...row,
+      quant: inst.quantization || row.quant,
+      parameter_count: inst.parameter_size || row.parameter_count,
+      params_b: params,
+      required_gb: vramGb,
+      fit_level: _fitLevel(vramGb),
+      score: _score(params),
+      context: ctx || 0,
+      _installed: true,
+      _olSizeBytes: inst.size,
+    };
+  };
+  const matched = new Set();
   for (const m of libModels) {
     const sizes = (Array.isArray(m.sizes) && m.sizes.length) ? m.sizes : ['latest'];
     for (const sz of sizes) {
       const params = _olParseSize(sz);
       // Ollama default GGUF is ~Q4_K_M. Rough VRAM estimate: 0.6 GB / B.
       const vramGb = params ? params * 0.6 : 0;
-      let fitLevel = 'no_fit';
-      if (vramGb && vramAvail) {
-        if (vramGb <= vramAvail * 0.6) fitLevel = 'perfect';
-        else if (vramGb <= vramAvail) fitLevel = 'good';
-        else if (ramAvail && vramGb <= ramAvail) fitLevel = _ramFitLevel(vramGb, ramAvail);
-        else fitLevel = 'too_tight';
-      } else if (vramGb && ramAvail && vramGb <= ramAvail) {
-        fitLevel = _ramFitLevel(vramGb, ramAvail);
-      }
       const tag = `${m.name}:${sz}`;
-      const paramsLabel = params
-        ? (params >= 1 ? params.toFixed(params >= 10 ? 0 : 1) + 'B' : (params * 1000).toFixed(0) + 'M')
-        : '?';
-      // A modest score so Ollama rows still sort sensibly in the default
-      // score view — bigger models get a slightly higher base, but they
-      // always come in below well-scored HF results. Sort by Fit or VRAM
-      // to surface them more aggressively.
-      const score = params ? Math.min(30 + params * 0.3, 60) : 25;
-      out.push({
+      let row = {
         name: tag,
         repo_id: tag,
         quant: 'Q4_K_M',
-        parameter_count: paramsLabel,
+        parameter_count: _paramsLabel(params),
         params_b: params || 0,
         required_gb: vramGb,
-        fit_level: fitLevel,
-        score,
+        fit_level: _fitLevel(vramGb),
+        score: _score(params),
         speed_tps: 0,
         context: 0,
         is_gguf: true,
@@ -658,10 +692,49 @@ function _ollamaToHwfitRows(libModels, vramAvail, ramAvail) {
         _olName: m.name,
         _olSize: sz,
         _description: m.description || '',
-      });
+      };
+      const inst = findInstalled(installed, tag);
+      if (inst) {
+        matched.add(inst.name);
+        row = _installedRow(row, inst);
+      }
+      out.push(row);
     }
   }
+  // Installed tags that aren't in the library list (custom presets, hf.co
+  // imports, namespaced models) still deserve a real-size row.
+  for (const inst of installed) {
+    if (matched.has(inst.name) || (inst.capabilities || []).includes('embedding')) continue;
+    const [olName, olSize = 'latest'] = String(inst.name).split(':');
+    out.push(_installedRow({
+      name: inst.name,
+      repo_id: inst.name,
+      quant: 'Q4_K_M',
+      parameter_count: '?',
+      params_b: 0,
+      speed_tps: 0,
+      is_gguf: true,
+      backend: 'ollama',
+      _isOllama: true,
+      _olName: olName,
+      _olSize: olSize,
+      _description: 'Installed on your Ollama server',
+    }, inst));
+  }
   return out;
+}
+
+// Installed Ollama models behind the scanned host, bounded so a slow or
+// missing daemon never delays the ranking.
+async function _ollamaInstalledForScan(remoteHost) {
+  try {
+    return await Promise.race([
+      fetchInstalledForHost(remoteHost || ''),
+      new Promise(resolve => setTimeout(() => resolve(null), 4000)),
+    ]);
+  } catch {
+    return null;
+  }
 }
 
 export async function _hwfitFetch(fresh = false, opts = {}) {
@@ -897,8 +970,8 @@ export async function _hwfitFetch(fresh = false, opts = {}) {
     if (!isImageMode) {
       const _vramAvail = data.system?.gpu_vram_gb || 0;
       const _ramAvail = data.system?.total_ram_gb || 0;
-      const _lib = await _ensureOllamaLib();
-      const _olRows = _ollamaToHwfitRows(_lib, _vramAvail, _ramAvail);
+      const [_lib, _olInstalled] = await Promise.all([_ensureOllamaLib(), _ollamaInstalledForScan(remoteHost)]);
+      const _olRows = _ollamaToHwfitRows(_lib, _vramAvail, _ramAvail, _olInstalled);
       // Search filter on Ollama rows: HF API already filters by search; do the
       // same client-side over Ollama name + description so the search box
       // works consistently across both sources.
@@ -1667,7 +1740,11 @@ export function _expandModelRow(row, modelData) {
     dlBtn.addEventListener('click', () => {
       const host = _syncHostFromScanDropdown();   // host the user picked, passed explicitly
       if (backend === 'ollama') {
-        _runPanelCmd(panel, _buildDownloadCmd(modelData, backend), { timeout: 0 });
+        // Prefer the Ollama HTTP API (live progress, cancel) when reachable.
+        const tag = String(modelData.ollama || modelData.ollama_name || modelData.name || '').split('/').pop().toLowerCase();
+        pullViaApiForHost(host, tag)
+          .catch(() => false)
+          .then(ok => { if (!ok) _runPanelCmd(panel, _buildDownloadCmd(modelData, backend), { timeout: 0 }); });
       } else {
         _runModelDownload(panel, modelData, backend, host);
       }

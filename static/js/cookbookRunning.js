@@ -10,6 +10,8 @@ import { registerMenuDismiss } from './escMenuStack.js';
 import { computeProgressSignal } from './cookbookProgressSignal.js';
 import { portOf, nextFreePort } from './cookbookPorts.js';
 import { topPortalZ } from './toolWindowZOrder.js';
+import { unloadOnServerUrl } from './cookbookOllama.js';
+import { sameOllamaRoot } from './cookbookOllamaFormat.js';
 
 // Human-friendly badge label for a task's internal status. Avoids surfacing
 // the word "error" in the sidebar — a server the user stopped or one that
@@ -593,13 +595,15 @@ function _isAnyBindHost(host) {
   return h === '0.0.0.0' || h === '::' || h === '[::]';
 }
 
+// Ollama advertises its API root ("Ollama API ready on port N: <url>").
+// Register the native root (no /v1) so chat uses /api/chat.
 function _endpointFromAdvertisedUrl(rawUrl, currentHost, fallbackPort = '11434') {
   try {
     const u = new URL(rawUrl);
     const host = _isAnyBindHost(u.hostname) ? currentHost : (u.hostname || currentHost);
     const port = u.port || fallbackPort;
     const bracketedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
-    return { host, port, baseUrl: `${u.protocol}//${bracketedHost}${port ? `:${port}` : ''}/v1` };
+    return { host, port, baseUrl: `${u.protocol}//${bracketedHost}${port ? `:${port}` : ''}` };
   } catch {
     return null;
   }
@@ -650,6 +654,19 @@ function _markServeEndpointMismatch(task, ep, host, port) {
 function _appendPinnedServeModel(fd, task) {
   const expected = _serveExpectedModel(task);
   if (expected) fd.append('pinned_models', expected);
+}
+
+// Ollama serves register as native endpoints (endpoint_kind=ollama, no /v1).
+function _appendOllamaEndpointKind(fd, task, snapshot = '') {
+  if (_taskLooksOllama(task, snapshot)) fd.append('endpoint_kind', 'ollama');
+}
+
+// An endpoint already registered for this serve's server — exact URL, or for
+// Ollama the same server through either its native or /v1 URL.
+function _findServeEndpoint(eps, baseUrl, task, snapshot = '') {
+  const exact = (eps || []).find(e => e.base_url === baseUrl);
+  if (exact || !_taskLooksOllama(task, snapshot)) return exact || null;
+  return (eps || []).find(e => sameOllamaRoot(e.base_url, baseUrl)) || null;
 }
 
 function _isImageServeTask(task) {
@@ -1159,9 +1176,49 @@ function _ollamaUnloadCommand(task, outputText = '') {
   return inner;
 }
 
+// Ollama root as Odysseus reaches it (not the target host's loopback):
+// reused daemon URL, then the advertised ready URL, then host:port.
+function _ollamaApiUrlForTask(task, outputText = '') {
+  const reused = String(task?.payload?._ollamaUrl || '');
+  if (reused) return reused.replace(/\/+$/, '');
+  const connectHost = _connectHostFromRemote(_taskRemoteHost(task));
+  const out = String(outputText || '');
+  const ready = out.match(/Ollama API ready on port\s+\d+:\s*(http:\/\/[^\s]+)/i);
+  if (ready) {
+    const ep = _endpointFromAdvertisedUrl(ready[1].replace(/\/+$/, ''), connectHost, '11434');
+    if (ep) return ep.baseUrl;
+  }
+  const cmd = String(task?.payload?._cmd || '');
+  const hostVal = cmd.match(/OLLAMA_HOST=([^\s]+)/)?.[1] || '';
+  // The backend may pick a free port server-side; Ollama logs the real bind.
+  const port = out.match(/Listening on\D*?:(\d+)/i)?.[1] || hostVal.match(/:(\d+)$/)?.[1] || '11434';
+  return `http://${connectHost}:${port}`;
+}
+
+// Unload through the Ollama management API; fall back to the old curl over
+// SSH only when no allowlisted server matches (daemon bound to the remote's
+// loopback, unreachable from Odysseus).
+async function _unloadOllamaForTask(task, outputText = '') {
+  if (!_taskLooksOllama(task, outputText)) return;
+  const model = _ollamaModelForTask(task);
+  if (!model) return;
+  try {
+    if (await unloadOnServerUrl(_ollamaApiUrlForTask(task, outputText), model)) return;
+  } catch (_) { /* fall back */ }
+  const fallback = _ollamaUnloadCommand(task, outputText);
+  if (!fallback) return;
+  try {
+    await fetch('/api/shell/exec', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: fallback }),
+    });
+  } catch (_) { /* unload best-effort */ }
+}
+
 function _endpointUrlForTask(task, outputText = '') {
   if (_taskLooksOllama(task, outputText)) {
-    return _ollamaBaseUrlForTask(task, outputText) + '/v1';
+    return _ollamaApiUrlForTask(task, outputText);
   }
   const host = _connectHostFromRemote(_taskRemoteHost(task));
   const portMatch = task.payload?._cmd?.match(/--port\s+(\d+)/);
@@ -2023,8 +2080,18 @@ export async function _launchServeTask(shortName, repo, cmd, fields, hostOverrid
     // so the "Edit / relaunch" button can re-open the Serve panel pre-filled
     // with these precise settings (not just the last-used-for-repo state).
     const payload = { repo_id: repo, remote_host: _host || undefined, remote_server_key: _serverMetaKey || undefined, remote_server_name: _serverMetaName || undefined, ssh_port: _sp || undefined, _cmd: cmd, _fields: fields || undefined, _env: _usedEnv, _envPath: _usedEnvPath, _gpus: _usedGpus };
+    if (data.reused_ollama) {
+      // The backend found an Ollama daemon already running on this host and
+      // attached the task to it instead of starting a second one.
+      payload._reusedOllama = true;
+      payload._ollamaUrl = data.reused_ollama.url || undefined;
+    }
     _addTask(data.session_id, shortName, 'serve', payload);
-    uiModule.showToast(`Serving ${shortName}...`);
+    if (data.reused_ollama) {
+      uiModule.showToast(`Ollama ${data.reused_ollama.version || ''} is already running at ${data.reused_ollama.url || 'this host'} — reusing it instead of starting a second daemon.`.replace('  ', ' '), 8000);
+    } else {
+      uiModule.showToast(`Serving ${shortName}...`);
+    }
     // Auto-register may have enabled an existing (offline) endpoint for this
     // host:port. Refresh the picker so the row is no longer dimmed, and the
     // user doesn't see "offline" on a serve they just started.
@@ -2649,13 +2716,15 @@ export function _renderRunningTab() {
         if (task.type === 'serve' && task.payload?._cmd) {
           items.push({ group: 'endpoint', label: 'Register endpoint', action: 'register-endpoint', custom: async () => {
             const host = _connectHostFromRemote(task.remoteHost);
+            const _outText = el.querySelector('.cookbook-output-pre')?.textContent || task.output || '';
+            const _isOllamaTask = _taskLooksOllama(task, _outText);
             const portMatch = task.payload?._cmd?.match(/--port\s+(\d+)/);
-            const port = portMatch ? portMatch[1] : '8000';
-            const baseUrl = `http://${host}:${port}/v1`;
+            const baseUrl = _isOllamaTask ? _ollamaApiUrlForTask(task, _outText) : `http://${host}:${portMatch ? portMatch[1] : '8000'}/v1`;
+            const port = baseUrl.match(/:(\d+)(?:\/|$)/)?.[1] || (portMatch ? portMatch[1] : '8000');
             try {
               // Check existing first — offer to overwrite if present
               const eps = await (await fetch('/api/model-endpoints', { credentials: 'same-origin' })).json();
-              const existing = eps.find(e => e.base_url === baseUrl);
+              const existing = _findServeEndpoint(eps, baseUrl, task, _outText);
               if (existing) {
                 uiModule.showToast(`Already registered as "${existing.name}"`);
                 task._endpointAdded = true;
@@ -2672,6 +2741,7 @@ export function _renderRunningTab() {
               fd.append('name', task.name);
               fd.append('skip_probe', 'true');
               _appendCookbookEndpointScope(fd, task.remoteHost || '');
+              if (_isOllamaTask) fd.append('endpoint_kind', 'ollama');
               if (_isImageServeTask(task)) fd.append('model_type', 'image');
               const res = await fetch('/api/model-endpoints', { method: 'POST', credentials: 'same-origin', body: fd });
               if (res.ok) {
@@ -2878,19 +2948,14 @@ export function _renderRunningTab() {
       el.dataset.status = 'stopped';
       _updateTask(task.sessionId, { _userStopped: true });
       const outputText = el.querySelector('.cookbook-output-pre')?.textContent || task.output || '';
-      // Drop the model endpoint so the picker stops listing it.
-      if (task.type === 'serve' && task.payload) {
+      // Unload first (the unload targets an allowlisted server, which may be
+      // the endpoint we're about to drop).
+      await _unloadOllamaForTask(task, outputText);
+      // Drop the model endpoint so the picker stops listing it — unless the
+      // serve reused an Ollama daemon Cookbook didn't start: that daemon (and
+      // its endpoint) keeps running.
+      if (task.type === 'serve' && task.payload && !task.payload._reusedOllama) {
         _removeEndpointByUrl(_endpointUrlForTask(task, outputText));
-      }
-      const ollamaUnload = _ollamaUnloadCommand(task, outputText);
-      if (ollamaUnload) {
-        try {
-          await fetch('/api/shell/exec', {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ command: ollamaUnload }),
-          });
-        } catch {}
       }
       // Gracefully stop (C-c, then kill the session) so it's fully down...
       try {
@@ -2913,16 +2978,7 @@ export function _renderRunningTab() {
     el.querySelector('.cookbook-task-action-kill').addEventListener('click', async () => {
       const outputText = el.querySelector('.cookbook-output-pre')?.textContent || task.output || '';
       const isLive = task.type === 'serve' && ['running', 'ready', 'loading', 'warming', 'starting'].includes(task.status || '');
-      const ollamaUnload = _ollamaUnloadCommand(task, outputText);
-      if (ollamaUnload) {
-        try {
-          await fetch('/api/shell/exec', {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ command: ollamaUnload }),
-          });
-        } catch (_) { /* unload best-effort */ }
-      }
+      await _unloadOllamaForTask(task, outputText);
       let killOk = true;
       try {
         const r = await fetch('/api/shell/exec', {
@@ -2956,7 +3012,7 @@ export function _renderRunningTab() {
         try { uiModule.showToast('Kill failed — session may still be running. Check `tmux ls` on the server.', 'error'); } catch (_) {}
         return;  // leave the row so the user can retry
       }
-      if (task.type === 'serve' && task.payload) {
+      if (task.type === 'serve' && task.payload && !task.payload._reusedOllama) {
         const endpointUrl = _endpointUrlForTask(task, outputText);
         _removeEndpointByUrl(endpointUrl);
         const modelName = task.payload.model || task.name || '';
@@ -3626,19 +3682,25 @@ async function _reconnectTask(el, task) {
           if (ollamaUrlMatch) {
             const endpoint = _endpointFromAdvertisedUrl(ollamaUrlMatch[1], host, '11434');
             if (endpoint) ({ host, port, baseUrl } = endpoint);
+          } else if (_taskLooksOllama(task, snapshot)) {
+            // Fresh `ollama serve`: native root at the port from its
+            // "Listening on host:port" log line.
+            if (!portMatch) port = '11434';
+            baseUrl = `http://${host}:${port}`;
           }
           fetch('/api/model-endpoints', { credentials: 'same-origin' })
             .then(r => r.json())
             .then(async (eps) => {
               // Match only exact base_url — don't dedup by friendly name,
               // because other endpoints may happen to share a model name.
-              const exists = eps.some(e => e.base_url === baseUrl);
+              // (Ollama: the same server via its native or /v1 URL.)
+              const exists = !!_findServeEndpoint(eps, baseUrl, task, snapshot);
               if (exists) {
                 // Already registered — e.g. the backend pre-registers diffusion
                 // endpoints server-side. Mark so we don't retry, but STILL
                 // refresh the picker (and probe until online) so the new model
                 // shows up without the user having to manually refresh.
-                const _ex = eps.find(e => e.base_url === baseUrl);
+                const _ex = _findServeEndpoint(eps, baseUrl, task, snapshot);
                 if (_ex && !_endpointMatchesServe(_ex, task)) {
                   _markServeEndpointMismatch(task, _ex, host, port);
                   return null;
@@ -3659,6 +3721,7 @@ async function _reconnectTask(el, task) {
               fd.append('skip_probe', 'true');
               _appendCookbookEndpointScope(fd, task.remoteHost || '');
               _appendPinnedServeModel(fd, task);
+              _appendOllamaEndpointKind(fd, task, snapshot);
               if (_isDiffusion) fd.append('model_type', 'image');
               return fetch('/api/model-endpoints', { method: 'POST', credentials: 'same-origin', body: fd });
             })
@@ -4280,6 +4343,10 @@ async function _pollBackgroundStatus() {
       if (ollamaUrlMatch) {
         const endpoint = _endpointFromAdvertisedUrl(ollamaUrlMatch[1], host, '11434');
         if (endpoint) ({ host, port, baseUrl } = endpoint);
+      } else if (_taskLooksOllama(localTask || { payload: { _cmd: localTask?.payload?._cmd || '' } }, snapshot)) {
+        // Native Ollama root; prefer the port from "Listening on host:port".
+        port = snapshot.match(/Listening on\D*?:(\d+)/i)?.[1] || (portMatch ? port : '11434');
+        baseUrl = `http://${host}:${port}`;
       }
       const _isDiffusion = _isImageServeTask(localTask);
 
@@ -4318,6 +4385,7 @@ async function _pollBackgroundStatus() {
           fd.append('skip_probe', 'true');
           _appendCookbookEndpointScope(fd, localTask?.remoteHost || t.remote || '');
           _appendPinnedServeModel(fd, localTask || { name: t.model, model: t.model, payload: { repo_id: t.model, _cmd } });
+          _appendOllamaEndpointKind(fd, localTask || { payload: { _cmd } }, snapshot);
           if (_isDiffusion) fd.append('model_type', 'image');
           if (_supportsTools) fd.append('supports_tools', 'true');
           return fetch('/api/model-endpoints', { method: 'POST', credentials: 'same-origin', body: fd });

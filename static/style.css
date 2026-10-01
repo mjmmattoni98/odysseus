@@ -41399,3 +41399,44 @@ body.settings-sidebar-resize-active {
     display: none;
   }
 }
+
+/* ── Cookbook: Ollama tab (static/js/cookbookOllama.js) ── */
+.cookbook-ollama-panel { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; overflow-y: auto; min-height: 0; }
+.cookbook-ollama-toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.cookbook-ollama-toolbar select { height: 24px; max-width: 100%; }
+.cookbook-ollama-version { font-size: 10px; opacity: 0.55; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.cookbook-ollama-notice { font-size: 11px; line-height: 1.4; padding: 6px 8px; border-radius: 5px; background: color-mix(in srgb, var(--fg, #ccc) 6%, transparent); }
+.cookbook-ollama-notice.is-error { color: var(--red, #e55); background: color-mix(in srgb, var(--red, #e55) 10%, transparent); }
+.cookbook-ollama-section { display: flex; flex-direction: column; gap: 6px; }
+.cookbook-ollama-h { margin: 0; font-size: 12px; font-weight: 600; opacity: 0.85; }
+details.cookbook-ollama-preset > summary { cursor: pointer; user-select: none; }
+.cookbook-ollama-list { display: flex; flex-direction: column; gap: 4px; }
+.cookbook-ollama-empty { font-size: 11px; opacity: 0.5; padding: 4px 0; }
+.cookbook-ollama-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; align-items: center; padding: 6px 8px; border-radius: 5px; background: color-mix(in srgb, var(--fg, #ccc) 4%, transparent); }
+.cookbook-ollama-row-main { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; min-width: 0; }
+.cookbook-ollama-name { font-size: 12px; font-weight: 600; font-family: var(--mono, monospace); overflow-wrap: anywhere; }
+.cookbook-ollama-meta { grid-column: 1; font-size: 10px; opacity: 0.6; overflow-wrap: anywhere; }
+.cookbook-ollama-actions { grid-column: 2; grid-row: 1 / span 3; display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.cookbook-ollama-badge { font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 600; white-space: nowrap; background: color-mix(in srgb, var(--accent, var(--red, #e55)) 16%, transparent); color: var(--accent, var(--red, #e55)); }
+.cookbook-ollama-badge-embedding { background: color-mix(in srgb, var(--fg, #ccc) 12%, transparent); color: inherit; }
+.cookbook-ollama-vram { grid-column: 1; height: 6px; border-radius: 3px; overflow: hidden; background: color-mix(in srgb, var(--fg, #ccc) 14%, transparent); }
+.cookbook-ollama-vram-fill { height: 100%; background: var(--color-warning, #e0a030); transition: width 0.3s ease; }
+.cookbook-ollama-vram.is-full .cookbook-ollama-vram-fill { background: var(--color-success, #4caf50); }
+.cookbook-ollama-pull-row { display: flex; gap: 4px; align-items: center; }
+.cookbook-ollama-pull-row input { flex: 1; min-width: 0; }
+.cookbook-ollama-progress { height: 8px; border-radius: 4px; overflow: hidden; background: color-mix(in srgb, var(--fg, #ccc) 14%, transparent); }
+.cookbook-ollama-progress-fill { height: 100%; width: 0; background: var(--accent, var(--red, #e55)); transition: width 0.25s ease; }
+.cookbook-ollama-progress.is-error .cookbook-ollama-progress-fill { background: var(--red, #e55); }
+.cookbook-ollama-pull-status { font-size: 10px; opacity: 0.7; min-height: 13px; overflow-wrap: anywhere; }
+.cookbook-ollama-pull-status.is-error { color: var(--red, #e55); opacity: 1; }
+.cookbook-ollama-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px 8px; }
+.cookbook-ollama-form label { display: flex; flex-direction: column; gap: 2px; font-size: 10px; opacity: 0.85; }
+.cookbook-ollama-form .cookbook-field-input { width: 100%; box-sizing: border-box; }
+.cookbook-ollama-form-wide { grid-column: 1 / -1; }
+.cookbook-ollama-form textarea { resize: vertical; font-family: var(--mono, monospace); }
+.cookbook-ollama-form-actions { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 6px; }
+.cookbook-ollama-form-hint { font-size: 10px; opacity: 0.55; margin-right: auto; }
+@media (max-width: 560px) {
+  .cookbook-ollama-row { grid-template-columns: minmax(0, 1fr); }
+  .cookbook-ollama-actions { grid-column: 1; grid-row: auto; justify-content: flex-start; }
+}

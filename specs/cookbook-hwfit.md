@@ -8,6 +8,7 @@ This spec covers model setup/serving and hardware fit in:
 
 - app route registration in `app.py`;
 - `routes/cookbook_routes.py`;
+- `routes/ollama_routes.py` and `src/ollama_admin.py` (Cookbook Ollama tab);
 - `src/cookbook_serve_lifecycle.py`;
 - `src/host_docker_access.py`;
 - Cookbook package/rebuild/shell integration in `routes/shell_routes.py`;
@@ -51,6 +52,8 @@ Runtime behavior:
 - missing `tmux`, `docker`, or serve-engine binaries return shaped errors where possible;
 - local Docker inside the Odysseus container is available only when the Docker CLI exists, `ODYSSEUS_ENABLE_HOST_DOCKER=true`, and `/var/run/docker.sock` is actually mounted as a socket; otherwise Cookbook should show the host-Docker access hint and prefer remote SSH Docker workflows;
 - model serve auto-registers LLM or image `ModelEndpoint` rows immediately, then frontend readiness probing can repair/create fallback endpoints;
+- Ollama serves register as native endpoints (`http://host:port`, no `/v1`, `endpoint_kind="ollama"`); an existing row for the same Ollama server (native or `/v1`) is reused, not duplicated or renamed. The agent tool's `_ensure_served_endpoint` does the same and reads `--port N`, `--port=N` and `OLLAMA_HOST=host:port`;
+- before `ollama serve`, the backend probes `/api/version` on the target's Ollama port (local: `127.0.0.1` and, in Docker, `host.docker.internal`; remote: `http://<host>:port`, then the remote loopback over SSH). A running daemon is reused — the task attaches to it, prints the reuse notice plus the `Ollama API ready on port N: <url>` marker, returns `reused_ollama`, and Stop unloads the model without removing the endpoint. A remote daemon that only listens on its loopback is reported as an error instead of starting a second daemon; a daemon is still started when none answers;
 - diffusion-server serves are registered as image endpoints;
 - MLX image serves use `scripts/mlx_image_server.py`, which pins generation/edit dispatch to the model chosen at process start and ignores OpenAI-compatible per-request model selectors;
 - vLLM recipe routes fetch and cache model recipe manifests/YAML from `vllm-project/recipes`, normalize base args/env/dependencies/tool-calling/reasoning variants, and expose compatible strategy metadata for serve setup;
@@ -70,6 +73,19 @@ Runtime behavior:
 - user-shell PATH bootstrap, Git-Bash drive-path conversion, preflight, and exit-code helpers.
 
 Cookbook routes request shell/SSH behavior; they do not relax shell security.
+
+## Ollama Management
+
+`routes/ollama_routes.py` (`/api/cookbook/ollama/*`, admin-only) backs the Cookbook Ollama tab (`static/js/cookbookOllama.js`, pure helpers in `static/js/cookbookOllamaFormat.js`) through `src/ollama_admin.py`:
+
+- targets are an allowlist addressed by opaque id: Ollama-looking `ModelEndpoint` rows (`endpoint_kind="ollama"`, port 11434, or "ollama" in the host; not ollama.com; forwards the row's API key as a bearer) plus reachable local candidates (`OLLAMA_BASE_URL`/`OLLAMA_URL`/`OLLAMA_HOST`, `127.0.0.1:11434`, `host.docker.internal:11434` in Docker). Raw URLs are never accepted and redirects are not followed;
+- `GET servers` (with `/api/version`), `GET models` (`/api/tags` merged with `/api/show` details cached per digest: capabilities, min `*.context_length`, parameter size, quantization, Modelfile parameters, f16 KV bytes/token for full and sliding-window layers), `GET running` (`/api/ps`: size, size_vram, context_length, expires_at);
+- `POST pull` proxies `/api/pull` NDJSON as SSE (`start`/`progress`/`done`/`error`); closing the request closes the upstream stream (Ollama resumes partial pulls). The Download tab and HW Fit Ollama rows use it when the target's API is reachable and keep the CLI/tmux `ollama pull` flow otherwise;
+- `DELETE models` refuses (409 with `in_use`) models referenced by default/utility/vision/research/task/teacher/image settings, the utility/vision fallback chains, or the embedding endpoint unless `force=true` (entries scoped to a different endpoint don't count);
+- `POST unload` sends `/api/generate` `{model, keep_alive: 0}` without a prompt; `POST keep-alive` accepts seconds, durations (`30m`) or `-1`;
+- `POST create` builds `/api/create` `{model, from, parameters, system}` presets; names match `[a-z0-9._-]` with one optional `:tag`, parameters are limited to `num_ctx`, `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `num_predict`, `stop` with range checks, the base must be installed and an existing name needs `overwrite`.
+
+HW Fit rows for installed Ollama tags (local target, or an endpoint on the scanned remote host) use the real size from `/api/tags` plus a KV estimate for the allocated context (preset `num_ctx`, else `local_context_limit_default`): per layer `kv_heads × (key_length + value_length) × 2 bytes × cached_tokens`, where full-attention layers cache `ctx` tokens and sliding-window layers (`*_swa` lengths) cache `min(ctx, sliding_window)`; hybrid models count every `full_attention_interval`-th layer (f16 upper bound, q8_0 ≈ half). Installed tags missing from the library list get their own rows.
 
 ## Shell Dependencies
 
@@ -143,7 +159,8 @@ Runtime behavior:
 - Remote SSH host/port validation is shared through route validators for Cookbook/HWFit paths.
 - Windows launcher/runtime Git Bash discovery includes per-user installs under `%LocalAppData%\\Programs\\Git`, and WSL/Git Bash detection shapes PATH handling for NVIDIA/remote flows.
 - macOS startup helpers start ChromaDB alongside the app path.
-- Ollama serve can auto-pick an available port, and scheduled task stop paths
+- Ollama serve reuses an Ollama daemon already answering on the target and
+  otherwise can auto-pick an available port; scheduled task stop paths
   verify stop success before persisting a stopped state.
 
 ## Model Catalog And Latest Lookup

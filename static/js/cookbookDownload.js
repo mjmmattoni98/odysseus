@@ -6,6 +6,7 @@
 
 import uiModule from './ui.js';
 import { _diagnose, _showDiagnosis, _clearDiagnosis } from './cookbook-diagnosis.js';
+import { pullViaApiForHost } from './cookbookOllama.js';
 
 // Shared state/functions injected by init()
 let _envState;
@@ -518,6 +519,17 @@ export async function _runModelDownload(panel, model, backend, hostOverride) {
   }
   const platform = host ? (srv.platform || '') : (_envState.platform || '');
   const isWin = host ? (platform === 'windows') : _isWindows();
+
+  // Ollama: when the target's Ollama HTTP API is reachable, pull through it
+  // (real per-layer progress + cancel in the Ollama tab). The CLI/tmux flow
+  // below stays for SSH hosts whose daemon Odysseus cannot reach.
+  if (backend === 'ollama') {
+    try {
+      if (await pullViaApiForHost(host, repo)) return;
+    } catch (e) {
+      console.warn('[cookbook] Ollama API pull unavailable, using CLI flow', e);
+    }
+  }
 
   const payload = { repo_id: repo, backend };
   if (include) payload.include = include;

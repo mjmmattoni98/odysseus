@@ -180,6 +180,9 @@ REQUEST_HARD_TIMEOUT = float(os.getenv("REQUEST_HARD_TIMEOUT", "45"))
 _TIMEOUT_EXEMPT_PREFIXES = (
     "/api/chat",            # streaming
     "/api/shell/stream",    # SSE
+    "/api/cookbook/ollama/pull",  # SSE pull progress (multi-GB downloads)
+    "/api/cookbook/ollama/keep-alive",  # may load a large model
+    "/api/cookbook/ollama/create",  # preset creation can copy layers
     "/api/research",        # multi-minute jobs
     "/api/model/download",  # tmux setup may run pip installs
     "/api/model/probe",     # SSE; iterates models with up to 8s timeout each
@@ -805,6 +808,9 @@ app.include_router(setup_shell_routes())
 # Cookbook (model download/serve/cache, cookbook state sync)
 from routes.cookbook_routes import setup_cookbook_routes
 app.include_router(setup_cookbook_routes())
+# Cookbook Ollama tab: installed/loaded models, streamed pulls, presets
+from routes.ollama_routes import setup_ollama_routes
+app.include_router(setup_ollama_routes())
 
 from routes.workspace_routes import setup_workspace_routes
 app.include_router(setup_workspace_routes())

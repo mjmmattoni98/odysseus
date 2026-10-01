@@ -213,13 +213,13 @@ def _infer_serve_port(cmd: str) -> int:
     """Infer likely listen port from a serve command."""
     if not cmd:
         return 8080
-    m = re.search(r"--port\\s+(\\d+)", cmd)
+    m = re.search(r"--port(?:=|\s+)(\d+)", cmd)
     if m:
         try:
             return int(m.group(1))
         except Exception:
             pass
-    m = re.search(r"OLLAMA_HOST=[^\\s]*?:(\\d+)", cmd)
+    m = re.search(r"OLLAMA_HOST=['\"]?[^\s'\"]*?:(\d+)", cmd)
     if m:
         try:
             return int(m.group(1))
@@ -249,9 +249,12 @@ async def _ensure_served_endpoint(
     import httpx
     endpoint_host, container_local = _infer_serve_host(host)
     port = _infer_serve_port(cmd)
-    base_url = f"http://{endpoint_host}:{port}/v1"
     short_name = model.split("/")[-1] if "/" in model else model
     is_image = "diffusion_server.py" in (cmd or "") or "mlx_image_server.py" in (cmd or "")
+    # Ollama serves register against the native API root (no /v1) so chat
+    # uses /api/chat; every other engine is OpenAI-compatible at /v1.
+    is_ollama = not is_image and bool(re.search(r"\bollama\b", cmd or "", re.I))
+    base_url = f"http://{endpoint_host}:{port}" if is_ollama else f"http://{endpoint_host}:{port}/v1"
     payload = {
         "name": short_name if not is_image else f"{short_name} (image)",
         "base_url": base_url,
@@ -259,6 +262,8 @@ async def _ensure_served_endpoint(
         "model_type": "image" if is_image else "llm",
         "container_local": "true" if container_local else "false",
     }
+    if is_ollama:
+        payload["endpoint_kind"] = "ollama"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
