@@ -1370,7 +1370,7 @@ def setup_session_routes(
     @router.get("/session/{sid}/assistant")
     async def get_assistant_preferences(request: Request, sid: str):
         _verify_session_owner(request, sid)
-        from src.assistant_preferences import load_preferences, DEFAULT_LOCAL_CONTEXT_LIMIT
+        from src.assistant_preferences import load_preferences, default_context_limit
         from src.ollama_capabilities import supports_thinking, ollama_api_root, model_context_window
         from src.model_context import _ollama_ps_context, is_local_endpoint
         from src.llm_core import _is_ollama_native_url
@@ -1378,16 +1378,22 @@ def setup_session_routes(
 
         session = session_manager.get_session(sid)
         options = load_preferences(sid)
-        local_ollama = bool(ollama_api_root(session.endpoint_url) and is_local_endpoint(session.endpoint_url))
+        local_ollama = bool(await run_in_threadpool(
+            lambda: bool(ollama_api_root(session.endpoint_url) and is_local_endpoint(session.endpoint_url))
+        ))
         runtime = {"model": session.model, "local_ollama": local_ollama}
         if local_ollama:
-            native = _is_ollama_native_url(session.endpoint_url)
+            native = await run_in_threadpool(_is_ollama_native_url, session.endpoint_url)
+            default_limit = default_context_limit()
             runtime.update({
                 "native": native,
                 "supports_thinking": await run_in_threadpool(supports_thinking, session.endpoint_url, session.model),
                 "loaded_context": await run_in_threadpool(_ollama_ps_context, session.endpoint_url, session.model),
                 "maximum_context": await run_in_threadpool(model_context_window, session.endpoint_url, session.model),
-                "context_limit": options.context_limits.get(session.model, DEFAULT_LOCAL_CONTEXT_LIMIT) if native else None,
+                "context_limit": options.context_limits.get(session.model, default_limit) if native else None,
+                # Lets the UI warn that a per-conversation cap different from
+                # the default makes Ollama reload the model between calls.
+                "default_context_limit": default_limit if native else None,
             })
         return {"preferences": options.model_dump(), "runtime": runtime}
 

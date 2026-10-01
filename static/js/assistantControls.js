@@ -12,6 +12,20 @@ let revision = 0;
 let saves = Promise.resolve();
 const el = id => document.getElementById(id);
 
+// Ollama reloads a model whenever num_ctx changes between calls, and
+// background calls always use the default cap.
+export function contextReloadNote(value) {
+  const fallback = Number(runtime.default_context_limit);
+  if (!runtime.native || !fallback || Number(value) === fallback) return '';
+  return ` This differs from the default (${fallback.toLocaleString()} tokens): Ollama reloads the model when calls switch between the two sizes.`;
+}
+
+function runtimeText(contextValue) {
+  return runtime.local_ollama
+    ? `${runtime.model}. ${runtime.loaded_context ? `Loaded context: ${runtime.loaded_context.toLocaleString()} tokens.` : 'Model is not loaded.'} ${runtime.maximum_context ? `Model maximum: ${runtime.maximum_context.toLocaleString()} tokens.` : ''} ${runtime.native ? `Context limit applies to this model in this conversation.${contextReloadNote(contextValue)}` : 'Ollama controls context and keep-alive for this connection. Set OLLAMA_CONTEXT_LENGTH and OLLAMA_KEEP_ALIVE on the server.'}`
+    : 'The selected model is saved with this conversation.';
+}
+
 function render() {
   const legacy = preferences.profile === 'legacy';
   const button = el('assistant-settings-btn');
@@ -24,10 +38,8 @@ function render() {
   el('assistant-instructions').value = preferences.instructions;
   el('assistant-thinking-row').hidden = runtime.supports_thinking !== true;
   el('assistant-context-row').hidden = !runtime.native;
-  el('assistant-context').value = preferences.context_limits[runtime.model] || runtime.context_limit || 32768;
-  el('assistant-runtime').textContent = runtime.local_ollama
-    ? `${runtime.model}. ${runtime.loaded_context ? `Loaded context: ${runtime.loaded_context.toLocaleString()} tokens.` : 'Model is not loaded.'} ${runtime.maximum_context ? `Model maximum: ${runtime.maximum_context.toLocaleString()} tokens.` : ''} ${runtime.native ? 'Context limit applies to this model in this conversation.' : 'Ollama controls context and keep-alive for this connection. Set OLLAMA_CONTEXT_LENGTH and OLLAMA_KEEP_ALIVE on the server.'}`
-    : 'The selected model is saved with this conversation.';
+  el('assistant-context').value = preferences.context_limits[runtime.model] || runtime.context_limit || runtime.default_context_limit || 32768;
+  el('assistant-runtime').textContent = runtimeText(el('assistant-context').value);
   const webButton = el('web-toggle-btn');
   if (!legacy && webButton) {
     webButton.title = `Web: ${preferences.web_mode}. Click to change.`;
@@ -97,6 +109,9 @@ function init() {
     el('assistant-settings-modal').classList.remove('hidden');
     el('assistant-profile').focus();
   });
+  el('assistant-context')?.addEventListener('input', event => {
+    el('assistant-runtime').textContent = runtimeText(event.target.value);
+  });
   el('assistant-close')?.addEventListener('click', () => el('assistant-settings-modal').classList.add('hidden'));
   el('assistant-profile')?.addEventListener('change', event => {
     const profile = event.target.value;
@@ -140,4 +155,4 @@ function init() {
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
 else init();
 
-export default { loadSession, prepareTurn };
+export default { loadSession, prepareTurn, contextReloadNote };

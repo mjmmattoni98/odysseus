@@ -150,8 +150,25 @@ class ModelDiscovery:
         _append_env_hosts(hosts)
         return hosts
 
+    def _ollama_version(self, host: str, port: int) -> Optional[str]:
+        """Ollama's ``GET /api/version`` answer (``{"version": "0.x"}``), else None."""
+        try:
+            r = httpx.get(f"http://{host}:{port}/api/version", timeout=1.5)
+            if r.is_success:
+                data = r.json()
+                version = data.get("version") if isinstance(data, dict) else None
+                if isinstance(version, str) and version.strip():
+                    return version.strip()
+        except Exception:
+            pass
+        return None
+
     def _fingerprint_provider(self, host: str, port: int) -> Optional[str]:
         """Identify the server software via its native API, independent of port."""
+        # Ollama first: its /api/version is unique and cheap, and Ollama also
+        # answers /v1/models, so it is otherwise indistinguishable from vLLM.
+        if self._ollama_version(host, port):
+            return "ollama"
         try:
             r = httpx.get(f"http://{host}:{port}/api/v1/models", timeout=1.5)
             if r.is_success:
@@ -183,28 +200,69 @@ class ModelDiscovery:
             pass
         return None
 
+    def _native_ollama_item(self, host: str, port: int, ids: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """Discovery item for an Ollama server, registered on its native API.
+
+        New Ollama registrations default to ``http://host:port`` (``/api/chat``)
+        so context size, keep-alive and thinking controls work; ``/v1``
+        remains supported when typed by hand.
+        """
+        if not ids:
+            try:
+                r = httpx.get(f"http://{host}:{port}/api/tags", timeout=3)
+                models = (r.json() or {}).get("models") if r.is_success else None
+                ids = [
+                    m.get("name") or m.get("model") for m in (models or [])
+                    if isinstance(m, dict) and (m.get("name") or m.get("model"))
+                ]
+            except Exception:
+                ids = []
+        if not ids:
+            return None
+        root = f"http://{host}:{port}"
+        return {
+            "host": host,
+            "port": port,
+            "url": root,
+            "base_url": root,
+            "api": "ollama",
+            "models": ids,
+            "models_display": list(ids),
+            "provider": "ollama",
+        }
+
     def _check_port(self, host: str, port: int) -> Optional[Dict[str, Any]]:
         """Check a single host:port for models."""
         base = f"http://{host}:{port}/v1"
         try:
             r = httpx.get(f"{base}/models", timeout=3)
             if not r.is_success:
-                return None
+                raise ValueError(f"HTTP {r.status_code}")
             data = r.json()
             # Some OpenAI-compatible servers return a bare list, not {"data": [...]}.
             items = data if isinstance(data, list) else ((data or {}).get("data") or [])
             ids = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
             if ids:
+                provider = self._fingerprint_provider(host, port)
+                if provider == "ollama":
+                    return self._native_ollama_item(host, port, ids)
                 return {
                     "host": host,
                     "port": port,
                     "url": f"http://{host}:{port}{self.openai_compat_path}",
                     "models": ids,
                     "models_display": [i.lstrip("/") for i in ids],
-                    "provider": self._fingerprint_provider(host, port),
+                    "provider": provider,
                 }
         except Exception:
-            pass
+            # Older Ollama builds have no /v1/models; check the native API on
+            # the ports Ollama is known to use.
+            if port in (11434, 11435) or port in self._extra_ports:
+                try:
+                    if self._ollama_version(host, port):
+                        return self._native_ollama_item(host, port)
+                except Exception:
+                    pass
         return None
 
     def discover_models(self) -> Dict[str, List[Dict[str, Any]]]:
@@ -258,7 +316,11 @@ class ModelDiscovery:
             return []
         urls: List[str] = []
         for ep in items[:limit]:
-            url = (ep.get("url") or "").replace("/chat/completions", "/models")
+            if ep.get("provider") == "ollama":
+                root = (ep.get("base_url") or ep.get("url") or "").rstrip("/")
+                url = f"{root}/api/version" if root else ""
+            else:
+                url = (ep.get("url") or "").replace("/chat/completions", "/models")
             if url:
                 urls.append(url)
         return urls

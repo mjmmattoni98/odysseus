@@ -343,6 +343,9 @@ def analyze_image_with_vl_result(image_path: str, owner: str | None = None) -> d
             url, model_id, headers = _resolve_vl_model(vl_model, owner=owner)
         except ValueError:
             return {"text": "[No vision model configured — set one in Settings → Vision]", "model": vl_model or ""}
+        # Single-resident-model mode: reuse a loaded vision-capable local model.
+        from src.endpoint_resolver import apply_single_model_mode
+        url, model_id, headers = apply_single_model_mode("vision", (url, model_id, headers), owner=owner)
 
         with open(image_path, "rb") as f:
             img_data = base64.b64encode(f.read()).decode("utf-8")

@@ -543,6 +543,7 @@ async function loadEndpoints() {
             </div>
           </div>
           <div class="admin-ep-detail">${esc(ep.base_url)}${category === 'local' ? `<button type="button" class="admin-ep-copy-btn" data-adm-copy-url="${esc(ep.base_url)}" title="Copy URL" aria-label="Copy URL" style="background:none;border:none;padding:0 2px;margin-left:6px;cursor:pointer;color:inherit;opacity:0.45;vertical-align:-2px;line-height:1;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>` : ''}${keyLabel}</div>
+          ${ep.native_ollama_url ? `<div class="admin-ep-detail" style="opacity:0.8;"><button type="button" class="admin-btn-sm" data-adm-ep-native="${ep.id}" data-adm-ep-native-url="${esc(ep.native_ollama_url)}" title="Uses ${esc(ep.native_ollama_url)} (/api/chat). Existing chats keep their current connection until you pick the model again.">Switch to native Ollama API</button> <span style="font-size:10px;opacity:0.6;">enables context size, keep-alive and thinking controls</span></div>` : ''}
           ${hasModels ? `<div class="mcp-tools-panel hidden" data-adm-ep-models-panel="${ep.id}"></div>` : ''}
         </div>`;
     });
@@ -581,6 +582,26 @@ async function loadEndpoints() {
       btn.addEventListener('click', async (e) => {
         e.stopPropagation();
         await fetch(`/api/model-endpoints/${btn.dataset.admToggleEp}`, { method: 'PATCH' });
+        await _refreshAfterEndpointChange();
+        loadEndpoints();
+      });
+    });
+    queryAll('[data-adm-ep-native]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        btn.disabled = true;
+        try {
+          const res = await fetch(`/api/model-endpoints/${btn.dataset.admEpNative}`, {
+            method: 'PATCH',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ base_url: btn.dataset.admEpNativeUrl }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          uiModule?.showToast?.('Switched to the native Ollama API', 2500);
+        } catch (_) {
+          uiModule?.showToast?.('Failed to switch endpoint', 3000);
+        }
         await _refreshAfterEndpointChange();
         loadEndpoints();
       });
@@ -1019,8 +1040,11 @@ function initEndpointForm() {
         u = 'https://ollama.com/api';
       }
     } catch(e) {}
-    // Ensure /v1 suffix for bare host:port URLs (not cloud providers)
-    if (!u.includes('api.') && !u.includes('openrouter') && !u.includes('opencode.ai') && !u.includes('ollama.com') && !u.endsWith('/v1')) {
+    // Ensure /v1 suffix for bare host:port URLs (not cloud providers).
+    // Ollama keeps the bare root: its native API is the default for new
+    // registrations (context size, keep-alive, thinking); /v1 still works
+    // when typed explicitly.
+    if (!u.includes('api.') && !u.includes('openrouter') && !u.includes('opencode.ai') && !u.includes('ollama.com') && !u.endsWith('/v1') && !_looksLikeOllamaBase(u)) {
       try {
         const parsed = new URL(u);
         if (!parsed.pathname || parsed.pathname === '/') {
@@ -1029,6 +1053,16 @@ function initEndpointForm() {
       } catch(e) {}
     }
     return u;
+  }
+  // Ollama's default port or an "ollama" host name. Custom-port Ollama is
+  // fingerprinted server-side (GET /api/version) when the endpoint is added.
+  function _looksLikeOllamaBase(u) {
+    try {
+      const parsed = new URL(u);
+      return parsed.port === '11434' || parsed.hostname.toLowerCase().includes('ollama');
+    } catch (_) {
+      return false;
+    }
   }
 
   async function _defaultOllamaUrl() {
@@ -1039,7 +1073,7 @@ function initEndpointForm() {
         if (data && data.ollama_base_url) return data.ollama_base_url;
       }
     } catch (_) {}
-    return 'http://127.0.0.1:11434/v1';
+    return 'http://127.0.0.1:11434';
   }
 
   function _renderEndpointTestResult(msg, res, d) {
@@ -1738,7 +1772,8 @@ function initEndpointForm() {
           let added = 0;
           let skipped = 0;
           for (const item of items) {
-            const base = item.url.replace('/chat/completions', '').replace(/\/$/, '');
+            // Ollama items carry their native root; others a /v1 chat URL.
+            const base = (item.base_url || item.url.replace('/chat/completions', '')).replace(/\/$/, '');
             const providerDisplay = _PROVIDER_DISPLAY[item.provider] || null;
             const fd = new FormData();
             fd.append('base_url', base);

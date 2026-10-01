@@ -260,6 +260,14 @@ def _pathless_host(base: str, host: str) -> bool:
     return (parsed.hostname or "").lower() == host and not (parsed.path or "").strip("/")
 
 
+_LOCAL_URL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
+
+
+def _is_pathless_local(base: str) -> bool:
+    parsed = urlparse(base)
+    return not (parsed.path or "").strip("/") and (parsed.hostname or "").lower() in _LOCAL_URL_HOSTS
+
+
 def _anthropic_api_root(base: str) -> str:
     """Return Anthropic's API root, preserving /v1 for OpenAI-compatible APIs elsewhere."""
     base = (base or "").strip().rstrip("/")
@@ -278,7 +286,10 @@ def build_chat_url(base: str) -> str:
         return _append_endpoint_path(_ollama_api_root(base), "/chat")
     if provider == "chatgpt-subscription":
         return _append_endpoint_path(base, "/responses")
-    if _pathless_host(base, "api.openai.com"):
+    if _pathless_host(base, "api.openai.com") or _is_pathless_local(base):
+        # Local OpenAI-compatible servers (LM Studio, llama.cpp, vLLM) serve
+        # chat under /v1, mirroring build_models_url. Pathless Ollama roots
+        # never get here: they are detected as native above.
         base = _append_endpoint_path(base, "/v1")
     return _append_endpoint_path(base, "/chat/completions")
 
@@ -308,7 +319,7 @@ def build_models_url(base: str) -> Optional[str]:
     # caller's base so look-alike provider hosts stay generic.
     parsed = urlparse(base)
     host = (parsed.hostname or "").lower()
-    is_local = host in {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
+    is_local = host in _LOCAL_URL_HOSTS
     uses_v1_models_by_default = is_local or host in {"api.deepseek.com", "api.openai.com"}
     if not parsed.path and uses_v1_models_by_default:
         base = _append_endpoint_path(base, "/v1")
@@ -340,6 +351,90 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     return headers
 
 
+# Background roles that single-resident-model mode may redirect to the model
+# already loaded on a local server. "default"/"chat" are the user's choice
+# and are never rewritten.
+SINGLE_MODEL_ROLES = frozenset({"utility", "task", "research", "teacher", "compaction", "vision"})
+
+
+def single_model_mode_enabled() -> bool:
+    """Whether Settings → ``local_single_model_mode`` is on."""
+    try:
+        from src.settings import get_setting
+        value = get_setting("local_single_model_mode", False)
+    except Exception:
+        return False
+    return value is True or str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _can_chat(url: str, model: str) -> bool:
+    """Chat-capable per Ollama's capability report, else by name."""
+    try:
+        from src.ollama_capabilities import capability_tokens, is_embedding_only
+        tokens = capability_tokens(url, model)
+    except Exception:
+        tokens = None
+    if tokens is not None:
+        return not is_embedding_only(tokens)
+    return not any(p in str(model).lower() for p in _NON_CHAT_MODEL)
+
+
+def apply_single_model_mode(
+    role: str,
+    route: Tuple[Optional[str], Optional[str], Optional[Dict]],
+    *,
+    chat_route: Optional[Tuple[Optional[str], Optional[str], Optional[Dict]]] = None,
+    owner: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
+    """Keep background work on the model a local server already has loaded.
+
+    With ``local_single_model_mode`` on, a background ``role`` resolved to a
+    LOCAL endpoint uses, in order: the configured model if it is already
+    loaded there; another chat-capable model loaded there (``/api/ps``,
+    most recently used first); the session/default chat model when that is
+    local too. Otherwise ``route`` is returned unchanged — a cloud model is
+    never substituted, and cloud routes are never touched. For ``vision`` a
+    replacement must itself support images. ``chat_route`` is the caller's
+    session model when known; the default chat model is used otherwise.
+    Explicit per-call pins do not come through here and always win.
+    """
+    url, model, headers = route
+    if role not in SINGLE_MODEL_ROLES or not url or not model or not single_model_mode_enabled():
+        return route
+    try:
+        from src.model_context import is_local_endpoint
+        from src.ollama_capabilities import loaded_model_names
+
+        if not is_local_endpoint(url):
+            return route
+
+        def _eligible(u: str, m: str) -> bool:
+            if not _can_chat(u, m):
+                return False
+            if role == "vision":
+                from src.chat_helpers import model_supports_vision
+                return model_supports_vision(m, u)
+            return True
+
+        loaded = loaded_model_names(url) or []
+        if model in loaded:
+            return route
+        for name in loaded:
+            if _eligible(url, name):
+                logger.info("[single-model] %s: using loaded %s instead of %s", role, name, model)
+                return url, name, headers
+        if not (chat_route and chat_route[0] and chat_route[1]):
+            chat_route = resolve_endpoint("default", owner=owner)
+        chat_url, chat_model, chat_headers = chat_route
+        if (chat_url and chat_model and (chat_url, chat_model) != (url, model)
+                and is_local_endpoint(chat_url) and _eligible(chat_url, chat_model)):
+            logger.info("[single-model] %s: using chat model %s instead of %s", role, chat_model, model)
+            return chat_url, chat_model, chat_headers or {}
+    except Exception as e:
+        logger.debug("single-model resolution failed for %s: %s", role, e)
+    return route
+
+
 def resolve_endpoint(
     setting_prefix: str,
     fallback_url: Optional[str] = None,
@@ -356,9 +451,27 @@ def resolve_endpoint(
         fallback_model:  Model to use if settings are empty.
         fallback_headers: Headers to use if using fallback.
 
+    Background roles then pass through ``apply_single_model_mode`` (a no-op
+    unless ``local_single_model_mode`` is on); the caller's fallback is the
+    session model preferred there.
+
     Returns:
         (endpoint_url, model, headers) — resolved or fallback values.
     """
+    route = _resolve_configured_endpoint(setting_prefix, fallback_url, fallback_model, fallback_headers, owner)
+    if setting_prefix in SINGLE_MODEL_ROLES:
+        session_route = (fallback_url, fallback_model, fallback_headers) if fallback_url and fallback_model else None
+        route = apply_single_model_mode(setting_prefix, route, chat_route=session_route, owner=owner)
+    return route
+
+
+def _resolve_configured_endpoint(
+    setting_prefix: str,
+    fallback_url: Optional[str],
+    fallback_model: Optional[str],
+    fallback_headers: Optional[Dict],
+    owner: Optional[str],
+) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
     try:
         from src.settings import get_user_setting, load_settings
         settings = load_settings()

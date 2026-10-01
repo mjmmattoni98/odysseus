@@ -9,6 +9,7 @@ import ipaddress
 import logging
 import re
 import sys
+import time
 from typing import Dict, List, Optional, Tuple
 
 from urllib.parse import urlparse
@@ -54,6 +55,43 @@ def _normalize_base_for_compare(url: str) -> str:
     return url
 
 
+# Enabled endpoint rows as (normalized base, kind, has_key). Every provider
+# detection and local check consults them, so a short TTL keeps request paths
+# from hitting the database on each call. Keyed by the session factory so a
+# swapped database (tests, reconfiguration) is never served stale rows.
+_ENDPOINT_ROWS_TTL_SECONDS = 5.0
+_endpoint_rows_cache: Optional[Tuple[float, object, list]] = None
+
+
+def invalidate_endpoint_kind_cache() -> None:
+    """Forget cached endpoint rows (call after endpoint create/update/delete)."""
+    global _endpoint_rows_cache
+    _endpoint_rows_cache = None
+
+
+def _endpoint_kind_rows() -> list:
+    global _endpoint_rows_cache
+    from core.database import SessionLocal, ModelEndpoint
+    now = time.monotonic()
+    cached = _endpoint_rows_cache
+    if cached is not None and cached[1] is SessionLocal and now - cached[0] < _ENDPOINT_ROWS_TTL_SECONDS:
+        return cached[2]
+    db = SessionLocal()
+    try:
+        rows = [
+            (
+                _normalize_base_for_compare(getattr(ep, "base_url", "") or ""),
+                (getattr(ep, "endpoint_kind", None) or "auto").strip().lower(),
+                bool(getattr(ep, "api_key", None)),
+            )
+            for ep in db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True).all()
+        ]
+    finally:
+        db.close()
+    _endpoint_rows_cache = (now, SessionLocal, rows)
+    return rows
+
+
 def _configured_endpoint_kind(url: str) -> Optional[str]:
     """Return configured endpoint kind for a chat/base URL when available."""
     target = _normalize_base_for_compare(url)
@@ -62,28 +100,20 @@ def _configured_endpoint_kind(url: str) -> Optional[str]:
     if "core.database" not in sys.modules:
         return None
     try:
-        from core.database import SessionLocal, ModelEndpoint
-        db = SessionLocal()
-        try:
-            rows = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True).all()
-            for ep in rows:
-                base = _normalize_base_for_compare(getattr(ep, "base_url", "") or "")
-                if not base:
-                    continue
-                if target != base and not target.startswith(base + "/"):
-                    continue
-                kind = (getattr(ep, "endpoint_kind", None) or "auto").strip().lower()
-                if kind in ("local", "api", "proxy"):
-                    return kind
-                if getattr(ep, "api_key", None):
-                    parsed = urlparse(base)
-                    host = (parsed.hostname or "").lower()
-                    path = (parsed.path or "").rstrip("/")
-                    if parsed.port != 11434 and "ollama" not in host and (path.endswith("/v1") or "/openai" in path):
-                        return "proxy"
-                return "auto"
-        finally:
-            db.close()
+        for base, kind, has_key in _endpoint_kind_rows():
+            if not base:
+                continue
+            if target != base and not target.startswith(base + "/"):
+                continue
+            if kind in ("local", "api", "proxy", "ollama"):
+                return kind
+            if has_key:
+                parsed = urlparse(base)
+                host = (parsed.hostname or "").lower()
+                path = (parsed.path or "").rstrip("/")
+                if parsed.port != 11434 and "ollama" not in host and (path.endswith("/v1") or "/openai" in path):
+                    return "proxy"
+            return "auto"
     except Exception:
         return None
 
@@ -95,6 +125,14 @@ def is_local_endpoint(url: str) -> bool:
         return False
     if kind == "local":
         return True
+    if kind == "ollama":
+        # Registered Ollama servers (e.g. Cookbook serves) are self-hosted;
+        # only Ollama Cloud keeps its cloud classification.
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            host = ""
+        return not (host == "ollama.com" or host.endswith(".ollama.com"))
     try:
         host = urlparse(url).hostname or ""
         return host in _LOCAL_HOSTS or _is_private_ip_literal(host) or _in_tailscale_range(host)
@@ -246,6 +284,17 @@ KNOWN_CONTEXT_WINDOWS = {
 # Cache
 # ---------------------------------------------------------------------------
 _context_cache: Dict[Tuple[str, str], Tuple[int, bool]] = {}
+# Local endpoints can restart with a different --max-model-len / num_ctx while
+# keeping the same model id, so their answers only live briefly. Without this
+# every request paid a database lookup plus synchronous probes (/slots,
+# /api/ps, /v1/models).
+_LOCAL_CONTEXT_TTL_SECONDS = 20.0
+_local_context_cache: Dict[Tuple[str, str], Tuple[float, int, bool]] = {}
+# Last serving window /api/ps reported per (Ollama root, model). Ollama's /v1
+# surface cannot carry num_ctx, so this is the best evidence of what the
+# server allocates when the model is not loaded right now.
+_serving_context_seen: Dict[Tuple[str, str], int] = {}
+_clock = time.monotonic
 
 
 def _get_context_length_cached(endpoint_url: str, model: str) -> Tuple[int, bool]:
@@ -260,12 +309,16 @@ def _get_context_length_cached(endpoint_url: str, model: str) -> Tuple[int, bool
     cache_key = (endpoint_url, model)
     if not is_local and cache_key in _context_cache:
         return _context_cache[cache_key]
+    if is_local:
+        cached = _local_context_cache.get(cache_key)
+        if cached is not None and _clock() - cached[0] < _LOCAL_CONTEXT_TTL_SECONDS:
+            return cached[1], cached[2]
 
     ctx, known = _query_context_length(endpoint_url, model)
     # Only cache non-default values to allow retry on next request.
-    # Local endpoints can restart with a different --max-model-len while keeping
-    # the same model id, so always re-query them instead of serving stale cache.
-    if not is_local and (ctx != DEFAULT_CONTEXT or configured_kind in ("api", "proxy")):
+    if is_local:
+        _local_context_cache[cache_key] = (_clock(), ctx, known)
+    elif ctx != DEFAULT_CONTEXT or configured_kind in ("api", "proxy"):
         _context_cache[cache_key] = (ctx, known)
     logger.info(f"Context length for {model}: {ctx}")
     return ctx, known
@@ -289,8 +342,7 @@ def get_context_length_known(endpoint_url: str, model: str) -> Tuple[int, bool]:
     (review on #4122)."""
     ctx, known = _get_context_length_cached(endpoint_url, model)
     from src.ollama_capabilities import ollama_api_root
-    from urllib.parse import urlparse
-    if ollama_api_root(endpoint_url) and is_local_endpoint(endpoint_url) and "/v1" not in urlparse(endpoint_url).path:
+    if "/v1" not in urlparse(endpoint_url).path and is_local_endpoint(endpoint_url) and ollama_api_root(endpoint_url):
         from src.assistant_preferences import context_limit
         limit = context_limit(endpoint_url, model)
         return (min(ctx, limit) if known else limit), True
@@ -432,19 +484,18 @@ def _ollama_ps_context(endpoint_url: str, model: str) -> Optional[int]:
     so the serving window is the server's own choice (VRAM-tier default or
     ``OLLAMA_CONTEXT_LENGTH``). Reading it back from the native ``/api/ps``
     query keeps agent budgeting honest instead of assuming the model's
-    advertised maximum. Returns ``None`` when the model isn't loaded or the
-    endpoint isn't a local Ollama.
+    advertised maximum. Every sighting is remembered per (root, model) for
+    when the model is unloaded later. Returns ``None`` when the model isn't
+    loaded or the endpoint isn't a local Ollama.
     """
-    try:
-        parsed = urlparse(endpoint_url or "")
-    except Exception:
+    from src.ollama_capabilities import ollama_api_root
+
+    root = ollama_api_root(endpoint_url)
+    if not root or not root.startswith(("http://", "https://")):
         return None
-    host = (parsed.hostname or "").lower()
-    if parsed.port != 11434 and host not in _LOCAL_HOSTS:
+    host = (urlparse(root).hostname or "").lower()
+    if host == "ollama.com" or host.endswith(".ollama.com"):
         return None
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return None
-    root = f"{parsed.scheme}://{parsed.netloc}"
     target = (model or "").strip().lower()
     if not target:
         return None
@@ -459,13 +510,49 @@ def _ollama_ps_context(endpoint_url: str, model: str) -> Optional[int]:
                 str(item.get("name") or "").lower(),
                 str(item.get("model") or "").lower(),
             }
+            ctx = item.get("context_length")
+            if not (isinstance(ctx, int) and ctx > 0):
+                continue
+            for name in names - {""}:
+                _serving_context_seen[(root, name)] = ctx
             if target in names:
-                ctx = item.get("context_length")
-                if isinstance(ctx, int) and ctx > 0:
-                    return ctx
+                return ctx
     except Exception:
         return None
     return None
+
+
+def _ollama_compat_unloaded_context(endpoint_url: str, model: str, known: Optional[int]) -> int:
+    """Budget window for an Ollama ``/v1`` model that is not loaded right now.
+
+    The server — not Odysseus — picks the window when it loads the model
+    (``OLLAMA_CONTEXT_LENGTH`` or its VRAM-tier default), and that is often
+    far below the model maximum from ``/api/show`` or the name table. Trusting
+    the maximum (e.g. 131072 for qwen3 while the server allocates 65536)
+    silently truncated long agent runs. Prefer the last allocation ``/api/ps``
+    reported for this model; otherwise assume no more than the configured
+    default local cap, which errs toward compacting early over overflowing.
+    """
+    from src.ollama_capabilities import ollama_api_root, model_context_window
+    from src.assistant_preferences import default_context_limit
+
+    root = ollama_api_root(endpoint_url)
+    seen = _serving_context_seen.get((root, (model or "").strip().lower()))
+    if seen:
+        return seen
+    maximum = model_context_window(endpoint_url, model) or known
+    cap = default_context_limit()
+    return min(maximum, cap) if maximum else cap
+
+
+def _slots_base(endpoint_url: str) -> str:
+    """llama.cpp serves ``/slots`` at the server root, beside ``/v1``."""
+    parsed = urlparse(endpoint_url or "")
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    path = parsed.path or ""
+    prefix = path.split("/v1", 1)[0] if "/v1" in path else ""
+    return f"{parsed.scheme}://{parsed.netloc}{prefix.rstrip('/')}"
 
 
 def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
@@ -492,30 +579,47 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
             return api_ctx, True
         return DEFAULT_CONTEXT, False
 
-    # Try llama.cpp /slots endpoint first — reports actual serving context
     if is_local_endpoint(endpoint_url):
-        try:
-            base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
-            r = httpx.get(f"{base}/slots", timeout=REQUEST_TIMEOUT)
-            if r.is_success:
-                slots = r.json()
-                if isinstance(slots, list) and slots:
-                    n_ctx = slots[0].get("n_ctx")
-                    if n_ctx and isinstance(n_ctx, int) and n_ctx > 0:
-                        logger.info(f"llama.cpp /slots reports n_ctx={n_ctx} for {model}")
-                        return n_ctx, True
-        except Exception:
-            pass
+        from src.ollama_capabilities import ollama_api_root, model_context_window
+        # /v1 URLs are only treated as Ollama when that is already known
+        # (port 11434, kind "ollama", cached fingerprint): budgeting a
+        # llama.cpp/vLLM server must not cost an extra /api/version request.
+        compat_path = "/v1" in urlparse(endpoint_url).path
+        is_ollama = bool(ollama_api_root(endpoint_url, probe=not compat_path))
+
+        # Try llama.cpp /slots endpoint first — reports actual serving context.
+        # Ollama has no /slots, so don't spend a request on it there.
+        slots_base = "" if is_ollama else _slots_base(endpoint_url)
+        if slots_base:
+            try:
+                r = httpx.get(f"{slots_base}/slots", timeout=REQUEST_TIMEOUT)
+                if r.is_success:
+                    slots = r.json()
+                    if isinstance(slots, list) and slots:
+                        n_ctx = slots[0].get("n_ctx")
+                        if n_ctx and isinstance(n_ctx, int) and n_ctx > 0:
+                            logger.info(f"llama.cpp /slots reports n_ctx={n_ctx} for {model}")
+                            return n_ctx, True
+            except Exception:
+                pass
 
         # Ollama reports the window it actually allocated for a loaded model.
         # Prefer it over the model's advertised maximum so budgeting matches
         # what /v1 requests will really get (Ollama /v1 cannot carry num_ctx).
-        from src.ollama_capabilities import ollama_api_root, model_context_window
-        native_ollama = bool(ollama_api_root(endpoint_url) and "/v1" not in urlparse(endpoint_url).path)
-        ollama_ctx = model_context_window(endpoint_url, model) if native_ollama else _ollama_ps_context(endpoint_url, model)
-        if ollama_ctx:
-            logger.info("Ollama %s context_length=%s for %s", "maximum" if native_ollama else "loaded", ollama_ctx, model)
-            return ollama_ctx, True
+        if is_ollama:
+            if not compat_path:
+                ollama_ctx = model_context_window(endpoint_url, model)
+                if ollama_ctx:
+                    logger.info("Ollama maximum context_length=%s for %s", ollama_ctx, model)
+                    return ollama_ctx, True
+            else:
+                ollama_ctx = _ollama_ps_context(endpoint_url, model)
+                if ollama_ctx:
+                    logger.info("Ollama loaded context_length=%s for %s", ollama_ctx, model)
+                    return ollama_ctx, True
+                ollama_ctx = _ollama_compat_unloaded_context(endpoint_url, model, known)
+                logger.info("Ollama /v1 %s is not loaded; budgeting %s tokens", model, ollama_ctx)
+                return ollama_ctx, True
 
     # GitHub Copilot's /models requires auth + X-GitHub-Api-Version headers that
     # aren't available here; an unauthenticated probe just 400s. All Copilot

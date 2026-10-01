@@ -31,7 +31,9 @@ def test_auto_compaction_utility_endpoint_keeps_chat_owner():
 
     assert "owner=user" in helper_src
     assert "owner: Optional[str] = None" in compact_src
-    assert 'resolve_endpoint("utility", owner=owner)' in compact_src
+    # The session route is the fallback for an unset Utility model; owner
+    # scoping is unchanged.
+    assert '"utility", endpoint_url, model, headers, owner=owner,' in compact_src
 
 
 def test_background_session_sort_uses_owner_task_endpoint():

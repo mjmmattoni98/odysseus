@@ -121,6 +121,18 @@ DEFAULT_SETTINGS = {
     # `think:false` is ignored by current Ollama builds) and as `think` on the
     # native /api/chat surface. Levels are soft hints for most local models.
     "local_thinking_effort": "auto",
+    # Context window (num_ctx) native local Ollama requests allocate unless a
+    # conversation sets its own per-model limit. Background calls (titles,
+    # memory, tasks) always use it, so every call to one model sends the same
+    # num_ctx — Ollama reloads the model when num_ctx changes between calls.
+    # Clamped to 1024..262144 (see src.assistant_preferences).
+    "local_context_limit_default": 32768,
+    # Single-resident-model mode: background roles (utility, tasks, research,
+    # teacher, compaction, vision when supported) on a LOCAL endpoint use the
+    # model that is already loaded there (or the chat model) instead of
+    # swapping in a different one. For servers that keep one model loaded
+    # (OLLAMA_MAX_LOADED_MODELS=1). Never substitutes a cloud model.
+    "local_single_model_mode": False,
     # Soft input-token budget for the agent loop. The DEFAULT value (6000) is the
     # "auto" sentinel: it means "scale the budget to the model's context window"
     # (#1230) — so long-context models aren't capped at 6000. Set ANY OTHER value

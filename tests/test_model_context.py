@@ -222,24 +222,34 @@ class TestGetContextLength:
     def setup_method(self):
         model_context._context_cache.clear()
         model_context._catalog_ctx_cache.clear()
+        model_context._local_context_cache.clear()
+        model_context._serving_context_seen.clear()
+        import src.ollama_capabilities as oc
+        oc.reset_cache()
 
     def test_local_endpoint_requeries_same_model_after_restart(self, monkeypatch):
+        # Local answers live only for a short TTL: a restarted server with a
+        # new --max-model-len is picked up once it expires, while requests in
+        # between skip the database + probe round trip.
         calls = []
+        now = [1000.0]
 
         def fake_query(endpoint_url, model):
             calls.append((endpoint_url, model))
             return (8192, True) if len(calls) == 1 else (27000, True)
 
         monkeypatch.setattr(model_context, "_query_context_length", fake_query)
+        monkeypatch.setattr(model_context, "_clock", lambda: now[0])
 
         endpoint = "http://127.0.0.1:8000/v1/chat/completions"
         model = "Qwen/Qwen3-14B"
 
         first = model_context.get_context_length(endpoint, model)
-        second = model_context.get_context_length(endpoint, model)
+        cached = model_context.get_context_length(endpoint, model)
+        now[0] += model_context._LOCAL_CONTEXT_TTL_SECONDS + 1
+        after_restart = model_context.get_context_length(endpoint, model)
 
-        assert first == 8192
-        assert second == 27000
+        assert (first, cached, after_restart) == (8192, 8192, 27000)
         assert len(calls) == 2
 
     def test_remote_endpoint_keeps_cached_context(self, monkeypatch):
@@ -338,6 +348,10 @@ class TestOllamaServingContext:
     def setup_method(self):
         model_context._context_cache.clear()
         model_context._catalog_ctx_cache.clear()
+        model_context._local_context_cache.clear()
+        model_context._serving_context_seen.clear()
+        import src.ollama_capabilities as oc
+        oc.reset_cache()
 
     def test_loaded_model_uses_ollama_serving_window(self, monkeypatch):
         def fake_get(url, *args, **kwargs):
@@ -369,17 +383,49 @@ class TestOllamaServingContext:
         )
         assert ctx == 65536
 
-    def test_unloaded_model_falls_through_to_known_window(self, monkeypatch):
+    def _no_show(self, monkeypatch):
+        def fake_post(*args, **kwargs):
+            raise RuntimeError("no /api/show in this test")
+
+        monkeypatch.setattr(model_context.httpx, "post", fake_post)
+
+    def test_unloaded_v1_model_is_capped_by_default_limit_not_name_table(self, monkeypatch):
+        # Ollama /v1 cannot carry num_ctx: the server picks the window when it
+        # loads the model, so an unloaded model budgets at most the configured
+        # default cap instead of the 131072 name-table maximum.
         def fake_get(url, *args, **kwargs):
             return _FakeResp({"models": []})
 
         monkeypatch.setattr(model_context.httpx, "get", fake_get)
+        self._no_show(monkeypatch)
+        import src.assistant_preferences as ap
+        monkeypatch.setattr(ap, "default_context_limit", lambda: 40000)
 
         ctx, known = model_context._query_context_length(
             "http://127.0.0.1:11434/v1/chat/completions", "qwen3.8:27b"
         )
-        assert ctx == 131072
-        assert known is True
+        assert (ctx, known) == (40000, True)
+
+    def test_unloaded_v1_model_keeps_smaller_known_window(self, monkeypatch):
+        monkeypatch.setattr(model_context.httpx, "get", lambda *a, **k: _FakeResp({"models": []}))
+        self._no_show(monkeypatch)
+        import src.assistant_preferences as ap
+        monkeypatch.setattr(ap, "default_context_limit", lambda: 32768)
+
+        ctx, _ = model_context._query_context_length("http://127.0.0.1:11434/v1", "phi-4:14b")
+        assert ctx == 16000
+
+    def test_unloaded_v1_model_reuses_last_serving_window(self, monkeypatch):
+        # The user's server allocates 65536 (OLLAMA_CONTEXT_LENGTH); once
+        # /api/ps has shown that, it wins after the model is unloaded.
+        loaded = {"models": [{"name": "qwen3.8:27b", "model": "qwen3.8:27b", "context_length": 65536}]}
+        responses = [loaded, {"models": []}]
+        monkeypatch.setattr(model_context.httpx, "get", lambda url, *a, **k: _FakeResp(responses.pop(0)))
+        self._no_show(monkeypatch)
+
+        endpoint = "http://127.0.0.1:11434/v1/chat/completions"
+        assert model_context._query_context_length(endpoint, "qwen3.8:27b") == (65536, True)
+        assert model_context._query_context_length(endpoint, "qwen3.8:27b") == (65536, True)
 
     def test_ps_probe_is_direct_and_tolerant(self, monkeypatch):
         calls = []
@@ -391,9 +437,14 @@ class TestOllamaServingContext:
             return _FakeResp({}, ok=False)
 
         monkeypatch.setattr(model_context.httpx, "get", fake_get)
+        self._no_show(monkeypatch)
+        import src.assistant_preferences as ap
+        monkeypatch.setattr(ap, "default_context_limit", lambda: 32768)
 
         ctx, known = model_context._query_context_length(
             "http://127.0.0.1:11434/v1", "gemma4:26b"
         )
-        assert ctx == 262144
+        assert (ctx, known) == (32768, True)
         assert any(url.endswith("/api/ps") for url in calls)
+        # Ollama has no llama.cpp /slots endpoint; it is not probed.
+        assert not any(url.endswith("/slots") for url in calls)

@@ -807,38 +807,45 @@ ANTHROPIC_MODELS = [
 
 
 def _is_ollama_native_url(url: str) -> bool:
-    """Return True for native Ollama API URLs, including Ollama Cloud."""
+    """Return True for native Ollama API URLs, including Ollama Cloud.
+
+    Server identity comes from ``src.ollama_capabilities.is_ollama_url`` (port
+    11434, kind "ollama", or a local ``/api/version`` fingerprint) so a
+    pathless LM Studio (``:1234``) or llama.cpp (``:8080``) URL is never routed
+    to ``/api/chat``. Only a bare root or an ``/api`` path is native.
+    """
     try:
         parsed = urlparse(url or "")
     except Exception as e:
         logger.warning("Failed to parse URL for Ollama detection", exc_info=e)
         return False
-    host = parsed.hostname or ""
     path = (parsed.path or "").rstrip("/")
     if _host_match(url, "ollama.com"):
         return True
     if path.startswith("/v1"):
         return False
-    local_ollama_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or parsed.port == 11434
-    return local_ollama_host and (path == "" or path == "/api" or path.startswith("/api/"))
+    if not (path == "" or path == "/api" or path.startswith("/api/")):
+        return False
+    from src.ollama_capabilities import is_ollama_url
+    return is_ollama_url(url)
 
 
 def _is_ollama_openai_compat_url(url: str) -> bool:
-    """Return True for local Ollama's OpenAI-compatible /v1 surface.
+    """Return True for Ollama's OpenAI-compatible /v1 surface.
 
-    Mirrors the host detection used by ``_is_ollama_native_url`` so that the
-    two helpers stay in lockstep: a localhost Ollama on a non-default port
-    (custom ``OLLAMA_HOST``, reverse proxy, container port remap) is treated
-    the same way here as it is on the native ``/api`` path.
+    Uses the same server identity as ``_is_ollama_native_url`` so vLLM,
+    LM Studio and llama.cpp ``/v1`` servers never receive Ollama-only fields
+    (``think``, ``reasoning_effort: "none"``).
     """
     try:
         parsed = urlparse(url or "")
     except Exception:
         return False
-    host = parsed.hostname or ""
     path = (parsed.path or "").rstrip("/")
-    local_ollama_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or parsed.port == 11434
-    return local_ollama_host and (path == "/v1" or path.startswith("/v1/"))
+    if not (path == "/v1" or path.startswith("/v1/")):
+        return False
+    from src.ollama_capabilities import is_ollama_url
+    return is_ollama_url(url)
 
 
 def _ollama_api_root(url: str) -> str:
@@ -1865,17 +1872,17 @@ def _route_supports_thinking(url: str, model: str) -> bool:
     Ollama's native ``/api/show`` reports a ``thinking`` capability that covers
     every model family, including the ones the name list has never heard of
     (lfm, ornith, granite, laguna, ...). When the probe returns a definitive
-    answer we trust it; otherwise we keep the legacy name heuristics.
+    answer we trust it; otherwise we keep the legacy name heuristics. The
+    oracle answers ``None`` for anything that is not an Ollama server.
     """
-    if _is_ollama_openai_compat_url(url or "") or _is_ollama_native_url(url or ""):
-        try:
-            from src.ollama_capabilities import supports_thinking as _cap_thinking
+    try:
+        from src.ollama_capabilities import supports_thinking as _cap_thinking
 
-            capable = _cap_thinking(url, model)
-        except Exception:
-            capable = None
-        if capable is not None:
-            return capable
+        capable = _cap_thinking(url or "", model)
+    except Exception:
+        capable = None
+    if capable is not None:
+        return capable
     return _supports_thinking(model)
 
 def _normalize_mistral_content(content):

@@ -229,14 +229,20 @@ portable across users / hosts.
 """
 
 
+def _resolve_teacher(teacher_model_spec: str, owner: Optional[str] = None):
+    """Resolve the teacher spec; single-resident-model mode may keep it on the loaded local model."""
+    from src.ai_interaction import _resolve_model
+    from src.endpoint_resolver import apply_single_model_mode
+    return apply_single_model_mode("teacher", _resolve_model(teacher_model_spec, owner=owner), owner=owner)
+
+
 async def _call_teacher(teacher_model_spec: str, prompt: str,
                         owner: Optional[str] = None) -> Optional[str]:
     """Call the configured teacher endpoint with the escalation prompt."""
     from src.llm_core import llm_call_async
-    from src.ai_interaction import _resolve_model
     from src.agent_tools.model_interaction_tools import _TEACHER_SYSTEM_PROMPT
     try:
-        url, model, headers = await asyncio.to_thread(_resolve_model, teacher_model_spec, owner=owner)
+        url, model, headers = await asyncio.to_thread(_resolve_teacher, teacher_model_spec, owner=owner)
     except Exception as e:
         logger.warning(f"teacher endpoint not resolvable ({teacher_model_spec!r}): {e}")
         return None
@@ -582,8 +588,7 @@ async def run_teacher_inline(
 
     # Resolve teacher endpoint
     try:
-        from src.ai_interaction import _resolve_model
-        teacher_url, teacher_model, teacher_headers = await asyncio.to_thread(_resolve_model, teacher_spec, owner=owner)
+        teacher_url, teacher_model, teacher_headers = await asyncio.to_thread(_resolve_teacher, teacher_spec, owner=owner)
     except Exception as e:
         logger.warning(f"teacher endpoint not resolvable ({teacher_spec!r}): {e}")
         yield (

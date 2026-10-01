@@ -453,7 +453,9 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in ("true", "1", "yes", "on")
 
 
-_ENDPOINT_KINDS = {"auto", "local", "api", "proxy"}
+# "ollama" marks an Ollama server on any port (Cookbook serves Ollama on
+# 11435+); it is self-hosted, so it classifies like "local".
+_ENDPOINT_KINDS = {"auto", "local", "api", "proxy", "ollama"}
 _REFRESH_MODES = {"auto", "manual", "disabled"}
 
 
@@ -586,13 +588,67 @@ def _hidden_model_ids(ep: Any) -> set:
     return set(_parse_model_list(getattr(ep, "hidden_models", None)))
 
 
-def _is_ollama_base(base_url: str) -> bool:
+def _is_ollama_base(base_url: str, *, probe: bool = True) -> bool:
+    """Ollama server check shared with the request paths.
+
+    ``is_ollama_url`` is the single source of truth (port 11434, kind
+    "ollama", ``/api/version`` fingerprint). An "ollama" hostname is kept as a
+    hint for keyed reverse proxies in front of Ollama.
+    """
     try:
-        parsed = urlparse(base_url)
-        host = (parsed.hostname or "").lower()
-        return parsed.port == 11434 or "ollama" in host
+        from src.ollama_capabilities import is_ollama_url
+        if is_ollama_url(base_url, probe=probe):
+            return True
+    except Exception:
+        pass
+    try:
+        return "ollama" in (urlparse(base_url).hostname or "").lower()
     except Exception:
         return "ollama" in (base_url or "").lower()
+
+
+def _is_ollama_cloud_base(base_url: str) -> bool:
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except Exception:
+        return False
+    return host == "ollama.com" or host.endswith(".ollama.com")
+
+
+def _native_ollama_switch_target(base_url: str, endpoint_kind: str = "auto") -> Optional[str]:
+    """Native API root for an Ollama endpoint registered on ``/v1``, else None.
+
+    Feeds the "Switch to native Ollama API" affordance. Cache-only (port
+    11434 or kind "ollama"): the endpoint list must render without probing.
+    """
+    try:
+        parsed = urlparse(base_url or "")
+    except Exception:
+        return None
+    if (parsed.path or "").rstrip("/") != "/v1" or _is_ollama_cloud_base(base_url):
+        return None
+    if parsed.port != 11434 and _normalize_endpoint_kind(endpoint_kind) != "ollama":
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
+
+
+def _drop_ollama_embedding_models(base_url: str, models: List[str]) -> List[str]:
+    """Remove embedding-only models from a local Ollama model list.
+
+    Name filters miss embedding tags such as ``all-minilm``; Ollama's
+    ``/api/show`` reports ``["embedding"]`` for them. The lookup is cached
+    per model (10 min) and only runs for local Ollama servers with a modest
+    catalog, so model-list refreshes stay cheap.
+    """
+    if not models or len(models) > 64 or _is_ollama_cloud_base(base_url):
+        return models
+    try:
+        from src.ollama_capabilities import capability_tokens, is_embedding_only, ollama_api_root
+        if not ollama_api_root(base_url):
+            return models
+        return [m for m in models if not is_embedding_only(capability_tokens(base_url, m))]
+    except Exception:
+        return models
 
 
 # Prefixes/substrings for models that are NOT chat-completions-capable
@@ -699,11 +755,54 @@ def _resolve_probe_key(ep) -> Optional[str]:
         return None
 
 
+# A generation probe against a model Ollama has to load first (18 GB from
+# disk) routinely takes longer than the 8 s probe budget.
+_OLLAMA_COLD_LOAD_TIMEOUT = 120
+
+
+def _probe_ollama_model_capabilities(base: str, model_id: str, with_tools: bool = False) -> Optional[dict]:
+    """Probe a local Ollama model through ``/api/show`` instead of generating.
+
+    A generation probe makes Ollama load each model in turn, which evicts
+    the chat model on a one-model-resident server and reports cold loads as
+    failures (and "probe all" then hides those models). ``/api/show`` reads
+    the manifest only. Returns ``None`` when capabilities are unknown (older
+    Ollama, unreachable) so the caller can fall back to a generation probe.
+    """
+    if _is_ollama_cloud_base(base):
+        return None
+    try:
+        from src.ollama_capabilities import capability_tokens, is_embedding_only
+        t0 = _time.time()
+        tokens = capability_tokens(base, model_id, timeout=5.0)
+    except Exception:
+        return None
+    if tokens is None:
+        return None
+    latency = round((_time.time() - t0) * 1000)
+    caps = sorted(tokens)
+    if is_embedding_only(tokens):
+        return {"status": "fail", "latency_ms": latency, "error": "Embedding model (no chat)", "capabilities": caps}
+    if with_tools and not tokens & {"tools", "tool"}:
+        return {"status": "fail", "latency_ms": latency, "error": "Model does not advertise tool calling", "capabilities": caps}
+    return {"status": "ok", "latency_ms": latency, "capabilities": caps, "method": "capabilities"}
+
+
 def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 10, with_tools: bool = False) -> dict:
-    """Send a realistic completion request to a single model. Returns {status, latency_ms, error?}."""
+    """Send a realistic completion request to a single model. Returns {status, latency_ms, error?}.
+
+    Local Ollama models are checked through ``/api/show`` capabilities first
+    (no model load); see ``_probe_ollama_model_capabilities``.
+    """
     provider = _safe_detect_provider(base)
     if _is_discovery_only_provider(provider):
         return {"status": "ok", "latency_ms": 0, "skipped": True}
+    if _is_ollama_base(base):
+        shown = _probe_ollama_model_capabilities(base, model_id, with_tools=with_tools)
+        if shown is not None:
+            return shown
+        if not _is_ollama_cloud_base(base):
+            timeout = max(timeout, _OLLAMA_COLD_LOAD_TIMEOUT)
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Say OK"},
@@ -724,7 +823,10 @@ def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 1
         target_url = build_chat_url(base)
         h = _safe_build_headers(api_key, base)
         h["Content-Type"] = "application/json"
-        payload = _build_ollama_payload(model_id, messages, 0.0, 5, stream=False, tools=_test_tools)
+        # Passing the URL gives the probe the same num_ctx as normal calls
+        # (default_context_limit()), so a probe-loaded model is not reloaded
+        # by the next chat request.
+        payload = _build_ollama_payload(model_id, messages, 0.0, 5, stream=False, tools=_test_tools, url=target_url)
     else:
         target_url = build_chat_url(base)
         h = _safe_build_headers(api_key, base)
@@ -788,7 +890,7 @@ def _classify_endpoint(base_url: str, endpoint_kind: str = "auto") -> str:
     Includes the Tailscale CGNAT range (100.64.0.0/10) so tailnet-hosted
     servers (e.g. Cookbook serve endpoints) get reachability-probed too."""
     kind = _normalize_endpoint_kind(endpoint_kind)
-    if kind == "local":
+    if kind == "local" or (kind == "ollama" and not _is_ollama_cloud_base(base_url)):
         return "local"
     if kind in ("api", "proxy"):
         return "api"
@@ -799,6 +901,27 @@ def _classify_endpoint(base_url: str, endpoint_kind: str = "auto") -> str:
     except Exception:
         pass
     return "api"
+
+
+def _detect_ollama_kind(base_url: str, requested_kind: str) -> str:
+    """Record an Ollama server on a non-default port as kind "ollama".
+
+    Port 11434 is recognized everywhere without help. On other ports
+    (``OLLAMA_HOST=...:11435``, Cookbook serves) request paths only know the
+    server is Ollama from a cached ``/api/version`` fingerprint; persisting
+    the kind at registration makes native routing and capability probing
+    independent of that cache. Explicit api/proxy choices are left alone.
+    """
+    if requested_kind not in ("auto", "local"):
+        return requested_kind
+    try:
+        parsed = urlparse(base_url)
+        if parsed.port == 11434 or _is_ollama_cloud_base(base_url):
+            return requested_kind
+        from src.ollama_capabilities import fingerprint_ollama
+        return "ollama" if fingerprint_ollama(base_url, timeout=1.5) else requested_kind
+    except Exception:
+        return requested_kind
 
 
 def _effective_endpoint_kind(ep: Any, base_url: str) -> str:
@@ -1027,7 +1150,7 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
                 for _e in _PROVIDER_CURATED.get(_ck, []):
                     if _e not in set(models) and not any(m.startswith(_e) for m in models):
                         models.append(_e)
-            return [m for m in models if _is_chat_model(m)]
+            return [m for m in _drop_ollama_embedding_models(base, models) if _is_chat_model(m)]
     except httpx.HTTPStatusError as e:
         if e.response is not None and _is_loading_model_response(e.response):
             logger.info("Endpoint still loading model at %s", _redact_url_for_log(url))
@@ -1046,15 +1169,14 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
     # Older Ollama builds and some proxies expose native /api/tags even when
     # the OpenAI-compatible /v1/models path is unavailable.
     try:
-        parsed = urlparse(base)
-        if parsed.port == 11434 or "ollama" in (parsed.hostname or "").lower():
+        if _is_ollama_base(base):
             root = base[:-3].rstrip("/") if base.endswith("/v1") else base
             r = httpx.get(root + "/api/tags", timeout=timeout, verify=llm_verify())
             r.raise_for_status()
             data = r.json()
             models = _ollama_model_names(data)
             if models:
-                return [m for m in models if _is_chat_model(m)]
+                return [m for m in _drop_ollama_embedding_models(base, models) if _is_chat_model(m)]
     except Exception as e:
         logger.debug(f"Ollama /api/tags probe failed for {base}: {e}")
     # Fall back to curated list if the provider has a URL-based match (e.g. z.ai has no /models endpoint)
@@ -1075,11 +1197,9 @@ def _ping_endpoint(base_url: str, api_key: str = None, timeout: float = 1.5) -> 
     # Ollama exposes /v1/models (OpenAI-compatible) AND native /api/version,
     # /api/tags. Probe native paths for Ollama-style endpoints, but avoid using
     # /models as a generic health check because large proxy catalogs can be slow.
-    parsed_base = urlparse(base)
-    looks_like_ollama = (
-        parsed_base.port == 11434
-        or "ollama" in (parsed_base.hostname or "").lower()
-    )
+    # No fingerprint here: an unknown server gets the generic ping below,
+    # which an Ollama root answers too.
+    looks_like_ollama = _is_ollama_base(base, probe=False)
 
     def _is_loading_model_response(r) -> bool:
         if getattr(r, "status_code", None) != 503:
@@ -1097,7 +1217,7 @@ def _ping_endpoint(base_url: str, api_key: str = None, timeout: float = 1.5) -> 
                 return {
                     "reachable": False,
                     "status_code": r.status_code,
-                    "error": "That is Odysseus, not a model server. Use the Ollama URL, usually http://host.docker.internal:11434/v1 in Docker.",
+                    "error": "That is Odysseus, not a model server. Use the Ollama URL, usually http://host.docker.internal:11434 in Docker.",
                 }
             return {"reachable": False, "status_code": r.status_code, "error": f"HTTP {r.status_code} redirect"}
         if 200 <= r.status_code < 300:
@@ -1180,7 +1300,7 @@ def _model_endpoint_error_message(base_url: str, ping: Dict[str, Any] = None) ->
         probed = base_url
     parsed = urlparse(base_url)
     host = (parsed.hostname or "").lower()
-    is_ollama = parsed.port == 11434 or "ollama" in host or "ollama" in base_url.lower()
+    is_ollama = _is_ollama_base(base_url) or "ollama" in base_url.lower()
     is_lmstudio = (
         parsed.port == 1234
         or "lmstudio" in host
@@ -1211,8 +1331,8 @@ def _model_endpoint_error_message(base_url: str, ping: Dict[str, Any] = None) ->
         if error:
             parts.append(f"Last probe error: {error}.")
         parts.append("Check that Ollama is running and that the base URL is correct.")
-        parts.append("For native/local installs, use http://localhost:11434/v1.")
-        parts.append("For Docker, use http://host.docker.internal:11434/v1 when Ollama runs on the host.")
+        parts.append("For native/local installs, use http://localhost:11434 (native Ollama API; /v1 also works).")
+        parts.append("For Docker, use http://host.docker.internal:11434 when Ollama runs on the host.")
         parts.append("Run `ollama list` to confirm at least one model is installed.")
         return " ".join(parts)
 
@@ -1392,6 +1512,11 @@ def setup_model_routes(model_discovery):
         affects the visible endpoint list (CRUD on ModelEndpoint, prefs
         flip)."""
         _models_cache.clear()
+        try:
+            from src.model_context import invalidate_endpoint_kind_cache
+            invalidate_endpoint_kind_cache()
+        except Exception:
+            pass
 
     # Track model-list refreshes by URL+key. This prevents repeated picker/API
     # opens from starting duplicate /models probes, and gives slow/offline
@@ -1975,6 +2100,7 @@ def setup_model_routes(model_discovery):
                     "supports_tools": getattr(r, "supports_tools", None),
                     "endpoint_kind": kind,
                     "category": _classify_endpoint(base, kind),
+                    "native_ollama_url": _native_ollama_switch_target(base, kind),
                     "model_refresh_mode": _endpoint_refresh_mode(r, kind),
                     "model_refresh_interval": getattr(r, "model_refresh_interval", None),
                     "model_refresh_timeout": getattr(r, "model_refresh_timeout", None),
@@ -2023,7 +2149,7 @@ def setup_model_routes(model_discovery):
         if not name.strip():
             name = base_url.replace("http://", "").replace("https://", "").split("/")[0]
 
-        requested_kind = _normalize_endpoint_kind(endpoint_kind)
+        requested_kind = _detect_ollama_kind(base_url, _normalize_endpoint_kind(endpoint_kind))
         refresh_mode = _normalize_endpoint_refresh_mode(model_refresh_mode, requested_kind, base_url)
         refresh_interval = _parse_positive_int(model_refresh_interval, minimum=30, maximum=86400)
         refresh_timeout = _parse_positive_int(model_refresh_timeout, minimum=1, maximum=60)

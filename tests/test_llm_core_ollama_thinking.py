@@ -20,6 +20,17 @@ def _no_real_capability_probes(monkeypatch):
     thinking effort defaults to "auto" regardless of the local settings file."""
     monkeypatch.setattr("src.ollama_capabilities.supports_thinking", lambda url, model: None)
     monkeypatch.setattr(llm_core, "_ollama_thinking_effort", lambda: "auto")
+    yield
+    import src.ollama_capabilities as oc
+    oc.reset_cache()
+
+
+def _fingerprint(monkeypatch, ollama_roots):
+    """Answer /api/version probes: Ollama only for ``ollama_roots``."""
+    import src.ollama_capabilities as oc
+    oc.reset_cache()
+    monkeypatch.setattr(oc, "_probe_version", lambda root, timeout: "0.34.4" if root in ollama_roots else None)
+    monkeypatch.setattr(oc, "_registered_kind", lambda url: None)
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +113,17 @@ class TestIsOllamaOpenAICompatUrl:
         # IPv6 addresses in URLs require square brackets per RFC 3986
         assert llm_core._is_ollama_openai_compat_url("http://[::1]:11434/v1")
 
-    def test_any_local_non_default_port(self):
-        """Localhost on a non-default port (custom OLLAMA_HOST) must also match."""
+    def test_any_local_non_default_port(self, monkeypatch):
+        """Localhost on a non-default port (custom OLLAMA_HOST) matches once
+        the server answered /api/version like Ollama."""
+        _fingerprint(monkeypatch, {"http://127.0.0.1:11435"})
         assert llm_core._is_ollama_openai_compat_url("http://127.0.0.1:11435/v1")
 
-    def test_localhost_non_default_port(self):
-        assert llm_core._is_ollama_openai_compat_url("http://localhost:8080/v1/chat/completions")
+    def test_localhost_non_default_port_that_is_not_ollama(self, monkeypatch):
+        """llama.cpp/LM Studio/vLLM /v1 servers on localhost are not Ollama
+        and must not receive Ollama-only thinking fields."""
+        _fingerprint(monkeypatch, set())
+        assert not llm_core._is_ollama_openai_compat_url("http://localhost:8080/v1/chat/completions")
 
     def test_zero_dot_zero_host(self):
         assert llm_core._is_ollama_openai_compat_url("http://0.0.0.0:11434/v1")
@@ -168,8 +184,10 @@ class TestThinkSuppression:
 
     def test_think_false_for_non_default_port_thinking_model(self, monkeypatch):
         """Custom-port localhost Ollama (e.g. OLLAMA_HOST=0.0.0.0:11435) must
-        also receive think:false — this is the regression guarded by the
-        host-set check added in this fix."""
+        also receive think:false once fingerprinted as Ollama."""
+        _fingerprint(monkeypatch, {"http://127.0.0.1:11435"})
+        import src.ollama_capabilities as oc
+        assert oc.is_ollama_url("http://127.0.0.1:11435/v1")  # warm the cache outside the loop
         payload = _capture_payload(
             monkeypatch, "http://127.0.0.1:11435/v1/chat/completions", "qwen3:14b"
         )

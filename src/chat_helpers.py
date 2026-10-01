@@ -158,13 +158,27 @@ def lmstudio_supports_vision(url: str, model: str) -> Optional[bool]:
 
 def model_supports_vision(model_name: str, endpoint_url: str = "") -> bool:
     """Whether a model accepts images, using the endpoint's reported
-    capability when available (LM Studio) and falling back to name-based
-    detection otherwise."""
+    capability when available (Ollama ``/api/show``, LM Studio) and falling
+    back to name-based detection otherwise.
+
+    Ollama's report matters beyond correctness: a false negative routes the
+    image to the separate Vision model, which on a one-model-resident server
+    (OLLAMA_MAX_LOADED_MODELS=1) evicts and later reloads the chat model.
+    """
     if endpoint_url:
-        try:
-            advertised = lmstudio_supports_vision(endpoint_url, model_name or "")
-        except Exception:
-            advertised = None
+        from src.ollama_capabilities import ollama_api_root, supports_vision
+
+        if ollama_api_root(endpoint_url):
+            # Never fall through to the LM Studio probe for an Ollama server.
+            try:
+                advertised = supports_vision(endpoint_url, model_name or "")
+            except Exception:
+                advertised = None
+        else:
+            try:
+                advertised = lmstudio_supports_vision(endpoint_url, model_name or "")
+            except Exception:
+                advertised = None
         if advertised is not None:
             return advertised
     return is_vision_model(model_name)

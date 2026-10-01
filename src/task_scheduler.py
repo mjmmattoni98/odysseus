@@ -2174,6 +2174,31 @@ class TaskScheduler:
         return True  # too deep, treat as cycle
 
     def _resolve_defaults(self, db, owner):
+        """Endpoint + model for a task with no pinned or crew-member model.
+
+        Callers check the task's own pin and its crew member first. Then:
+        the Background Tasks setting (``task_endpoint_id``/``task_model``,
+        which falls back to Utility and then Default Chat, with the
+        single-resident-model substitution when that mode is on), then the
+        default chat model. The most recent session's model is only a last
+        resort for installs that never configured a default — a task must
+        not follow whichever model the user happened to chat with last.
+        """
+        try:
+            from src.task_endpoint import resolve_task_endpoint
+            from src.endpoint_resolver import resolve_endpoint
+            for resolve in (
+                lambda: resolve_task_endpoint(owner=owner or None),
+                lambda: resolve_endpoint("default", owner=owner or None),
+            ):
+                url, model, _headers = resolve()
+                if url and model:
+                    return url, model
+        except Exception as e:
+            logger.debug("Task default resolution from settings failed: %s", e)
+        return self._recent_session_route(db, owner)
+
+    def _recent_session_route(self, db, owner):
         """Find the first available endpoint + model from an existing session."""
         from core.database import Session as DbSession
         try:
@@ -2549,7 +2574,7 @@ class TaskScheduler:
 
             # Resolve a default model/endpoint from any existing session so the
             # assistant has something to call. The user can change this later.
-            endpoint_url, model = self._resolve_defaults(db, owner)
+            endpoint_url, model = self._recent_session_route(db, owner)
 
             default_personality = (
                 "You are the user's personal assistant. Concise, warm, a little dry. "

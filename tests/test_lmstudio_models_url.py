@@ -23,12 +23,14 @@ from src import endpoint_resolver, llm_core
 
 
 def _neutralize_provider_detection(monkeypatch):
-    """``_is_ollama_native_url`` matches any localhost host with an empty
-    path, which would route ``http://localhost:1234`` (LM Studio) into the
-    Ollama branch and probe ``/api/tags`` instead of ``/v1/models``. Force
-    provider detection to "openai" so the URL builder takes the LM Studio
-    path the user actually intends."""
-    monkeypatch.setattr(llm_core, "_is_ollama_native_url", lambda url: False)
+    """Answer the Ollama fingerprint (``GET /api/version``) as "not Ollama"
+    without network I/O. Provider detection itself is real: a pathless
+    ``http://localhost:1234`` is only Ollama if the server says so, so
+    LM Studio takes the ``/v1/models`` path the user intends."""
+    import src.ollama_capabilities as oc
+    oc.reset_cache()
+    monkeypatch.setattr(oc, "_probe_version", lambda root, timeout: None)
+    monkeypatch.setattr(oc, "_registered_kind", lambda url: None)
 
 
 # ── build_models_url: handle LM Studio base shapes ────────────────────
@@ -141,9 +143,7 @@ def test_llm_core_list_model_ids_queries_v1_models_for_bare_lmstudio(monkeypatch
     """Issue #25: probing `http://localhost:1234` (no /v1) must hit `/v1/models`."""
     monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
     monkeypatch.setattr(llm_core, "_configured_cached_model_ids", lambda url, **kwargs: [])
-    # Localhost with empty path would otherwise be misclassified as Ollama
-    # (llm_core._is_ollama_native_url); neutralise that for the test.
-    monkeypatch.setattr(llm_core, "_is_ollama_native_url", lambda url: False)
+    _neutralize_provider_detection(monkeypatch)
     seen = []
 
     def fake_get(url, headers=None, timeout=None):

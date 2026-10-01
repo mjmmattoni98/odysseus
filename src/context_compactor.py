@@ -376,7 +376,11 @@ async def maybe_compact(
     )
 
     # Use utility model if configured, otherwise fall back to session model
-    util_url, util_model, util_headers = resolve_endpoint("utility", owner=owner)
+    # (passed as the fallback so an unset Utility means this session's model,
+    # not the global default chat model).
+    util_url, util_model, util_headers = resolve_endpoint(
+        "utility", endpoint_url, model, headers, owner=owner,
+    )
     compact_url = util_url or endpoint_url
     compact_model = util_model or model
     compact_headers = util_headers if util_url else headers

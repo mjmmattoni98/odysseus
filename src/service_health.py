@@ -384,10 +384,13 @@ def providers_health(endpoints: List[Dict[str, Any]],
 
 # ── Local Ollama endpoints ──
 
-# Docs recommend >= 64k for agent/search workloads; a loaded model below this
-# while the checkpoint supports much more means OLLAMA_CONTEXT_LENGTH is at
-# Ollama's VRAM-tier default.
-_MIN_AGENT_CONTEXT = 65536
+def _default_context_cap() -> int:
+    """The configured default local context cap (Settings → Local Models)."""
+    try:
+        from src.assistant_preferences import default_context_limit
+        return default_context_limit()
+    except Exception:
+        return 32768
 
 
 def _is_cloud_ollama_root(root: str) -> bool:
@@ -431,10 +434,16 @@ def local_models_health(endpoints: List[Dict[str, Any]], *,
     """Tuning checks for local Ollama endpoints.
 
     Reports the local-model failure modes that never show up as an outage:
-    CPU spill on a loaded model, a serving context far below the model's
-    advertised window (Ollama /v1 cannot carry ``num_ctx``), and native tool
+    CPU spill on a loaded model, a serving context below the configured
+    default local context cap while the model supports more, and native tool
     calling explicitly disabled for a tools-capable model. Read-only probes;
     ``meta`` carries no secrets.
+
+    The context check is surface-aware: native endpoints receive
+    ``num_ctx`` = the cap from Odysseus, so a smaller allocation means the
+    model was loaded by someone else and will be reloaded on the next call;
+    ``/v1`` endpoints cannot carry ``num_ctx``, so the server's own
+    ``OLLAMA_CONTEXT_LENGTH`` decides and is what must be raised.
     """
     if get_json is None:
         get_json = _probe_json_get
@@ -452,9 +461,15 @@ def local_models_health(endpoints: List[Dict[str, Any]], *,
     if not local:
         return _svc("local models", DISABLED, "No local Ollama endpoints configured.")
 
+    cap = _default_context_cap()
+
     def _check(_i: int, item: tuple) -> Dict[str, Any]:
         ep, root = item
         label = ep.get("name") or _safe_url(ep.get("base_url")) or "endpoint"
+        try:
+            compat = "/v1" in (urlparse(ep.get("base_url") or "").path or "")
+        except Exception:
+            compat = False
         ps = get_json(f"{root}/api/ps")
         if ps is None:
             return {"name": label, "ok": False, "error": "unreachable",
@@ -487,12 +502,22 @@ def local_models_health(endpoints: List[Dict[str, Any]], *,
                 if str(key).endswith(".context_length") and isinstance(val, int) and val > 0:
                     max_ctx = max(max_ctx or 0, val)
             serving = m.get("context_length")
-            if (isinstance(serving, int) and max_ctx
-                    and serving < _MIN_AGENT_CONTEXT and max_ctx >= serving * 2):
-                issues.append(
-                    f"{model_id}: serving {serving} tokens but supports {max_ctx} — "
-                    "raise OLLAMA_CONTEXT_LENGTH or set num_ctx"
-                )
+            if not (isinstance(serving, int) and serving > 0 and max_ctx):
+                continue
+            if serving < min(cap, max_ctx):
+                if compat:
+                    issues.append(
+                        f"{model_id}: server allocates {serving} tokens, below the "
+                        f"default local context cap ({cap}); the OpenAI-compatible /v1 "
+                        "API cannot set num_ctx — raise OLLAMA_CONTEXT_LENGTH on the "
+                        "Ollama server or switch the endpoint to the native Ollama API"
+                    )
+                else:
+                    issues.append(
+                        f"{model_id}: loaded with {serving} tokens, below the default "
+                        f"local context cap ({cap}); Ollama will reload it when "
+                        "Odysseus sends its num_ctx"
+                    )
         return {
             "name": label,
             "ok": not issues,

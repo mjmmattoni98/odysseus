@@ -155,13 +155,24 @@ function _normalizeSetupBaseUrl(raw) {
   u = u.replace(/\/v1\/(models|chat\/completions|completions|messages)\/?$/i, '/v1');
   u = u.replace(/\/(models|chat\/completions|completions|v1\/messages)\/?$/i, '');
   u = u.replace(/\/v1\/v1$/i, '/v1');
-  if (!u.includes('api.') && !u.includes('openrouter') && !u.endsWith('/v1')) {
+  if (!u.includes('api.') && !u.includes('openrouter') && !u.endsWith('/v1') && !_looksLikeOllamaBase(u)) {
     try {
       const parsed = new URL(u);
       if (!parsed.pathname || parsed.pathname === '/') u += '/v1';
     } catch (_) {}
   }
   return u;
+}
+
+// Ollama keeps its bare root: the native API is the default for new Ollama
+// endpoints (custom ports are fingerprinted server-side when added).
+function _looksLikeOllamaBase(u) {
+  try {
+    const parsed = new URL(u);
+    return parsed.port === '11434' || parsed.hostname.toLowerCase().includes('ollama');
+  } catch (_) {
+    return false;
+  }
 }
 
 function _clearSetupGuideMessages() {
@@ -206,7 +217,7 @@ function _showSetupEndpointChoices() {
       '<div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:color-mix(in srgb,var(--bg) 88%,var(--fg) 12%);">' +
         '<div style="font-weight:700;margin-bottom:6px;">' + SETUP_LOCAL_ICON + 'Local setup</div>' +
         '<div>Paste endpoint URL in chat (example):</div>' +
-        '<pre style="margin:4px 0 0;"><code class="setup-clickable-code" style="cursor:pointer;text-decoration:underline;" title="Click to fill in chat">http://localhost:11434/v1</code></pre>' +
+        '<pre style="margin:4px 0 0;"><code class="setup-clickable-code" style="cursor:pointer;text-decoration:underline;" title="Click to fill in chat">http://localhost:11434</code></pre>' +
         '<div style="margin-top:4px;">or</div>' +
         '<pre style="margin:2px 0 0;"><code class="setup-clickable-code" style="cursor:pointer;text-decoration:underline;" title="Click to fill in chat">http://llm-host.local:8000/v1</code></pre>' +
         '<div style="margin-top:4px;">or llama.cpp (llama-server):</div>' +
@@ -232,8 +243,8 @@ function _showSetupEndpointChoicesStreamed(options = {}) {
     { kind: 'p', text: 'Paste endpoint URL in chat (example):' },
     {
       kind: 'code',
-      text: 'http://localhost:11434/v1',
-      copyText: 'http://localhost:11434/v1',
+      text: 'http://localhost:11434',
+      copyText: 'http://localhost:11434',
     },
     { kind: 'p', text: 'or' },
     {
@@ -630,8 +641,8 @@ function detectProvider(input) {
       const parsed = new URL(url);
       if (parsed.hostname.endsWith('ollama.com')) url = 'https://ollama.com/api';
     } catch(e) {}
-    // Add /v1 if bare host:port
-    if (/^https?:\/\/[^/]+$/.test(url) && !url.includes('api.') && !url.includes('ollama.com')) url += '/v1';
+    // Add /v1 if bare host:port (Ollama keeps its native root)
+    if (/^https?:\/\/[^/]+$/.test(url) && !url.includes('api.') && !url.includes('ollama.com') && !_looksLikeOllamaBase(url)) url += '/v1';
     return { base_url: url, api_key: '', name: '' };
   }
   // Known key patterns
@@ -653,6 +664,8 @@ function setupChatUrlForEndpoint(detected) {
   const base = (detected.base_url || '').replace(/\/+$/, '');
   if (detected.name === 'Anthropic') return base.replace(/\/v1$/, '') + '/v1/messages';
   if (base.includes('ollama.com')) return 'https://ollama.com/api/chat';
+  if (/\/api$/.test(base)) return base + '/chat';
+  if (/^https?:\/\/[^/]+$/.test(base) && _looksLikeOllamaBase(base)) return base + '/api/chat';
   return base + '/chat/completions';
 }
 
@@ -5119,7 +5132,7 @@ async function _cmdSetup(args, ctx) {
       await connectDetectedSetupEndpoint({ base_url: normalized, api_key: '', name: 'Local' });
     } else {
       setupMode = 'endpoint-provider-first';
-      await _setupReply('Paste your local endpoint URL, for example http://100.x.x.x:11434/v1.');
+      await _setupReply('Paste your local endpoint URL, for example http://100.x.x.x:11434 (Ollama) or http://100.x.x.x:8000/v1.');
     }
     return true;
   }

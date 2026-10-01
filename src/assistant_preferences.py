@@ -9,6 +9,8 @@ import threading
 from pydantic import BaseModel, ConfigDict, Field
 
 DEFAULT_LOCAL_CONTEXT_LIMIT = 32768
+MIN_CONTEXT_LIMIT = 1024
+MAX_CONTEXT_LIMIT = 262144
 READ_ONLY_TOOLS = frozenset({"web_search", "web_fetch", "search_chats", "read_file", "grep", "glob", "ls", "ask_user"})
 
 
@@ -77,20 +79,40 @@ def current_preferences():
     return value[0] if value else LEGACY_PREFERENCES
 
 
+def default_context_limit():
+    """Configured default local context cap (``local_context_limit_default``).
+
+    Used for native local requests outside a turn and as the per-model
+    default inside one. Invalid stored values fall back to 32768; valid ones
+    are clamped to the same range as per-conversation limits.
+    """
+    try:
+        from src.settings import get_setting
+
+        raw = get_setting("local_context_limit_default", DEFAULT_LOCAL_CONTEXT_LIMIT)
+        if isinstance(raw, bool):
+            return DEFAULT_LOCAL_CONTEXT_LIMIT
+        value = int(raw)
+    except Exception:
+        return DEFAULT_LOCAL_CONTEXT_LIMIT
+    return max(MIN_CONTEXT_LIMIT, min(value, MAX_CONTEXT_LIMIT))
+
+
 def context_limit(url, model):
     from src.ollama_capabilities import ollama_api_root
 
     value = _turn.get()
+    default = default_context_limit()
     root = ollama_api_root(url)
     if root and value and root == ollama_api_root(value[1]):
-        return value[0].context_limits.get(model, DEFAULT_LOCAL_CONTEXT_LIMIT)
-    return DEFAULT_LOCAL_CONTEXT_LIMIT
+        return value[0].context_limits.get(model, default)
+    return default
 
 
 def parse_preferences(data):
     preferences = AssistantPreferences.model_validate(data)
     for model, limit in preferences.context_limits.items():
-        if not model.strip() or len(model) > 256 or isinstance(limit, bool) or not 1024 <= limit <= 262144:
+        if not model.strip() or len(model) > 256 or isinstance(limit, bool) or not MIN_CONTEXT_LIMIT <= limit <= MAX_CONTEXT_LIMIT:
             raise ValueError("Context limits must be between 1024 and 262144 tokens for a named model")
     return preferences
 

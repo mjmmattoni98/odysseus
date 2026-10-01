@@ -24,6 +24,7 @@ import {
 } from './settings/lifecycle.js';
 import { sortModelIds } from './modelSort.js';
 import { providerLogo } from './providers.js';
+import { localModelSwapWarnings, parseContextDefault } from './settings/localModels.js';
 import { isAltGrEvent } from './platform.js';
 import { bindMenuDismiss } from './escMenuStack.js';
 import { invalidateSettings } from './appConfig.js';
@@ -668,6 +669,65 @@ async function initThinkingEffortSettings() {
       if (msg) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
     }
   });
+}
+
+/* ── Local model context & residency ── */
+async function initLocalModelResidency() {
+  const ctxInput = el('set-localContextDefault');
+  const modeToggle = el('set-singleModelMode');
+  const warning = el('set-singleModelWarning');
+  const msg = el('set-localContextMsg');
+  if (!ctxInput || !modeToggle) return;
+  function flash(text, ok) {
+    if (!msg) return;
+    msg.textContent = text;
+    msg.style.color = ok ? 'var(--fg)' : 'var(--red)';
+    if (ok) setTimeout(() => { msg.textContent = ''; }, 2000);
+  }
+  async function refreshWarning() {
+    if (!warning) return;
+    try {
+      const [settingsRes, endpoints] = await Promise.all([
+        fetch('/api/auth/settings', { credentials: 'same-origin' }),
+        _fetchModelEndpoints(),
+      ]);
+      const lines = localModelSwapWarnings(await settingsRes.json(), endpoints);
+      warning.textContent = lines.length
+        ? `Each call to a different model on this server will unload/reload models if the server keeps only one loaded: ${lines.join('; ')}.`
+        : '';
+      warning.classList.toggle('hidden', !lines.length);
+    } catch (e) { console.warn('Failed to check local model swaps', e); }
+  }
+  try {
+    const res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    const settings = await res.json();
+    if (settings.local_context_limit_default) ctxInput.value = settings.local_context_limit_default;
+    modeToggle.checked = settings.local_single_model_mode === true;
+  } catch (e) { console.warn('Failed to load local model settings', e); }
+  ctxInput.addEventListener('change', async () => {
+    const value = parseContextDefault(ctxInput.value);
+    if (value === null) { flash('Enter 1024–262144 tokens', false); return; }
+    try {
+      const res = await _postSettings({ local_context_limit_default: value });
+      if (!res.ok) throw new Error(await res.text().catch(() => `HTTP ${res.status}`));
+      flash('Saved', true);
+    } catch (e) { flash('Failed to save', false); }
+  });
+  modeToggle.addEventListener('change', async () => {
+    try {
+      const res = await _postSettings({ local_single_model_mode: modeToggle.checked });
+      if (!res.ok) throw new Error(await res.text().catch(() => `HTTP ${res.status}`));
+      flash('Saved', true);
+    } catch (e) { flash('Failed to save', false); }
+  });
+  // Role pickers save on change; re-check once their save has landed.
+  let pending = null;
+  document.querySelector('[data-settings-panel="ai"]')?.addEventListener('change', () => {
+    clearTimeout(pending);
+    pending = setTimeout(refreshWarning, 600);
+  });
+  _registerAiEndpointRefresh(() => { refreshWarning(); });
+  refreshWarning();
 }
 
 /* ── Vision ── */
@@ -2198,6 +2258,7 @@ function initAll() {
   initialized = true;
   initDefaultChat();
   initThinkingEffortSettings();
+  initLocalModelResidency();
   initTeacherModel();
   initUtilityModel();
   initImageSettings();

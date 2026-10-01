@@ -57,9 +57,12 @@ def test_cpu_spill_is_reported():
     assert out["status"] == sh.DEGRADED
 
 
-def test_context_mismatch_is_reported():
+def test_context_mismatch_is_reported(monkeypatch):
+    # /v1 cannot carry num_ctx: a server allocation below the configured
+    # default cap is the server's OLLAMA_CONTEXT_LENGTH to raise.
+    monkeypatch.setattr(sh, "_default_context_cap", lambda: 32768)
     ps = {"models": [{"name": "qwen3.8:27b", "size": 20_000, "size_vram": 20_000,
-                      "context_length": 32768}]}
+                      "context_length": 16384}]}
     show = {"capabilities": ["completion", "tools"],
             "model_info": {"qwen35.context_length": 262144}}
     out = _run([_endpoint()], ps, show=show)

@@ -1008,10 +1008,12 @@ async def runtime_info() -> Dict[str, object]:
             in_docker = any(marker in cg for marker in ("docker", "containerd", "kubepods"))
         except Exception:
             in_docker = False
+    # Native Ollama API (no /v1) is the default for new registrations: it
+    # carries num_ctx, keep_alive and think. An explicit env value is kept.
     ollama_url = (
         os.getenv("OLLAMA_BASE_URL")
         or os.getenv("OLLAMA_URL")
-        or ("http://host.docker.internal:11434/v1" if in_docker else "http://127.0.0.1:11434/v1")
+        or ("http://host.docker.internal:11434" if in_docker else "http://127.0.0.1:11434")
     )
     return {
         "in_docker": in_docker,
