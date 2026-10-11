@@ -281,6 +281,6 @@ def test_start_route_passes_auto_rounds_through(monkeypatch):
     start = _endpoint(router, "/api/research/start", "POST")
     body = SimpleNamespace(query="q", max_rounds=0, search_provider=None, endpoint_id=None,
                            model=None, max_time=300, extraction_timeout=None,
-                           extraction_concurrency=None, category=None)
-    asyncio.run(start(body=body, request=None))
+                           extraction_concurrency=None, category=None, origin_chat_id=None)
+    asyncio.run(start(body=body, request=SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))))
     assert started["max_rounds"] == 0  # Auto: the handler applies the preset cap

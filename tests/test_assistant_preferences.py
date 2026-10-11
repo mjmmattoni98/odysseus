@@ -95,9 +95,10 @@ def test_foreground_overtakes_queued_research_without_cancelling_active_research
     monkeypatch.setattr(llm_core, "is_local_endpoint", lambda url: True)
     monkeypatch.setattr(llm_core, "_local_model_gate_enabled", lambda: True)
     monkeypatch.setattr(llm_core, "_LOCAL_MODEL_CURRENT", {})
-    monkeypatch.setattr(llm_core, "_LOCAL_MODEL_WAITING_FOREGROUND", 0)
+    monkeypatch.setattr(llm_core, "_LOCAL_MODEL_WAITING_FOREGROUND", {})
     async def run():
-        monkeypatch.setattr(llm_core, "_LOCAL_MODEL_LOCK", asyncio.Lock())
+        gate_key = llm_core._local_model_gate_key("http://localhost")
+        monkeypatch.setattr(llm_core, "_LOCAL_MODEL_LOCKS", {gate_key: asyncio.Lock()})
         entered = asyncio.Event()
         release = asyncio.Event()
         order = []
@@ -115,10 +116,10 @@ def test_foreground_overtakes_queued_research_without_cancelling_active_research
         await asyncio.sleep(0)
         foreground = asyncio.create_task(queued("foreground"))
         await asyncio.sleep(0)
-        assert llm_core._LOCAL_MODEL_WAITING_FOREGROUND == 1
+        assert llm_core._LOCAL_MODEL_WAITING_FOREGROUND[gate_key] == 1
         release.set()
         await asyncio.wait_for(asyncio.gather(first, research, foreground), 2)
         assert order == ["active finished", "foreground", "research"]
-        assert llm_core._LOCAL_MODEL_WAITING_FOREGROUND == 0
-        assert not llm_core._LOCAL_MODEL_LOCK.locked()
+        assert llm_core._LOCAL_MODEL_WAITING_FOREGROUND[gate_key] == 0
+        assert not llm_core._LOCAL_MODEL_LOCKS[gate_key].locked()
     asyncio.run(run())

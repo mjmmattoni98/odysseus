@@ -113,7 +113,7 @@ def test_empty_native_round_swaps_in_the_fenced_prompt(monkeypatch):
     ))
     first_system = "\n".join(m["content"] or "" for m in calls[0]["messages"] if m.get("role") == "system")
     retry_prompt = next(m["content"] for m in calls[1]["messages"] if m.get("_agent_injected") in {"prompt", "merged_prompt"})
-    assert "native tool/function calling" in first_system
-    assert "native tool/function calling" not in retry_prompt
+    assert "native tool schemas provided for this turn" in first_system
+    assert "native tool schemas provided for this turn" not in retry_prompt
     assert "```web_search" in retry_prompt
     assert not calls[1]["tools"]

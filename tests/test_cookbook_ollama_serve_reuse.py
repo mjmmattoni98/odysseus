@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 """Cookbook Ollama serves: reuse a running daemon, native endpoint registration,
 and the agent tool's port inference. No network: Ollama probes go through an
 httpx.MockTransport, tmux launches and endpoint probes are stubbed."""
@@ -132,7 +133,7 @@ def _serve_endpoint():
 
 
 def _request():
-    request = Request({"type": "http", "method": "POST", "path": "/api/model/serve", "headers": [], "state": {}})
+    request = Request({"type": "http", "method": "POST", "path": "/api/model/serve", "headers": [], "state": {}, "app": SimpleNamespace(state=SimpleNamespace(auth_manager=SimpleNamespace(is_admin=lambda user: user == "admin")))})
     request.state.current_user = "admin"
     return request
 

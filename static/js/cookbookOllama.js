@@ -5,7 +5,7 @@
 // are addressed by the backend's allowlisted ids, never by raw URL.
 // ============================================
 
-import uiModule from './ui.js';
+import uiModule from './ui.js?v=20260916largetoolscroll1';
 import {
   formatBytes, formatContext, aggregatePullProgress, parseSseEvents, vramInfo,
   formatExpiresIn, capabilityBadges, allocatedContext, modelKvBytes, validPresetName,

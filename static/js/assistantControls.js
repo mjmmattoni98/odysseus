@@ -1,4 +1,4 @@
-import ui from './ui.js';
+import ui from './ui.js?v=20260916largetoolscroll1';
 
 const defaults = () => ({ profile: 'everyday', web_mode: 'auto', thinking: 'off', instructions: '', context_limits: {} });
 let preferences = defaults();

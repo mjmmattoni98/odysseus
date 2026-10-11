@@ -186,6 +186,11 @@ KNOWN_CONTEXT_WINDOWS = {
     'deepseek-r1': 64000,
     'deepseek-v3': 64000,
     'deepseek-v2': 64000,
+    'deepseek-v4': 64000,
+    # Provider aliases used by configured Odysseus endpoints may omit the
+    # generation name. Keep them out of the unknown/small-model fallback,
+    # which otherwise trims multi-turn tool history to ~1K tokens.
+    'deepseek-flash': 64000,
 
     # --- Google ---
     'gemini-2.5-pro': 1048576,
@@ -603,6 +608,21 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
             except Exception:
                 pass
 
+            # llama-server only exposes /slots when started with --slots. Its
+            # /props endpoint still reports the active serving context, and is the
+            # authoritative value for single-slot servers.
+            try:
+                r = httpx.get(f"{slots_base}/props", timeout=REQUEST_TIMEOUT)
+                if r.is_success:
+                    props = r.json()
+                    generation = props.get("default_generation_settings") if isinstance(props, dict) else None
+                    n_ctx = generation.get("n_ctx") if isinstance(generation, dict) else None
+                    if n_ctx and isinstance(n_ctx, (int, float)) and n_ctx > 0:
+                        logger.info(f"llama.cpp /props reports n_ctx={int(n_ctx)} for {model}")
+                        return int(n_ctx), True
+            except Exception:
+                pass
+
         # Ollama reports the window it actually allocated for a loaded model.
         # Prefer it over the model's advertised maximum so budgeting matches
         # what /v1 requests will really get (Ollama /v1 cannot carry num_ctx).
@@ -669,11 +689,29 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
     return DEFAULT_CONTEXT, False
 
 
+def estimate_text_tokens(value: object) -> int:
+    """Estimate tokens for one text value without undercounting Unicode."""
+
+    text = value if isinstance(value, str) else str(value or "")
+    dense = 0
+    for char in text:
+        if ord(char) > 127:
+            dense += 1
+    return dense + int((len(text) - dense) * 0.3)
+
+
+# Private alias retained for callers/tests that imported the helper while it was
+# internal. New code should use the public name so every context-shaping path
+# shares the same Unicode-aware estimate.
+_estimate_text_tokens = estimate_text_tokens
+
+
 def estimate_tokens(messages: List[Dict]) -> int:
     """Rough token estimate for a list of messages.
 
-    Uses chars * 0.3 which is closer to real BPE tokenizer output
-    than the commonly-cited chars/4 (which underestimates by ~20-30%).
+    Uses chars * 0.3 for Latin-heavy text and approximately one token per CJK
+    character. A single global character ratio severely undercounts CJK input
+    and can prevent context compaction from running before provider rejection.
     Also adds ~4 tokens per message for role/formatting overhead, and counts
     assistant tool_calls (name + arguments) — a tool-only turn carries
     content=None with the real payload in tool_calls, so ignoring them made the
@@ -685,11 +723,11 @@ def estimate_tokens(messages: List[Dict]) -> int:
         total += 4  # per-message overhead (role, separators)
         content = msg.get("content", "")
         if isinstance(content, str):
-            total += int(len(content) * 0.3)
+            total += estimate_text_tokens(content)
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
-                    total += int(len(item.get("text", "")) * 0.3)
+                    total += estimate_text_tokens(item.get("text", ""))
         # Tool calls carry real payload too: a tool-only assistant turn is stored
         # with content=None and the actual args (e.g. a create_document body) in
         # tool_calls[].function.arguments. Ignoring them made large tool arguments
@@ -705,5 +743,5 @@ def estimate_tokens(messages: List[Dict]) -> int:
                 if not isinstance(args, str):
                     args = str(args)  # some shapes store arguments as a dict
                 total += 4  # per tool-call overhead (id, type, wrapper)
-                total += int((len(str(name)) + len(args)) * 0.3)
+                total += estimate_text_tokens(str(name) + args)
     return total

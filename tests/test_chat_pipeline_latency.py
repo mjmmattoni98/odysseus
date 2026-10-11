@@ -42,7 +42,7 @@ def _patch_context_deps(monkeypatch, *, context_length=8192):
             attachment_meta=[],
         )
 
-    async def fake_maybe_compact(sess, endpoint_url, model, messages, headers, owner=None):
+    async def fake_maybe_compact(sess, endpoint_url, model, messages, headers, owner=None, **kwargs):
         return messages, context_length, False
 
     monkeypatch.setattr(chat_helpers, "preprocess", fake_preprocess)
@@ -56,7 +56,7 @@ def _patch_context_deps(monkeypatch, *, context_length=8192):
     monkeypatch.setattr(
         chat_helpers,
         "add_user_message",
-        lambda sess, chat_handler, preprocessed, incognito=False: sess.messages.append(
+        lambda sess, chat_handler, preprocessed, incognito=False, **kwargs: sess.messages.append(
             {"role": "user", "content": preprocessed.user_content}
         ),
     )
@@ -337,11 +337,13 @@ def _seed_skill(tmp_path, monkeypatch):
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: deploy-app\ndescription: Ship the app\ncategory: ops\n"
-        "status: published\nplatform: all\n---\n\n# deploy-app\n",
+        "status: published\nconfidence: 1.0\nplatform: all\n---\n\n# deploy-app\n",
         encoding="utf-8",
     )
     import src.constants as constants
     monkeypatch.setattr(constants, "DATA_DIR", str(tmp_path), raising=False)
+    from services.memory.skills import SkillsManager
+    SkillsManager(str(tmp_path)).set_audit("deploy-app", "pass")
 
 
 @pytest.mark.parametrize(

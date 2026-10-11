@@ -105,11 +105,10 @@ def test_stop_prompt_distinguishes_auto_and_explicit_rounds():
 
 
 def _fake_page(monkeypatch, content):
-    search_mod = types.ModuleType("src.search")
-    search_mod.fetch_webpage_content = lambda url, timeout: {
+    from src.search import content as search_content
+    monkeypatch.setattr(search_content, "fetch_webpage_content", lambda url, timeout: {
         "success": True, "content": content, "title": "Page", "og_image": "",
-    }
-    monkeypatch.setitem(sys.modules, "src.search", search_mod)
+    })
 
     async def immediate_to_thread(fn, *args, **kwargs):
         return fn(*args, **kwargs)

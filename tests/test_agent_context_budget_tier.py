@@ -12,6 +12,7 @@ Behavior under test:
 """
 import asyncio
 import json
+import inspect
 
 import jsonschema
 import pytest
@@ -83,7 +84,9 @@ def local_route(monkeypatch):
     monkeypatch.setattr(tool_index, "get_tool_index", lambda: state["index"])
 
     async def fake_stream(candidates, messages, **kwargs):
-        request = await kwargs["candidate_request_factory"](0, *candidates[0])
+        request = kwargs["candidate_request_factory"](0, *candidates[0])
+        if inspect.isawaitable(request):
+            request = await request
         state["requests"].append(request)
         yield 'data: {"delta": "ok"}\n\n'
         yield "data: [DONE]\n\n"
@@ -203,9 +206,10 @@ def test_local_cap_keeps_pinned_and_forced_tools_and_rebuilds_tool_list(local_ro
     many = {s["function"]["name"] for s in FUNCTION_TOOL_SCHEMAS}
     tools, messages = _run_turn(
         local_route,
-        [{"role": "user", "content": "do everything"}],
+        [{"role": "user", "content": "organize my notes and emails and search the web"}],
         relevant_tools=many,
         forced_tools={"web_search", "web_fetch"},
+        approved_plan="1. Organize notes. 2. Search the web.",
     )
     names = _names(tools)
     assert {"web_search", "web_fetch", "ask_user", "manage_memory", "update_plan"} <= set(names)
@@ -215,10 +219,9 @@ def test_local_cap_keeps_pinned_and_forced_tools_and_rebuilds_tool_list(local_ro
     )
     assert estimate_tool_tokens(tools) <= max(tool_schema_token_budget(20000), pinned_cost)
     system = _system_text(messages)
-    listed = [
-        line[3:-1] for line in system.split("## Available tools\n", 1)[1].split("\n\n", 1)[0].splitlines()
-    ]
-    assert listed == names
+    # Upstream native prompts defer tool availability to the actual schemas.
+    assert "native tool schemas provided for this turn" in system
+    assert "## Available tools" not in system
 
 
 def test_cloud_routes_are_not_capped(local_route, monkeypatch):
@@ -226,7 +229,7 @@ def test_cloud_routes_are_not_capped(local_route, monkeypatch):
     many = {s["function"]["name"] for s in FUNCTION_TOOL_SCHEMAS}
     _collect(al.stream_agent_loop(
         "https://api.openai.com/v1", "gpt-test",
-        [{"role": "user", "content": "do everything"}],
+        [{"role": "user", "content": "organize my notes and emails and search the web"}],
         relevant_tools=many, max_rounds=1, _is_teacher_run=True,
     ))
     tools = local_route["requests"][-1]["kwargs"].get("tools")
@@ -242,12 +245,12 @@ def test_sticky_tool_set_is_byte_identical_across_turns(local_route):
     first, _ = _run_turn(local_route, history)
     history += [
         {"role": "assistant", "content": "You have two unread emails."},
-        {"role": "user", "content": "thanks"},
+        {"role": "user", "content": "check my inbox for unread emails"},
     ]
     second, _ = _run_turn(local_route, history)
     history += [
         {"role": "assistant", "content": "Anything else?"},
-        {"role": "user", "content": "ok, and the second one?"},
+        {"role": "user", "content": "check my inbox for unread emails"},
     ]
     third, _ = _run_turn(local_route, history)
     assert first and "list_emails" in _names(first)
@@ -256,15 +259,16 @@ def test_sticky_tool_set_is_byte_identical_across_turns(local_route):
 
 
 def test_sticky_tool_set_appends_newly_needed_tools(local_route):
-    history = [{"role": "user", "content": "remind me to call mom tomorrow"}]
+    history = [{"role": "user", "content": "check my inbox for unread emails"}]
     first, _ = _run_turn(local_route, history)
     history += [
         {"role": "assistant", "content": "Done."},
-        {"role": "user", "content": "also search the web for the weather in Madrid"},
+        {"role": "user", "content": "organize my notes and emails and search the web"},
     ]
     second, _ = _run_turn(local_route, history)
     first_names, second_names = _names(first), _names(second)
-    assert "web_search" not in first_names and "web_search" in second_names
+    assert "manage_notes" not in first_names and "manage_notes" in second_names
+    assert len(local_route["requests"]) == 2
     # Earlier tools keep their positions; the new ones are appended.
     kept = [name for name in second_names if name in first_names]
     assert second_names[: len(kept)] == kept
