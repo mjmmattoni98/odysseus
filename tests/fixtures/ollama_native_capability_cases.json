@@ -1,0 +1,55 @@
+{
+  "_comment": "Native Ollama capability reports (/api/show 'capabilities' of an installed model) and the Cookbook task facet they must produce. Shared by tests/test_hwfit_recommendation_facets.py (services/hwfit/facets.py, checked against src/ollama_capabilities.chat_capability) and tests/cookbook_facets.test.mjs (static/js/cookbookFacets.js) so the Cookbook labels a model the way chat eligibility treats it: 'completion' => chat; a report without it => not chat; no report => unknown.",
+  "installed": [
+    {
+      "name": "classifier reporting decision + vision (clef-flash:latest on the audit machine)",
+      "capabilities": ["decision", "vision"],
+      "expect": {"task": "classification", "task_label": "Vision classifier", "chat_capable": false}
+    },
+    {
+      "name": "classifier without vision",
+      "capabilities": ["decision"],
+      "expect": {"task": "classification", "task_label": "Classifier", "chat_capable": false}
+    },
+    {
+      "name": "embedding model",
+      "capabilities": ["embedding"],
+      "expect": {"task": "embedding", "task_label": "Embedding", "chat_capable": false}
+    },
+    {
+      "name": "vision chat model",
+      "capabilities": ["completion", "vision", "audio", "tools", "thinking"],
+      "expect": {"task": "vision", "task_label": "Vision chat", "chat_capable": true}
+    },
+    {
+      "name": "text chat model",
+      "capabilities": ["completion", "tools"],
+      "expect": {"task": "chat", "task_label": "Chat", "chat_capable": true}
+    },
+    {
+      "name": "report tokens are case-insensitive",
+      "capabilities": ["Completion", "VISION"],
+      "expect": {"task": "vision", "task_label": "Vision chat", "chat_capable": true}
+    },
+    {
+      "name": "tools and thinking without completion cannot chat",
+      "capabilities": ["tools", "thinking"],
+      "expect": {"task": "other", "task_label": "No chat: thinking, tools", "chat_capable": false}
+    },
+    {
+      "name": "vision without completion cannot chat",
+      "capabilities": ["vision"],
+      "expect": {"task": "other", "task_label": "No chat: vision", "chat_capable": false}
+    },
+    {
+      "name": "empty report is unknown",
+      "capabilities": [],
+      "expect": {"task": "unknown", "task_label": "Unknown", "chat_capable": null}
+    },
+    {
+      "name": "missing report is unknown",
+      "capabilities": null,
+      "expect": {"task": "unknown", "task_label": "Unknown", "chat_capable": null}
+    }
+  ]
+}

@@ -10,6 +10,8 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 import { topPortalZ } from './toolWindowZOrder.js';
 import sessionModule from './sessions.js';
 import fileHandlerModule from './fileHandler.js?v=20260909mobileattachmentedit1';
+import { parseUtcTimestamp } from './util/utcTimestamp.js';
+import { applyImageEdit, photoDisplayDate, photoEditedDate } from './galleryImageRecord.js';
 
 const API_BASE = window.location.origin;
 const ACTIVE_EDITOR_SESSION_KEY = 'odysseus-gallery-active-editor-v1';
@@ -1078,7 +1080,8 @@ function _draftsPaint() {
     return name.includes(q);
   });
   grid.innerHTML = filtered.map(d => {
-    const updated = d.updated_at ? _humanRelativeDate(new Date(d.updated_at)) : '';
+    const updatedAt = parseUtcTimestamp(d.updated_at);
+    const updated = updatedAt ? _humanRelativeDate(updatedAt) : '';
     const dims = (d.width && d.height) ? `${d.width}×${d.height}` : '';
     const thumb = d.thumbnail
       ? `<img class="gallery-editor-draft-thumb" src="${_esc(d.thumbnail)}" alt="" />`
@@ -1392,9 +1395,8 @@ function _renderGrid() {
 
   let html = uploadTile;
   _items.forEach(img => {
-    const date = img.taken_at
-      ? new Date(img.taken_at).toLocaleDateString()
-      : (img.created_at ? new Date(img.created_at).toLocaleDateString() : '');
+    const dateObj = photoDisplayDate(img);
+    const date = dateObj ? dateObj.toLocaleDateString() : '';
     // Card label: prefer the prompt (which doubles as the user-editable
     // name for uploaded photos). Fall back to a cleaned filename so
     // imported photos with empty prompts still show something useful
@@ -1520,8 +1522,7 @@ function _openDetail(img) {
   // Drop any face-overlay resize listener from the previous photo
   // before the new render attaches its own.
 
-  const _dateSrc = img.taken_at || img.created_at || null;
-  const _dateObj = _dateSrc ? new Date(_dateSrc) : null;
+  const _dateObj = photoDisplayDate(img);
   const _relAgo = (d) => {
     if (!d || isNaN(d.getTime())) return '';
     const secs = (Date.now() - d.getTime()) / 1000;
@@ -1535,28 +1536,30 @@ function _openDetail(img) {
     const y = Math.floor(secs / (86400 * 365));
     return `${y} year${y !== 1 ? 's' : ''} ago`;
   };
-  const date = _dateObj
-    ? `${_dateObj.toLocaleString()}<span class="gallery-date-rel"> (${_relAgo(_dateObj)})</span>`
-    : 'Unknown';
+  const _stampHtml = (d) => {
+    const rel = _relAgo(d);
+    return `${d.toLocaleString()}${rel ? `<span class="gallery-date-rel"> (${rel})</span>` : ''}`;
+  };
+  const date = _dateObj ? _stampHtml(_dateObj) : 'Unknown';
   const userTags = img.user_tags || img.tags || '';
   const aiTags = img.ai_tags || '';
-  const dims = img.width && img.height ? `${img.width} x ${img.height}` : (img.size || 'Unknown');
-  const fileSize = img.file_size ? _humanSize(img.file_size) : '';
+  // Size and Edited are recomputed after an in-place edit (rotate), so
+  // they read from `img` on each call.
+  const _sizeLabel = () => {
+    const dims = img.width && img.height ? `${img.width} x ${img.height}` : (img.size || 'Unknown');
+    const fileSize = img.file_size ? _humanSize(img.file_size) : '';
+    return `${dims}${fileSize ? ` · ${fileSize}` : ''}`;
+  };
+  const _editedHtml = () => {
+    const edited = photoEditedDate(img);
+    return edited
+      ? `<div class="gallery-detail-section" id="gallery-detail-edited"><label>Edited</label><div>${_stampHtml(edited)}</div></div>`
+      : '';
+  };
   const fallbackName = (img.filename || '').replace(/^\d{4,}[_-]/, '').replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
   const displayTitle = (img.prompt || img.caption || fallbackName || 'Photo').trim();
   const sourceLabel = img.model === 'imported' ? 'Imported' : (img.model || 'Unknown');
   const sessionLabel = img.session_name || (img.session_id ? 'Source chat' : '');
-  // "Edited" row: only show when updated_at is meaningfully later than
-  // created_at (>10s). Every photo bumps updated_at on insert via the
-  // ORM timestamp mixin, so the gap filters out the trivial case.
-  let editedHtml = '';
-  if (img.updated_at && img.created_at) {
-    const u = new Date(img.updated_at);
-    const c = new Date(img.created_at);
-    if (!isNaN(u) && !isNaN(c) && (u.getTime() - c.getTime() > 10000)) {
-      editedHtml = `<div class="gallery-detail-section"><label>Edited</label><div>${u.toLocaleString()}<span class="gallery-date-rel"> (${_relAgo(u)})</span></div></div>`;
-    }
-  }
 
   detail.innerHTML = `
     <div class="gallery-detail-header">
@@ -1641,11 +1644,11 @@ function _openDetail(img) {
         ${img.prompt && img.model !== 'imported' ? `<div class="gallery-detail-section gallery-detail-prompt-section"><label>Prompt</label><div class="gallery-detail-prompt">${_esc(img.prompt)}</div><div class="gallery-detail-mini-actions"><button class="gallery-detail-mini-btn" id="gallery-detail-copy-prompt"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Copy</button><button class="gallery-detail-mini-btn" id="gallery-detail-reuse-prompt"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>Reuse in chat</button></div></div>` : ''}
         <div class="gallery-detail-meta-grid">
           <div class="gallery-detail-meta-card"><span>Date</span><strong>${date}</strong></div>
-          <div class="gallery-detail-meta-card"><span>Size</span><strong>${dims}${fileSize ? ` · ${fileSize}` : ''}</strong></div>
+          <div class="gallery-detail-meta-card"><span>Size</span><strong id="gallery-detail-size">${_esc(_sizeLabel())}</strong></div>
           <div class="gallery-detail-meta-card"><span>Source</span><strong>${_esc(sourceLabel)}</strong></div>
           ${sessionLabel ? `<div class="gallery-detail-meta-card"><span>Session</span><strong>${img.session_id ? `<button class="gallery-detail-inline-link" id="gallery-detail-source-link">${_esc(sessionLabel)}</button>` : _esc(sessionLabel)}</strong></div>` : ''}
         </div>
-        ${editedHtml}
+        ${_editedHtml()}
         ${img.camera ? `<div class="gallery-detail-section"><label>Camera</label><div>${_esc(img.camera)}</div></div>` : ''}
         ${img.gps ? `<div class="gallery-detail-section"><label>Location</label><div>${img.gps.lat}, ${img.gps.lng}</div></div>` : ''}
         ${aiTags ? `<div class="gallery-detail-section"><label>AI Tags</label><div class="gallery-ai-tags">${aiTags.split(',').map(t => t.trim()).filter(Boolean).map(t => `<button class="gallery-ai-chip gallery-aitag-chip" data-tag-filter="${_esc(t)}" title="AI-generated tag — click to filter to photos tagged “${_esc(t)}”"><span class="gallery-aitag-mark" aria-hidden="true">✦</span>${_esc(t)}</button>`).join('')}</div></div>` : ''}
@@ -1988,6 +1991,24 @@ function _openDetail(img) {
   document.getElementById('gallery-edit-btn')?.addEventListener('click', _openInEditor);
   document.getElementById('gallery-edit-direct-btn')?.addEventListener('click', _openInEditor);
 
+  // Re-sync the inspector fields an in-place edit changes. A full
+  // _openDetail() re-render would reload the image element, so patch the
+  // Size card and Edited row instead. No-op once the user has moved to
+  // another photo: this render's nodes are then detached.
+  const _sizeEl = document.getElementById('gallery-detail-size');
+  const _refreshEditedMeta = () => {
+    if (!_sizeEl?.isConnected) return;
+    _sizeEl.textContent = _sizeLabel();
+    const editedHtml = _editedHtml();
+    const editedRow = detail.querySelector('#gallery-detail-edited');
+    if (editedRow) {
+      if (editedHtml) editedRow.outerHTML = editedHtml;
+      else editedRow.remove();
+    } else if (editedHtml) {
+      detail.querySelector('.gallery-detail-meta-grid')?.insertAdjacentHTML('afterend', editedHtml);
+    }
+  };
+
   // Rotate — server-side image rotation. Forces a fresh URL afterwards
   // so the browser doesn't show the old cached version. Shows a
   // whirlpool over the detail image while the request + reload are in
@@ -2012,6 +2033,9 @@ function _openDetail(img) {
       try { spinner?.destroy?.(); } catch {}
       overlay?.remove();
     };
+    // Captured before the request so a photo the user navigates to
+    // meanwhile never receives this photo's image.
+    const imgEl = document.getElementById('gallery-detail-img');
     try {
       const r = await fetch(`${API_BASE}/api/gallery/${img.id}/rotate`, {
         method: 'POST',
@@ -2020,18 +2044,30 @@ function _openDetail(img) {
         body: JSON.stringify({ angle }),
       });
       if (!r.ok) { cleanup(); uiModule.showError('Rotate failed'); return; }
-      // Cache-bust the image in the detail view, then wait for the new
-      // image to actually load before clearing the spinner so the user
-      // doesn't see a flash of the old/blank image.
-      const imgEl = document.getElementById('gallery-detail-img');
-      if (imgEl) {
-        const newSrc = img.url + (img.url.includes('?') ? '&' : '?') + 't=' + Date.now();
+      // The response carries the rotated record (dimensions, file size,
+      // updated_at, and a url versioned by the new content hash); fold it
+      // into the detail object and the library copy.
+      const previousUrl = img.url;
+      const data = await r.json().catch(() => null);
+      applyImageEdit(img, data);
+      const listed = _items.find(i => i.id === img.id);
+      if (listed && listed !== img) applyImageEdit(listed, data);
+      // No new version (unparseable response): cache-bust by hand so the
+      // browser can't serve the immutable-cached pre-rotation file.
+      if (img.url === previousUrl) {
+        const baseUrl = img.url.split(/[?&]t=/)[0];
+        img.url = baseUrl + (baseUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
+      }
+      // Wait for the new image to actually load before clearing the
+      // spinner so the user doesn't see a flash of the old/blank image.
+      if (imgEl?.isConnected) {
         await new Promise((resolve) => {
           imgEl.onload = imgEl.onerror = () => { imgEl.onload = null; imgEl.onerror = null; resolve(); };
-          imgEl.src = newSrc;
+          imgEl.src = img.url;
         });
       }
       cleanup();
+      _refreshEditedMeta();
       uiModule.showToast('Rotated');
       _fetchLibrary(false);
     } catch (e) {
@@ -2544,7 +2580,7 @@ export function openGallery() {
   if (visionLink) {
     visionLink.addEventListener('click', (e) => {
       e.preventDefault();
-      import('./settings.js?v=20261011forksync1').then(m => {
+      import('./settings.js?v=20261014audit1').then(m => {
         m.open('ai');
         // The gallery modal gets a bumped z-index from modalManager; settings
         // opens with its lower static z-index and lands BEHIND it. Raise it above.

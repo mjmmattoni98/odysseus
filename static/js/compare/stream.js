@@ -1,7 +1,9 @@
 // compare/stream.js — SSE streaming to panes
 import state from './state.js';
-import { addFinishBadge } from './vote.js?v=20260828resendcaldrag1';
-import { getModelCost, renderAskUserCard, safeDisplayImageSrc } from '../chatRenderer.js?v=20261011forksync1';
+import { addFinishBadge, syncVoteControls } from './vote.js?v=20260828resendcaldrag1';
+import { consumePaneStream, createPaneStreamReader, paneResponseState, PANE_PENDING } from './streamOutcome.js';
+import { createTerminalStreamError } from '../chatStreamErrors.js';
+import { getModelCost, renderAskUserCard, safeDisplayImageSrc } from '../chatRenderer.js?v=20261014audit1';
 import markdownModule from '../markdown.js';
 import spinnerModule from '../spinner.js';
 import uiModule from '../ui.js?v=20260916largetoolscroll1';
@@ -232,6 +234,40 @@ function _renderPaneAskUserCard(paneIdx, sessionId, payload, hist, aiMsgEl, orig
   return card;
 }
 
+const _ICON_RETRY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66"/><polyline points="20 4 20 11 13 11"/></svg>';
+const _ICON_SWAP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/></svg>';
+
+/** Show a pane's failure in place of (or below) its answer, with Retry and
+ *  Switch model actions. Uses the preround check's error row styling; the
+ *  buttons are handled by the compare grid's delegated click listener so
+ *  they keep working after a shuffle copies the pane's HTML. `actions:
+ *  false` shows the error alone (search summaries: a pane re-roll repeats
+ *  the search, not the summary). */
+function _renderPaneFailure(aiBody, message, keepContent, { actions = true } = {}) {
+  if (!keepContent) aiBody.innerHTML = '';
+  aiBody.querySelectorAll('.compare-pane-error').forEach(el => el.remove());
+  const notice = document.createElement('div');
+  notice.className = 'compare-probe-detail compare-pane-error';
+  notice.setAttribute('role', 'alert');
+  const icon = document.createElement('span');
+  icon.className = 'compare-probe-detail-icon';
+  icon.textContent = '!';
+  const text = document.createElement('span');
+  text.className = 'compare-probe-detail-message';
+  text.textContent = message || 'The model request failed.';
+  notice.append(icon, text);
+  const buttons = actions ? [['retry', 'Retry', _ICON_RETRY], ['switch', 'Switch model', _ICON_SWAP]] : [];
+  for (const [action, label, svg] of buttons) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'compare-probe-action-btn';
+    btn.dataset.paneFailureAction = action;
+    btn.innerHTML = svg + '<span>' + label + '</span>';
+    notice.appendChild(btn);
+  }
+  aiBody.appendChild(notice);
+}
+
 /** Format milliseconds as human-readable duration (e.g. "120ms", "1.23s", "4.5s"). */
 function _formatMs(ms) {
   if (ms < 1000) return Math.round(ms) + 'ms';
@@ -285,6 +321,8 @@ async function _runSynthForPane(modelToUse, synthPrompt, synthBody, spinner, his
     fd.append('skip_validation', 'true');
   }
 
+  let synthSessionId = '';
+  let synthText = '';
   try {
     const createRes = await fetch(`${state.API_BASE}/api/session`, { method: 'POST', body: fd });
     if (!createRes.ok) {
@@ -292,6 +330,7 @@ async function _runSynthForPane(modelToUse, synthPrompt, synthBody, spinner, his
       throw new Error(errData.detail || 'Failed to create session');
     }
     const createData = await createRes.json();
+    synthSessionId = createData.id || '';
 
     const synthAc = new AbortController();
     state._abortControllers.push(synthAc);
@@ -301,46 +340,48 @@ async function _runSynthForPane(modelToUse, synthPrompt, synthBody, spinner, his
       body: JSON.stringify({ session: createData.id, message: synthPrompt }),
       signal: synthAc.signal,
     });
+    if (!streamRes.ok) {
+      const errBody = await streamRes.json().catch(() => ({}));
+      throw createTerminalStreamError({
+        status: streamRes.status,
+        text: typeof errBody.detail === 'string' ? errBody.detail : `HTTP ${streamRes.status}`,
+      });
+    }
 
     if (spinner) spinner.stop();
     synthBody.innerHTML = '';
-    const reader = streamRes.body.getReader();
-    const decoder = new TextDecoder();
-    let synthText = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n');
-      for (const line of lines) {
-        if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-          try {
-            const d = JSON.parse(line.slice(6));
-            if (d.delta) {
-              synthText += d.delta;
-              if (markdownModule && synthText.trim()) {
-                synthBody.innerHTML = markdownModule.processWithThinking(
-                  markdownModule.squashOutsideCode(synthText)
-                );
-              } else {
-                synthBody.textContent = synthText;
-              }
-              hist.scrollTop = hist.scrollHeight;
-            }
-          } catch (e) {}
+    // Same reader as the chat panes: a named `event: error` or an empty
+    // summary fails instead of leaving a blank box.
+    const streamReader = await consumePaneStream(streamRes.body, (d) => {
+      if (!d.delta) return;
+      synthText += d.delta;
+      try {
+        if (markdownModule && synthText.trim()) {
+          synthBody.innerHTML = markdownModule.processWithThinking(
+            markdownModule.squashOutsideCode(synthText)
+          );
+        } else {
+          synthBody.textContent = synthText;
         }
-      }
-    }
+      } catch (e) { console.warn('Compare synthesis render error:', e); }
+      hist.scrollTop = hist.scrollHeight;
+    });
+    const synthFailure = streamReader.failure();
+    if (synthFailure) throw synthFailure;
 
     // Final highlight
     if (window.hljs) synthBody.querySelectorAll('pre code:not(.hljs)').forEach(b => window.hljs.highlightElement(b));
-
-    // Cleanup temp session
-    fetch(`${state.API_BASE}/api/session/${createData.id}`, { method: 'DELETE' }).catch(() => {});
   } catch (e) {
     if (spinner) spinner.stop();
-    synthBody.innerHTML = '<div style="color:var(--color-error);font-size:0.85em;">Synthesis failed: ' + escapeHtml(e.message) + '</div>';
+    if (e.name === 'AbortError') {
+      if (!synthText.trim()) synthBody.innerHTML = '<div style="color:#f0ad4e;font-size:0.9em;">Cancelled.</div>';
+    } else {
+      // Keep any partial summary visible above the error.
+      _renderPaneFailure(synthBody, 'Synthesis failed: ' + e.message, Boolean(synthText.trim()), { actions: false });
+    }
+  } finally {
+    // Cleanup temp session
+    if (synthSessionId) fetch(`${state.API_BASE}/api/session/${synthSessionId}`, { method: 'DELETE' }).catch(() => {});
   }
 }
 
@@ -353,6 +394,9 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
 
   const ac = new AbortController();
   state._abortControllers[paneIdx] = ac;
+  // Vote eligibility reads this per-message state (see vote.js).
+  aiMsgEl.dataset.responseState = PANE_PENDING;
+  syncVoteControls();
 
   // Show stop button for this pane
   const _paneEl = document.querySelector(`.compare-pane[data-pane="${paneIdx}"]`);
@@ -368,7 +412,9 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
   let metrics = null;
   let timedOut = false;
   let streamOk = false;
+  let aborted = false;
   let awaitingChoice = false;
+  const streamReader = createPaneStreamReader();
   let currentToolBlock = null;  // track active agent tool block
   // Idle timeout — abort only if no data is received for this many seconds.
   // Long generations (SVG, big code) are fine as long as the stream stays
@@ -470,12 +516,19 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
       headers: _compareTimezoneHeaders(),
       signal: ac.signal
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => ({}));
+      throw createTerminalStreamError({
+        status: response.status,
+        text: typeof errBody.detail === 'string' ? errBody.detail : `HTTP ${response.status}`,
+      });
+    }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
 
+    streamRead:
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -486,11 +539,14 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
       buffer = lines.pop() || '';
 
       for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6);
-        if (data === '[DONE]') break;
+        const json = streamReader.read(line);
+        if (streamReader.ended) {
+          // Provider error (`event: error`): stop reading and fail the pane.
+          reader.cancel().catch(() => {});
+          break streamRead;
+        }
+        if (!json) continue;
         try {
-          const json = JSON.parse(data);
           if (json.type === 'metrics') {
             metrics = json.data;
 
@@ -704,6 +760,10 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
       }
     }
 
+    // A named provider error, or a clean close that produced nothing, is a
+    // failed response, not a finished one.
+    const streamFailure = streamReader.failure({ awaitingChoice });
+    if (streamFailure) throw streamFailure;
     streamOk = true;
     // Destroy any remaining spinner
     if (aiMsgEl._spinner && aiMsgEl._spinner.element) aiMsgEl._spinner.destroy();
@@ -873,6 +933,7 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
     if (hist) hist.scrollTop = hist.scrollHeight;
 
   } catch (error) {
+    aborted = error.name === 'AbortError';
     if (error.name === 'AbortError') {
       if (timedOut) {
         if (accumulated.trim()) {
@@ -900,7 +961,18 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
       }
     } else {
       console.error('Compare stream error:', error);
-      aiBody.innerHTML = '<span style="color:var(--color-error);">Error: ' + escapeHtml(error.message) + '</span>';
+      for (const key of ['_spinner', '_imgSpinner']) {
+        if (aiMsgEl[key]) {
+          if (aiMsgEl[key].element) aiMsgEl[key].destroy();
+          aiMsgEl[key] = null;
+        }
+      }
+      if (currentToolBlock && currentToolBlock._waveInterval) {
+        clearInterval(currentToolBlock._waveInterval);
+        currentToolBlock._waveInterval = null;
+      }
+      // Keep any partial answer visible above the error.
+      _renderPaneFailure(aiBody, error.message, streamReader.sawOutput);
     }
   } finally {
     clearTimeout(timeoutId);
@@ -930,6 +1002,15 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
     }
     state._paneMetrics[paneIdx] = metrics;
     state._paneElapsed[paneIdx] = _totalMs;
+    aiMsgEl.dataset.responseState = paneResponseState({
+      streamOk, awaitingChoice, aborted, sawOutput: streamReader.sawOutput,
+    });
+    if (!streamOk && !awaitingChoice) {
+      // Timed out or errored — show failed badge (retries and continuations
+      // included, which skip only the Fastest badge).
+      const badge = document.getElementById('cmp-badge-' + paneIdx);
+      if (badge) { badge.textContent = timedOut ? 'Timeout' : 'Failed'; badge.style.color = 'var(--color-error)'; }
+    }
     if (!opts.skipBadge && !awaitingChoice) {
       if (streamOk) {
         state._finishOrder++;
@@ -953,10 +1034,6 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
             if (winnerIdx >= 0) addFinishBadge(winnerIdx);
           }
         }
-      } else {
-        // Timed out or errored — show failed badge
-        const badge = document.getElementById('cmp-badge-' + paneIdx);
-        if (badge) { badge.textContent = timedOut ? 'Timeout' : 'Failed'; badge.style.color = 'var(--color-error)'; }
       }
     }
     // Auto-grade against expected answer — stamps ✓ or ✗ on the pane header.
@@ -968,6 +1045,7 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
     if (paneEl && !awaitingChoice && accumulated.trim()) {
       paneEl.querySelectorAll('.pane-needs-response').forEach(b => b.style.display = '');
     }
+    syncVoteControls();
   }
 }
 

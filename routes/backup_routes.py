@@ -1,20 +1,150 @@
-"""Backup routes — export/import user data (memories, presets, settings, skills, preferences)."""
+"""Backup routes.
+
+Two features share this router and must not be confused:
+
+* ``/api/export`` and ``/api/import`` download and merge a JSON export of
+  selected user data (memories, presets, settings, skills, preferences);
+* ``/api/backups/...`` manage full server-side backups (src.backup_service):
+  database plus file-backed workspace state, a schedule, verification, and a
+  guided restore applied at the next startup.
+"""
 
 import json
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Request, Response
-from core.middleware import require_admin
+from fastapi import APIRouter, Body, HTTPException, Request, Response
+from fastapi.responses import FileResponse
+from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_USER, require_admin
 from services.memory import MemoryStoreUnreadable
+from src import backup_service
 from src.auth_helpers import get_current_user
 from src.settings import load_settings, save_settings, load_features, save_features
 
 logger = logging.getLogger(__name__)
 
 
+def _require_backup_admin(request: Request) -> None:
+    """Admin only, and never the agent's loopback identity.
+
+    Backups hold every user's data plus the app key, and a restore replaces
+    all of it, so the internal-tool bypass that require_admin grants agent
+    tools does not extend to this surface.
+    """
+    require_admin(request)
+    if request.headers.get(INTERNAL_TOOL_HEADER) or getattr(request.state, "current_user", None) == INTERNAL_TOOL_USER:
+        raise HTTPException(403, "Backups are managed from Settings only")
+
+
+def _backup_errors(exc: Exception) -> HTTPException:
+    if isinstance(exc, backup_service.BackupBusy):
+        return HTTPException(409, str(exc))
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(404, "Backup not found")
+    return HTTPException(400, str(exc))
+
+
 def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRouter:
     router = APIRouter(tags=["backup"])
+
+    # ── Server-side backups ──
+    # Plain `def` handlers: they touch the filesystem, so FastAPI runs them in
+    # its thread pool. Creating, verifying and staging can outlast the request
+    # timeout, so those start a background operation the UI polls.
+
+    @router.get("/api/backups")
+    def backups_overview(request: Request):
+        _require_backup_admin(request)
+        return backup_service.overview()
+
+    @router.put("/api/backups/schedule")
+    def backups_schedule(request: Request, body: dict = Body(...)):
+        _require_backup_admin(request)
+        try:
+            return {"schedule": backup_service.save_schedule(body), **backup_service.overview()["scheduler"]}
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @router.get("/api/backups/operation")
+    def backups_operation(request: Request):
+        _require_backup_admin(request)
+        return backup_service.operation_status()
+
+    @router.post("/api/backups")
+    def backups_create(request: Request):
+        _require_backup_admin(request)
+        actor = get_current_user(request)
+        try:
+            op = backup_service.start_operation(
+                "manual", "Backup",
+                lambda progress: backup_service.run_backup("manual", actor=actor, progress=progress),
+            )
+        except Exception as exc:
+            raise _backup_errors(exc)
+        return {"operation": op}
+
+    @router.post("/api/backups/{name}/verify")
+    def backups_verify(name: str, request: Request):
+        _require_backup_admin(request)
+        try:
+            backup_service.archive_path(name)
+            op = backup_service.start_operation(
+                "verify", "Verify " + name,
+                lambda progress: backup_service.verify_backup(name, progress=progress),
+            )
+        except Exception as exc:
+            raise _backup_errors(exc)
+        return {"operation": op}
+
+    @router.get("/api/backups/{name}/download")
+    def backups_download(name: str, request: Request):
+        _require_backup_admin(request)
+        try:
+            path = backup_service.archive_path(name)
+        except Exception as exc:
+            raise _backup_errors(exc)
+        return FileResponse(path, media_type="application/gzip", filename=name,
+                            headers={"Cache-Control": "no-store"})
+
+    @router.delete("/api/backups/{name}")
+    def backups_delete(name: str, request: Request):
+        _require_backup_admin(request)
+        try:
+            backup_service.delete_backup(name)
+        except Exception as exc:
+            raise _backup_errors(exc)
+        return {"ok": True}
+
+    @router.get("/api/backups/{name}/restore-preview")
+    def backups_restore_preview(name: str, request: Request):
+        _require_backup_admin(request)
+        try:
+            return backup_service.restore_preview(name)
+        except Exception as exc:
+            raise _backup_errors(exc)
+
+    @router.post("/api/backups/{name}/restore")
+    def backups_restore(name: str, request: Request, body: dict = Body(default={})):
+        _require_backup_admin(request)
+        confirm = str((body or {}).get("confirm") or "")
+        actor = get_current_user(request)
+        try:
+            # Cheap checks up front so a mistyped name is a 400, not a failed job.
+            backup_service.check_restore_allowed(name, confirm)
+            op = backup_service.start_operation(
+                "restore", "Restore " + name,
+                lambda progress: backup_service.stage_restore(name, confirm, actor=actor, progress=progress),
+            )
+        except Exception as exc:
+            raise _backup_errors(exc)
+        return {"operation": op}
+
+    @router.delete("/api/backups/restore/pending")
+    def backups_cancel_restore(request: Request):
+        _require_backup_admin(request)
+        return {"ok": True, "cancelled": backup_service.cancel_pending_restore()}
+
+    # ── JSON export / import ──
 
     @router.get("/api/export")
     async def export_data(request: Request):

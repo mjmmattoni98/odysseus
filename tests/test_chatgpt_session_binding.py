@@ -160,3 +160,28 @@ def test_migration_is_additive_idempotent_and_repairs_missing_index(tmp_path, mo
     cdb._migrate_add_session_endpoint_id_column()
     assert [idx["name"] for idx in inspect(engine).get_indexes("sessions")] == ["ix_sessions_endpoint_id"]
     engine.dispose()
+
+
+def test_empty_model_recovery_skips_a_model_the_endpoint_reports_cannot_chat(state, monkeypatch):
+    # clef-flash reports Ollama capabilities ["decision", "vision"] (no
+    # "completion"); recovering an empty session model must not bind to it.
+    import src.ollama_capabilities as caps
+
+    factory, manager = state
+    ollama = "http://127.0.0.1:11434"
+    with factory() as db:
+        endpoint = db.get(cdb.ModelEndpoint, "b")
+        endpoint.base_url = ollama
+        endpoint.cached_models = '["clef-flash:latest", "gemma4:12b"]'
+        db.commit()
+    reports = {"clef-flash:latest": frozenset({"decision", "vision"}),
+               "gemma4:12b": frozenset({"completion", "vision"})}
+    monkeypatch.setattr(caps, "ollama_api_root", lambda url, probe=True: ollama + "/api")
+    monkeypatch.setattr(caps, "cached_capability_tokens", lambda url, model: reports.get(model))
+    sess = manager.create_session("s", "Chat", ollama + "/v1/chat/completions", "",
+                                  owner="alice", endpoint_id="b")
+
+    assert chat._recover_empty_session_model(sess, "s", "alice") is True
+    assert sess.model == "gemma4:12b"
+    with factory() as db:
+        assert db.get(cdb.Session, "s").model == "gemma4:12b"

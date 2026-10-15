@@ -9,7 +9,7 @@ import Storage from './storage.js';
 import assistantControls from './assistantControls.js';
 import uiModule from './ui.js?v=20260916largetoolscroll1';
 import sessionModule from './sessions.js';
-import chatRenderer, { renderToolIcon } from './chatRenderer.js?v=20261011forksync1';
+import chatRenderer, { renderToolIcon } from './chatRenderer.js?v=20261014audit1';
 import chatStream from './chatStream.js?v=20260914pdfstrip1';
 import { addAITTSButton } from './tts-ai.js';
 import markdownModule from './markdown.js';
@@ -39,6 +39,7 @@ import {
 import { createTerminalStreamError, isRecoverableStreamError } from './chatStreamErrors.js';
 import { loadPanel } from './panels.js?v=20260909movepicklayer1';
 import { invalidateSettings } from './appConfig.js';
+import { setActionLabel } from './a11yLabel.js';
 
   const RESEARCH_TIMEOUT_MS = 360000;
   const DEFAULT_TIMEOUT_MS = 120000;
@@ -1395,13 +1396,13 @@ import { invalidateSettings } from './appConfig.js';
         const hasQueuedText = !!(msgInput && msgInput.value && msgInput.value.trim());
         submitBtn.innerHTML = hasQueuedText && icons ? icons.send : _stopSvg;
         submitBtn.dataset.phase = hasQueuedText ? 'queue' : 'processing';
-        submitBtn.title = hasQueuedText ? 'Queue message' : 'Stop generation';
+        setActionLabel(submitBtn, hasQueuedText ? 'Queue message' : 'Stop generation');
         submitBtn.classList.remove('anim-launch');
         void submitBtn.offsetWidth;
         submitBtn.classList.add('anim-land');
         submitBtn.addEventListener('animationend', () => submitBtn.classList.remove('anim-land'), { once: true });
       }, 300);
-      submitBtn.title = 'Stop generation';
+      setActionLabel(submitBtn, 'Stop generation');
       submitBtn.dataset.mode = 'streaming';
       submitBtn.dataset.phase = 'processing';
       isStreaming = true;
@@ -1420,7 +1421,7 @@ import { invalidateSettings } from './appConfig.js';
       } else {
         var icons = window._odysseusBtnIcons;
         submitBtn.innerHTML = icons ? icons.send : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
-        submitBtn.title = 'Send message';
+        setActionLabel(submitBtn, 'Send message');
         submitBtn.classList.remove('mic-mode', 'newchat-mode');
       }
     }

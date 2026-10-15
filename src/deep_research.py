@@ -17,7 +17,12 @@ from typing import Callable, Dict, List, Optional, Set
 
 from src.research_utils import strip_thinking, is_low_quality
 from src.model_context import estimate_tokens
-from src.research_navigator import ResearchAction, ResearchNavigator, ResearchPage, assess_source, parse_research_actions
+from src.research_navigator import (
+    ResearchAction, ResearchNavigator, ResearchPage, assess_source, is_first_party_kind,
+    parse_research_actions,
+)
+from src.research_presets import count_report_words, trim_report_to_words
+from src.research_sources import SourceRules, canonical_url, content_hash, finding_allowed, usable_findings
 
 from src.goal_based_extractor import EXTRACTOR_SYSTEM
 from src.prompt_security import untrusted_context_message
@@ -235,6 +240,38 @@ Requirements:
 - Write in an engaging, informative style — not dry or robotic
 """
 
+# Used instead of FINAL_REPORT_PROMPT when the user asked for a specific or
+# short length: the word target is a ceiling, not a floor.
+FINAL_REPORT_LIMITED_PROMPT = """\
+Write a concise research answer to this question.
+
+**Question:** {question}
+
+**All collected evidence and analysis:**
+{report}
+
+**Evidence/source state:**
+{source_state}
+
+**Structured source coverage JSON:**
+{source_coverage_json}
+
+Requirements:
+- Length: about {target_words} words. Never exceed {max_words} words — the reader asked for this length.
+- Lead with the direct answer, then only the supporting points that matter most
+- Use at most a few short ## headings; skip headings entirely below 300 words
+- Include source URLs as inline citations [like this](url)
+- Prefer primary/official evidence; if evidence is weak or missing, say so in one sentence
+- No preamble, no executive summary section, no repetition
+"""
+
+_CONDENSE_INSTRUCTION = (
+    "This answer is {words} words, but the reader asked for about {target} words. "
+    "Rewrite it to at most {limit} words: keep the direct answer, the strongest "
+    "supporting points and their inline citations; drop everything else. "
+    "Write only the rewritten answer."
+)
+
 
 _META_SEARCH_QUERIES = {
     "search",
@@ -417,6 +454,17 @@ class DeepResearcher:
     context_window: Optional[int] = None  # known window; None = don't bound
     auto_rounds: bool = False
     preset_label: str = ""
+    # Per-run source rules and report length (see src/research_sources.py and
+    # research_presets.resolve_report_length). Class defaults keep callers
+    # that build the researcher without them on the unrestricted path.
+    source_rules: Optional[SourceRules] = None
+    report_length: str = ""
+    report_length_label: str = ""
+    report_word_limit: Optional[int] = None
+    rule_filtered_urls: int = 0
+    # A refresh re-downloads pages so its content fingerprints reflect the
+    # pages now, not the web-content cache.
+    fresh_fetch: bool = False
 
     def __init__(
         self,
@@ -450,6 +498,11 @@ class DeepResearcher:
         auto_rounds: bool = False,
         preset_label: str = "",
         session_id: str = "",
+        source_rules: Optional[SourceRules] = None,
+        report_length: str = "",
+        report_length_label: str = "",
+        report_word_limit: Optional[int] = None,
+        fresh_fetch: bool = False,
     ):
         self.llm_endpoint = llm_endpoint
         self.llm_model = llm_model
@@ -481,6 +534,12 @@ class DeepResearcher:
         self.context_window = int(context_window) if context_window else None
         self.auto_rounds = bool(auto_rounds)
         self.preset_label = preset_label or ""
+        self.source_rules = source_rules if source_rules is not None and source_rules.active else None
+        self.report_length = str(report_length or "")
+        self.report_length_label = str(report_length_label or "")
+        self.report_word_limit = int(report_word_limit) if report_word_limit else None
+        self.rule_filtered_urls = 0
+        self.fresh_fetch = bool(fresh_fetch)
         self._progress = progress_callback
         self._cancelled = False
         self._start_time: float = 0
@@ -501,6 +560,7 @@ class DeepResearcher:
             progress_callback=progress_callback,
             search_provider=search_provider,
             session_id=session_id,
+            fresh_fetch=self.fresh_fetch,
         )
 
     def cancel(self):
@@ -539,6 +599,7 @@ class DeepResearcher:
         prior_report: str = "",
         prior_findings: Optional[List[Dict]] = None,
         prior_urls: Optional[Set[str]] = None,
+        seed_urls: Optional[List[str]] = None,
     ) -> str:
         """Run iterative research and return a final report.
 
@@ -547,6 +608,8 @@ class DeepResearcher:
             prior_report: Previous report to continue from (for follow-up research).
             prior_findings: Previous findings to build on.
             prior_urls: URLs already visited (won't be re-fetched).
+            seed_urls: Pages to re-read in round 1 (a refresh re-reads the
+                previous version's sources so their changes can be compared).
         """
         self._start_time = time.time()
         self.fast_fact_mode = (
@@ -561,7 +624,16 @@ class DeepResearcher:
             self.extraction_concurrency = min(self.extraction_concurrency, 2)
             logger.info("Using fast factual research path for small model %s", self.llm_model)
         findings: List[Dict] = list(prior_findings) if prior_findings else []
+        rules = getattr(self, "source_rules", None)
+        if rules is not None:
+            # A continuation must not carry forward evidence this run's
+            # source rules exclude.
+            findings = [f for f in findings if not isinstance(f, dict) or finding_allowed(f, rules)]
         report = prior_report or ""
+        # Brief reports skip the per-round LLM synthesis: the final writer
+        # reads the compiled findings directly, which saves one long
+        # generation per round.
+        compile_findings = self.report_length == "brief" and not prior_report
 
         # PLAN: Analyze the question and create a research strategy
         if not prior_report:
@@ -612,10 +684,11 @@ class DeepResearcher:
             # legacy query-array path for weak/non-JSON model replies.
             actions = await self._plan_research_actions(question, report, round_num)
             if round_num == 1:
+                refresh_seeds = self._seed_url_actions(seed_urls)
                 actions = self._merge_seed_actions(
-                    self._explicit_url_actions(question),
+                    [*self._explicit_url_actions(question), *refresh_seeds],
                     actions,
-                    max_actions=4,
+                    max_actions=4 + len(refresh_seeds),
                 )
             queries = [a.args.get("query", "") for a in actions if a.tool == "web_search" and a.args.get("query")]
             if not actions:
@@ -650,7 +723,7 @@ class DeepResearcher:
                     err_detail = getattr(self, '_last_search_error', 'unknown error')
                     self._emit(phase="error", message=f"Search engine unavailable: {err_detail}")
                     if not findings:
-                        return (
+                        return self._limit_report_words(
                             f"**Search unavailable** — Web search failed after "
                             f"{round_num} rounds. Error: {err_detail}\n\n"
                             "Please check your search provider settings and ensure the service is running."
@@ -663,6 +736,12 @@ class DeepResearcher:
                     report = self._compact_fact_report(question, findings)
                     self.evolving_report = report
                     break
+                if compile_findings:
+                    report = self._format_findings(findings[-self.synthesis_window:])
+                    self.evolving_report = report
+                    if round_num >= self.min_rounds and not self._needs_more_evidence_before_stop(round_num):
+                        break
+                    continue
                 self._emit(phase="analyzing", round=round_num,
                            total_sources=len(self.urls_fetched),
                            total_findings=len(findings),
@@ -699,7 +778,7 @@ class DeepResearcher:
                     "Synthesis produced no report; returning %d gathered "
                     "finding(s) as a fallback", len(findings)
                 )
-                return self._fallback_report(question, findings)
+                return self._limit_report_words(self._fallback_report(question, findings))
             return "No information could be gathered for this question."
 
         self.evolving_report = report  # preserve pre-synthesis report
@@ -709,8 +788,8 @@ class DeepResearcher:
             # small local models and can make a successful lookup appear to
             # hang or fail.
             logger.info("Research complete via fast factual report")
-            return report
-        final = await self._final_report(question, report)
+            return self._limit_report_words(report)
+        final = self._limit_report_words(await self._final_report(question, report))
         elapsed = time.time() - self._start_time
         logger.info(
             f"Research complete: {self.round_count} rounds, "
@@ -938,6 +1017,7 @@ class DeepResearcher:
                 num_queries=num_queries,
                 round_instruction=round_instruction,
             )
+        prompt += self._rules_prompt_suffix()
 
         try:
             response = await self._llm(
@@ -1018,7 +1098,7 @@ class DeepResearcher:
             visited_urls=visited,
             round_num=round_num,
             max_actions=max_actions,
-        )
+        ) + self._rules_prompt_suffix()
         try:
             response = await self._llm(
                 [{"role": "user", "content": prompt}],
@@ -1096,6 +1176,10 @@ class DeepResearcher:
                 if url in urls_fetched:
                     _reject(tool, args, "already visited URL")
                     continue
+                violation = self._rule_violation(url)
+                if violation:
+                    _reject(tool, args, f"source rule: {violation}")
+                    continue
                 key = (tool, url)
                 normalized_args = {"url": url}
                 requested_by = str(args.get("requested_by") or "").strip()
@@ -1147,19 +1231,50 @@ class DeepResearcher:
                 break
         return actions
 
+    def _seed_url_actions(self, urls: Optional[List[str]], *, max_urls: int = 6) -> List[ResearchAction]:
+        """Direct reads for pages a refresh should re-read and compare."""
+        actions: List[ResearchAction] = []
+        seen = set()
+        for url in urls or []:
+            url = str(url or "").strip()
+            if not url.startswith(("http://", "https://")) or url in seen:
+                continue
+            seen.add(url)
+            actions.append(ResearchAction("web_fetch", {"url": url, "requested_by": "refresh"}))
+            if len(actions) >= max_urls:
+                break
+        return actions
+
+    def _rule_violation(self, url: str) -> str:
+        rules = getattr(self, "source_rules", None)
+        return rules.violation(url) if rules is not None else ""
+
+    def _rules_prompt_suffix(self) -> str:
+        rules = getattr(self, "source_rules", None)
+        text = rules.prompt_text() if rules is not None else ""
+        return f"\n\n{text}" if text else ""
+
     @staticmethod
     def _extract_explicit_urls(text: str) -> List[str]:
         urls: List[str] = []
         for raw in re.findall(r'https?://[^\s<>"\']+', text or ""):
             url = raw.rstrip('.,);]}')
-            parsed = urllib.parse.urlparse(url)
+            try:
+                parsed = urllib.parse.urlparse(url)
+            except ValueError:
+                # "https://[bad" and similar: not a readable URL, and not a
+                # reason to fail the whole run.
+                continue
             if parsed.scheme in {"http", "https"} and parsed.netloc:
                 urls.append(urllib.parse.urlunparse(parsed))
         return urls
 
     @staticmethod
     def _result_host(url: str) -> str:
-        parsed = urllib.parse.urlparse(str(url or ""))
+        try:
+            parsed = urllib.parse.urlparse(str(url or ""))
+        except ValueError:
+            return ""
         return (parsed.netloc or parsed.path.split("/", 1)[0]).lower().removeprefix("www.")
 
     @staticmethod
@@ -1258,7 +1373,15 @@ class DeepResearcher:
             url = str(result.get("url") or "").strip()
             if not url or url in seen_urls or url in self.urls_fetched:
                 continue
+            if self._rule_violation(url):
+                # Enforced before relevance ranking so excluded hosts never
+                # take an extraction slot from an allowed page.
+                seen_urls.add(url)
+                self.rule_filtered_urls = getattr(self, "rule_filtered_urls", 0) + 1
+                continue
             host = self._result_host(url)
+            if not host:
+                continue  # unparseable URL ("https://[bad"): nothing to read
             if not definition_question and any(token in host for token in (
                 "dictionary", "wiktionary", "merriam-webster", "collinsdictionary",
             )):
@@ -1342,6 +1465,9 @@ class DeepResearcher:
         for action in direct_reads:
             url = str(action.args.get("url") or "").strip()
             if not url or url in self.urls_fetched:
+                continue
+            if self._rule_violation(url):
+                self.rule_filtered_urls = getattr(self, "rule_filtered_urls", 0) + 1
                 continue
             assessment = assess_source(url, title=url)
             self.urls_fetched.add(url)
@@ -1436,10 +1562,17 @@ class DeepResearcher:
             navigator = ResearchNavigator(
                 search_provider=self.search_provider_override,
                 session_id=getattr(self, "session_id", ""),
+                fresh_fetch=getattr(self, "fresh_fetch", False),
             )
             self.navigator = navigator
+        search_query = self._scoped_search_query(query)
         try:
-            results = await navigator.search(query, count=10)
+            results = await navigator.search(search_query, count=10)
+            if not results and search_query != query:
+                # Some providers ignore or reject site:; retry the plain query
+                # and let the source rules filter its results instead.
+                search_query = query
+                results = await navigator.search(query, count=10)
             self.providers_used = list(dict.fromkeys([*self.providers_used, *navigator.providers_used]))
             status = "ok" if results else "no_results"
             error = ""
@@ -1448,7 +1581,7 @@ class DeepResearcher:
                 error = navigator.last_search_error
             self._record_navigation(
                 "web_search",
-                query=query,
+                query=search_query,
                 status=status,
                 results=len(results or []),
                 error=error,
@@ -1458,9 +1591,26 @@ class DeepResearcher:
             self._record_navigation("web_search", query=query, status="error", error=str(e))
             raise
 
+    def _scoped_search_query(self, query: str) -> str:
+        """Add ``site:`` when the rules allow exactly one concrete domain."""
+        rules = getattr(self, "source_rules", None)
+        if rules is None or "site:" in str(query or "").lower():
+            return query
+        dotted = [d for d in rules.allowed_domains if "." in d]
+        if len(dotted) != 1 or len(dotted) != len(rules.allowed_domains):
+            return query
+        return f"{query} site:{dotted[0]}"
+
     async def _fetch_and_extract(self, url: str, question: str,
                                  title: str, *, prefer_browser: bool = False) -> Optional[Dict]:
         """Fetch a URL's content and use LLM to extract relevant info."""
+        violation = self._rule_violation(url)
+        if violation:
+            # Fetch-time gate: a page outside the run's source rules is never
+            # read, whichever path (planner, seed, browser fallback) chose it.
+            self._record_navigation("web_fetch", url=url, title=title or url,
+                                    status="blocked", error=f"source rule: {violation}")
+            return None
         display = title or url
         self._emit(phase="reading", url=url, title=display,
                    total_sources=len(self.urls_fetched))
@@ -1470,6 +1620,7 @@ class DeepResearcher:
                 progress_callback=self._progress,
                 search_provider=self.search_provider_override,
                 session_id=getattr(self, "session_id", ""),
+                fresh_fetch=getattr(self, "fresh_fetch", False),
             )
             self.navigator = navigator
 
@@ -1493,6 +1644,8 @@ class DeepResearcher:
                 page = browser_page
             else:
                 return None
+        if self._blocked_redirect(url, page, requested_tool, display):
+            return None
 
         # Do this before asking the LLM to extract anything. A weak local
         # model may confidently answer the goal from an unrelated page even
@@ -1519,6 +1672,11 @@ class DeepResearcher:
 
         tried_browser_after_weak_extract = False
         while True:
+            if self._blocked_redirect(url, page, requested_tool, display):
+                return None
+            final_url = self._redirect_target(url, page)
+            # Classify the page the content came from, not the URL asked for.
+            source_url = final_url or url
             content = page.content
             extraction_tokens = self._output_budget(self.extraction_max_tokens)
             max_chars = self.max_content_chars
@@ -1564,8 +1722,13 @@ class DeepResearcher:
                 parsed["title"] = title or page.title
                 parsed["og_image"] = page.og_image
                 parsed["retrieval"] = page.retrieval
+                # Fingerprint of the page text that was read, so a later
+                # refresh can tell whether this evidence changed.
+                parsed["content_hash"] = content_hash(page.content)
+                if final_url:
+                    parsed["final_url"] = final_url
                 assessment = assess_source(
-                    url,
+                    source_url,
                     title=parsed["title"],
                     retrieval=page.retrieval,
                     summary=str(parsed.get("summary") or parsed.get("evidence") or ""),
@@ -1612,7 +1775,7 @@ class DeepResearcher:
                 return parsed
             # If JSON parsing fails, treat entire response as evidence
             assessment = assess_source(
-                url,
+                source_url,
                 title=title or page.title,
                 retrieval=page.retrieval,
                 summary=response,
@@ -1632,11 +1795,12 @@ class DeepResearcher:
                 source_score=assessment.score,
                 source_reason=assessment.reason,
             )
-            return {
+            raw_finding = {
                 "url": url,
                 "title": title or page.title,
                 "og_image": page.og_image,
                 "retrieval": page.retrieval,
+                "content_hash": content_hash(page.content),
                 "source_kind": assessment.kind,
                 "source_score": assessment.score,
                 "source_reason": assessment.reason,
@@ -1644,6 +1808,39 @@ class DeepResearcher:
                 "evidence": response[:3000],
                 "summary": response[:500],
             }
+            if final_url:
+                raw_finding["final_url"] = final_url
+            return raw_finding
+
+    @staticmethod
+    def _redirect_target(url: str, page) -> str:
+        """Where the fetch actually ended when that differs from ``url``."""
+        final_url = str(getattr(page, "final_url", "") or "").strip()
+        if not final_url or canonical_url(final_url) == canonical_url(url):
+            return ""
+        return final_url
+
+    def _blocked_redirect(self, url: str, page, requested_tool: str, display: str) -> bool:
+        """Apply the source rules to the page's final URL after redirects.
+
+        The fetch-time gate only saw the requested URL; an allowed page can
+        redirect to an excluded publisher whose text would otherwise be read
+        and attributed to the allowed URL.
+        """
+        final_url = self._redirect_target(url, page)
+        violation = self._rule_violation(final_url) if final_url else ""
+        if not violation:
+            return False
+        logger.info("Research page %s redirected to %s, outside the source rules", url, final_url)
+        self._record_navigation(
+            "browser_read" if page.retrieval == "browser" else requested_tool,
+            url=url,
+            title=display,
+            status="blocked",
+            retrieval=page.retrieval,
+            error=f"redirected to {final_url}; source rule: {violation}",
+        )
+        return True
 
     async def _browser_fallback(self, url: str, title: str, page) -> Optional[object]:
         """Use the private browser when a normal text fetch cannot read a page."""
@@ -1846,7 +2043,20 @@ class DeepResearcher:
 
         best = max(scored) if scored else 0
         gaps = []
-        primary_count = counts.get("official", 0) + counts.get("primary", 0)
+        # First-party evidence counts only pages that were actually read and
+        # kept as sources (the same population and kinds the visual report's
+        # "Primary sources" metric renders). source_mix above still describes
+        # every analyzed URL, including pages that failed to load.
+        primary_count = 0
+        for item in usable_findings(findings, getattr(self, "source_rules", None)):
+            kind = str(item.get("source_kind") or "").strip() or assess_source(
+                str(item.get("url") or ""),
+                title=str(item.get("title") or ""),
+                retrieval=str(item.get("retrieval") or ""),
+                summary=str(item.get("summary") or item.get("evidence") or ""),
+            ).kind
+            if is_first_party_kind(kind):
+                primary_count += 1
         if primary_count == 0:
             gaps.append("primary/official evidence missing")
         if len(findings) < 3:
@@ -1987,16 +2197,34 @@ class DeepResearcher:
         """LLM writes a polished final report, retrying if too short."""
         max_tokens = self._output_budget(self.max_report_tokens)
         cat_extra = CATEGORY_PROMPTS.get(self.category or "", "")
-        prompt = FINAL_REPORT_PROMPT.format(
-            question=question,
-            report=self._condense_report(report, self._embed_budget_chars(max_tokens)),
-            min_words=self.report_min_words,
-            source_state=self._source_state_summary(),
-            source_coverage_json=self._source_coverage_json(),
-            navigation_trace=self._navigation_trace_summary(limit=12),
-        )
+        word_limit = getattr(self, "report_word_limit", None)
+        condensed = self._condense_report(report, self._embed_budget_chars(max_tokens))
+        if word_limit:
+            prompt = FINAL_REPORT_LIMITED_PROMPT.format(
+                question=question,
+                report=condensed,
+                target_words=self.report_min_words,
+                max_words=word_limit,
+                source_state=self._source_state_summary(),
+                source_coverage_json=self._source_coverage_json(),
+            )
+        else:
+            prompt = FINAL_REPORT_PROMPT.format(
+                question=question,
+                report=condensed,
+                min_words=self.report_min_words,
+                source_state=self._source_state_summary(),
+                source_coverage_json=self._source_coverage_json(),
+                navigation_trace=self._navigation_trace_summary(limit=12),
+            )
         if cat_extra:
             prompt += "\n\n" + cat_extra
+            if word_limit:
+                prompt += f"\n- Keep this structure compact: the {word_limit}-word limit still applies."
+        prompt += self._citable_sources_block() + self._rules_prompt_suffix()
+        # Brief answers are short enough that hidden reasoning mostly adds
+        # latency; follow the preset's mechanical-step thinking choice.
+        think = self.mechanical_think if getattr(self, "report_length", "") == "brief" else None
 
         try:
             result = await self._llm(
@@ -2004,6 +2232,7 @@ class DeepResearcher:
                 temperature=0.3,
                 max_tokens=max_tokens,
                 timeout=180,
+                think=think,
             )
 
             # If report is too short, ask the LLM to expand it — unless the
@@ -2011,6 +2240,9 @@ class DeepResearcher:
             fits = (not self.context_window or estimate_tokens(
                 [{"content": prompt}, {"content": result}]) + max_tokens + _PROMPT_OVERHEAD_TOKENS
                 <= self.context_window)
+            if word_limit:
+                return await self._fit_word_limit(prompt, result, word_limit,
+                                                  max_tokens=max_tokens, think=think, fits=fits)
             if len(result.split()) < self.expand_below_words and fits:
                 logger.info(f"Final report too short ({len(result.split())} words), requesting expansion")
                 self._emit(phase="writing", message="Expanding report...")
@@ -2038,7 +2270,67 @@ class DeepResearcher:
             return result
         except Exception as e:
             logger.error(f"Final report generation failed: {e}")
-            return report  # return the evolving report as-is
+            # The evolving report as-is, within the requested length.
+            return self._limit_report_words(report)
+
+    async def _fit_word_limit(self, prompt: str, draft: str, word_limit: int, *,
+                              max_tokens: int, think, fits: bool) -> str:
+        """Return ``draft`` within ``word_limit`` words, condensing if needed.
+
+        The limit is a ceiling, not a target: any draft over it is rewritten
+        by the model (when the follow-up fits the context window), and
+        whatever is still over the limit after that is trimmed at sentence
+        and block boundaries. Words are counted by ``count_report_words``.
+        """
+        words = count_report_words(draft)
+        if words <= word_limit:
+            return draft
+        best = draft
+        if fits:
+            logger.info(f"Final report too long ({words} words, limit {word_limit}), condensing")
+            self._emit(phase="writing", message="Condensing report to the requested length...")
+            try:
+                condensed = await self._llm(
+                    [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": draft},
+                        {"role": "user", "content": _CONDENSE_INSTRUCTION.format(
+                            words=words, target=self.report_min_words, limit=word_limit)},
+                    ],
+                    temperature=0.2,
+                    max_tokens=max_tokens,
+                    timeout=180,
+                    think=think,
+                )
+            except Exception as e:
+                logger.warning(f"Condensing the final report failed: {e}")
+                condensed = ""
+            if condensed.strip() and count_report_words(condensed) < words:
+                best = condensed
+        return self._limit_report_words(best)
+
+    def _limit_report_words(self, report: str) -> str:
+        """Trim ``report`` to the run's hard word limit (no-op without one)."""
+        limit = getattr(self, "report_word_limit", None)
+        if not limit or not report:
+            return report
+        trimmed = trim_report_to_words(report, limit)
+        if trimmed != report:
+            logger.info("Trimmed report to the %d-word limit (%d words before)",
+                        limit, count_report_words(report))
+        return trimmed
+
+    def _citable_sources_block(self, limit: int = 30) -> str:
+        """List the pages that were actually read so citations stay grounded."""
+        usable = usable_findings(getattr(self, "findings", []), getattr(self, "source_rules", None))
+        urls = [str(f.get("url")) for f in usable[:limit] if f.get("url")]
+        if not urls:
+            return ""
+        return (
+            "\n\n**Pages actually read during research (cite only these URLs; "
+            "never cite a page that is not listed):**\n"
+            + "\n".join(f"- {url}" for url in urls)
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -2237,4 +2529,11 @@ class DeepResearcher:
             stats["Category"] = self.category.capitalize()
         if self.preset_label:
             stats["Preset"] = self.preset_label
+        if getattr(self, "report_length_label", ""):
+            stats["Length"] = self.report_length_label
+        rules = getattr(self, "source_rules", None)
+        if rules is not None:
+            stats["Source rules"] = rules.describe()
+            if getattr(self, "rule_filtered_urls", 0):
+                stats["Filtered by rules"] = self.rule_filtered_urls
         return stats

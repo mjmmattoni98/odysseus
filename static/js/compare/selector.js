@@ -1183,7 +1183,8 @@ async function showModelSelector() {
             renderModelRows();
             _expandModelSlot(idx);
           });
-          detail.appendChild(retryBtn);
+          // A model the provider says cannot chat won't pass on a retry.
+          if (!result.incompatible) detail.appendChild(retryBtn);
           detail.appendChild(swapBtn);
           probeFeedback.appendChild(detail);
         }

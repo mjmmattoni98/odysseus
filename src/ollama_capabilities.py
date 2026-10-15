@@ -1,8 +1,8 @@
 """TTL-cached capability lookup for local Ollama endpoints.
 
-Ollama reports per-model capabilities (``tools``, ``thinking``, ``vision``,
-``embedding``) on its native ``/api/show`` endpoint. Odysseus' request paths
-historically inferred those from hardcoded model-name substring lists, which
+Ollama reports per-model capabilities (``completion``, ``tools``,
+``thinking``, ``vision``, ``embedding``) on its native ``/api/show``
+endpoint. Odysseus' request paths historically inferred those from hardcoded model-name substring lists, which
 miss every new model family and forced users to hand-edit
 ``ModelEndpoint.supports_tools``.
 
@@ -49,6 +49,7 @@ _TOOL_TOKENS: FrozenSet[str] = frozenset({"tools", "tool"})
 _THINKING_TOKENS: FrozenSet[str] = frozenset({"thinking", "reasoning"})
 _VISION_TOKENS: FrozenSet[str] = frozenset({"vision"})
 _EMBEDDING_TOKENS: FrozenSet[str] = frozenset({"embedding"})
+_CHAT_TOKENS: FrozenSet[str] = frozenset({"completion", "completions", "chat"})
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 _cache: dict[tuple[str, str], tuple[float, Optional[FrozenSet[str]]]] = {}
@@ -279,7 +280,7 @@ def capability_tokens(url: str, model: str, *, timeout: float = _PROBE_TIMEOUT_S
 
 def cached_capability_tokens(url: str, model: str) -> Optional[FrozenSet[str]]:
     """Capability tokens already in the cache; never probes (cheap filters)."""
-    root = ollama_api_root(url)
+    root = ollama_api_root(url, probe=False)
     with _lock:
         cached = _cache.get((root, str(model or "").strip())) if root else None
     if cached is None:
@@ -319,6 +320,52 @@ def supports_embedding(url: str, model: str) -> Optional[bool]:
 def is_embedding_only(tokens: Optional[FrozenSet[str]]) -> bool:
     """True for a capability report of an embedding model that cannot chat."""
     return bool(tokens) and bool(tokens & _EMBEDDING_TOKENS) and "completion" not in tokens
+
+
+def chat_capability(tokens: Optional[FrozenSet[str]]) -> Optional[bool]:
+    """Whether a capability report says the model can chat; ``None`` if unknown.
+
+    Ollama lists ``completion`` for every model it can generate with. A
+    report without it (``["embedding"]``, or ``["decision", "vision"]`` from
+    a classifier) belongs to a model Ollama rejects with "does not support
+    chat". A missing or empty report stays unknown so callers fall back to
+    name heuristics or a generation probe instead of guessing.
+    """
+    if not tokens:
+        return None
+    return bool(tokens & _CHAT_TOKENS)
+
+
+def supports_chat(url: str, model: str) -> Optional[bool]:
+    """Whether the model can serve chat requests; ``None`` if unknown."""
+    return chat_capability(capability_tokens(url, model))
+
+
+def non_chat_reason(tokens: Optional[FrozenSet[str]]) -> str:
+    """User-facing reason a capability report rules out chat."""
+    if is_embedding_only(tokens):
+        return "Embedding model (no chat)"
+    listed = ", ".join(sorted(tokens or ())) or "none"
+    return f"Model does not support chat (capabilities: {listed})"
+
+
+def cached_non_chat_models(url: str) -> dict[str, str]:
+    """``{model: reason}`` for cached reports on ``url``'s server that rule out chat.
+
+    Cache-only, like :func:`cached_capability_tokens`: list views can show
+    why a model is missing without probing. Expired entries are skipped.
+    """
+    root = ollama_api_root(url, probe=False)
+    if not root:
+        return {}
+    now = time.time()
+    with _lock:
+        entries = [(model, ts, tokens) for (r, model), (ts, tokens) in _cache.items() if r == root]
+    return {
+        model: non_chat_reason(tokens)
+        for model, ts, tokens in entries
+        if tokens is not None and now - ts < _CACHE_TTL_SECONDS and chat_capability(tokens) is False
+    }
 
 
 def model_context_window(url: str, model: str) -> Optional[int]:

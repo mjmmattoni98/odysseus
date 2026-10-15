@@ -30,7 +30,8 @@ import {
   paneSettingsButtonHtml, togglePaneSettings,
   registerPaneActions,
 } from './panes.js?v=20260908compareheader1';
-import { handleVote, buildVoteBar, addFinishBadge, spawnConfetti, _saveVote, registerCompareActions } from './vote.js?v=20260828resendcaldrag1';
+import { handleVote, buildVoteBar, syncVoteControls, addFinishBadge, spawnConfetti, _saveVote, registerCompareActions } from './vote.js?v=20260828resendcaldrag1';
+import { PANE_OK, PANE_PENDING, searchResponseState } from './streamOutcome.js';
 import { showScoreboard } from './scoreboard.js?v=20260909voteconfirmalign1';
 
 // ── External dependency imports ──
@@ -42,6 +43,7 @@ import themeModule from '../theme.js?v=20260911organsrain1';
 import presetsModule from '../presets.js?v=20260908personaname1';
 import markdownModule from '../markdown.js';
 import { bindMenuDismiss } from '../escMenuStack.js';
+import { setActionLabel } from '../a11yLabel.js';
 
 var escapeHtml = uiModule.esc;
 
@@ -582,6 +584,23 @@ async function _buildCompareUI() {
       handleVote(idx);
       return;
     }
+    // Failed-response actions (stream.js). The pane index comes from the
+    // pane element: a shuffle moves the notice's HTML between panes.
+    const failureBtn = e.target.closest('[data-pane-failure-action]');
+    if (failureBtn) {
+      e.stopPropagation();
+      const failedPane = failureBtn.closest('.compare-pane');
+      const idx = parseInt(failedPane?.dataset.pane);
+      if (!Number.isInteger(idx)) return;
+      if (failureBtn.dataset.paneFailureAction === 'retry') {
+        rerollPane(idx);
+      } else {
+        // Re-ask this round's prompt once the user picks the new model.
+        failedPane.dataset.rerunOnSwap = '1';
+        _showModelSwapDropdown(idx, document.getElementById('cmp-title-' + idx) || failureBtn);
+      }
+      return;
+    }
     const actionBtn = e.target.closest('[data-action]');
     if (actionBtn) {
       e.stopPropagation();
@@ -667,14 +686,14 @@ function _setSendBtn(mode) {
   if (!btn) return;
   if (mode === 'stop') {
     btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
-    btn.title = 'Stop all models';
+    setActionLabel(btn, 'Stop all models');
     btn.dataset.mode = 'streaming';
     btn.classList.remove('mic-mode', 'newchat-mode');
   } else {
     btn.dataset.mode = '';
     btn.innerHTML = SEND_SVG;
     btn.style.color = '';
-    btn.title = 'Send to all models';
+    setActionLabel(btn, 'Send to all models');
     btn.classList.remove('mic-mode', 'newchat-mode', 'newchat-expanded');
   }
 }
@@ -804,6 +823,8 @@ async function _executeCompare(message) {
         const aiMsg = document.createElement('div');
         aiMsg.className = 'msg msg-ai';
         aiMsg.innerHTML = '<div class="role">Search</div><div class="body"></div>';
+        // Vote eligibility reads this per-message state (see vote.js).
+        aiMsg.dataset.responseState = PANE_PENDING;
         const aiBody = aiMsg.querySelector('.body');
         if (spinnerModule) {
           const spinner = spinnerModule.create('Searching...', 'right');
@@ -813,6 +834,8 @@ async function _executeCompare(message) {
         hist.appendChild(aiMsg);
         hist.scrollTop = hist.scrollHeight;
       }
+      // The last round's vote buttons must not stay live for this query.
+      syncVoteControls();
 
       // Fire searches — parallel or sequential based on _parallel setting
       const t0 = performance.now();
@@ -851,6 +874,7 @@ async function _executeCompare(message) {
           if (hist) {
             const aiMsg = hist.querySelector('.msg-ai:last-child');
             if (aiMsg) {
+              aiMsg.dataset.responseState = searchResponseState(data);
               const aiBody = aiMsg.querySelector('.body');
               aiBody.innerHTML = '';
               if (data.error) {
@@ -881,6 +905,9 @@ async function _executeCompare(message) {
                 const synthMsg = document.createElement('div');
                 synthMsg.className = 'msg msg-ai';
                 synthMsg.innerHTML = '<div class="role">Analysis</div><div class="body"></div>';
+                // The pane's latest message carries its vote state: the
+                // analysis only follows a search that returned results.
+                synthMsg.dataset.responseState = PANE_OK;
                 const synthBody = synthMsg.querySelector('.body');
                 let spinner = null;
                 if (spinnerModule) { spinner = spinnerModule.create('Analyzing...', 'right'); synthBody.appendChild(spinner.createElement()); spinner.start(); }
@@ -902,6 +929,7 @@ async function _executeCompare(message) {
         if (!hist) continue;
         const aiMsg = hist.querySelector('.msg-ai:last-child');
         if (!aiMsg) continue;
+        aiMsg.dataset.responseState = searchResponseState(data);
         const aiBody = aiMsg.querySelector('.body');
         aiBody.innerHTML = '';
 
@@ -951,6 +979,7 @@ async function _executeCompare(message) {
           const synthMsg = document.createElement('div');
           synthMsg.className = 'msg msg-ai';
           synthMsg.innerHTML = '<div class="role">Analysis</div><div class="body"></div>';
+          synthMsg.dataset.responseState = PANE_OK;   // follows a search with results
           const synthBody = synthMsg.querySelector('.body');
           let spinner = null;
           if (spinnerModule) {
@@ -1039,6 +1068,9 @@ async function _executeCompare(message) {
       hist.scrollTop = hist.scrollHeight;
       aiElements.push(aiMsg);
     }
+    // Nothing is votable until two of this round's answers finish; the last
+    // round's buttons must not stay live meanwhile (stream.js re-syncs).
+    syncVoteControls();
 
     // ── Auto-extend timeout ──
     const researchChk = document.getElementById('research-toggle');

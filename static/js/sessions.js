@@ -4,13 +4,14 @@
 import Storage from './storage.js';
 import assistantControls from './assistantControls.js';
 import uiModule, { autoResize, styledPrompt } from './ui.js?v=20260916largetoolscroll1';
-import chatRenderer from './chatRenderer.js?v=20261011forksync1';
+import chatRenderer from './chatRenderer.js?v=20261014audit1';
 import { providerLogo } from './providers.js';
 import { initModelPicker, updateModelPicker } from './modelPicker.js?v=20260909routeidentity1';
 import themeModule from './theme.js?v=20260911organsrain1';
 import spinnerModule from './spinner.js';
 import { actionMenuRank, orderActionMenuItems, SELECT_MENU_ICON } from './actionMenuOrder.js';
 import { registerEscapeLayer, bindMenuDismiss } from './escMenuStack.js';
+import { setActionLabel } from './a11yLabel.js';
 
 const API_BASE = window.location.origin;
 
@@ -2112,7 +2113,7 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     if (sendBtn && sendBtn.dataset.mode === 'streaming') {
       sendBtn.dataset.mode = '';
       sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
-      sendBtn.title = 'Send message';
+      setActionLabel(sendBtn, 'Send message');
     }
     // Deactivate compare mode on session switch
     if (window.compareModule) {

@@ -2288,6 +2288,13 @@ export default themeModule;
 
 // Init on DOM ready, with server-side sync fallback
 async function _initWithSync() {
+  // The logged-out login page imports this module only for its background
+  // effects. The per-user /api/prefs endpoints below need a session, so they
+  // would only answer 401 there; that page sets this flag before importing.
+  if (window.__odysseusLoggedOutPage) {
+    initThemeUI();
+    return;
+  }
   // If no local theme, try loading from server (cross-device sync)
   if (!getSaved()) {
     const serverTheme = await _loadFromServer();

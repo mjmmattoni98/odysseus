@@ -71,6 +71,24 @@ def format_utc_offset(offset_min: Optional[int]) -> str:
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 
+def utc_isoformat(value: Optional[datetime]) -> Optional[str]:
+    """Serialize a stored UTC timestamp as ISO 8601 with an explicit ``Z``.
+
+    ``TimestampMixin`` columns hold naive UTC. A bare ``isoformat()`` string
+    has no offset, so browsers parse it as local time and shift it by the
+    user's UTC offset. Naive values are treated as UTC; aware values are
+    converted. Do not use this for zone-less local wall times such as EXIF
+    capture dates.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.replace(tzinfo=None).isoformat() + "Z"
+
+
 def _zoneinfo_from_name():
     """Return ZoneInfo for the request's IANA name, or None if missing/invalid."""
     name = get_user_tz_name()

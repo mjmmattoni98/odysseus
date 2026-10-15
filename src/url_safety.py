@@ -160,6 +160,38 @@ def check_outbound_url(
     return True, "ok"
 
 
+def check_link_url(url: str, *, max_length: int = 2048) -> Tuple[bool, str]:
+    """Validate a URL that is only *stored and displayed* as a link, never fetched.
+
+    Same scheme policy as :func:`check_outbound_url` (http/https only, so a
+    saved link can never become ``javascript:`` or ``data:`` in the browser),
+    but no DNS resolution: the server makes no request to it, and resolving
+    would make saving a bookmark fail offline. Embedded credentials are
+    rejected because ``https://trusted.example@evil.example`` displays as one
+    host and opens another.
+    """
+    if not isinstance(url, str):
+        return False, "URL must be a string"
+    url = url.strip()
+    if not url:
+        return False, "URL is required"
+    if len(url) > max_length:
+        return False, f"URL is longer than {max_length} characters"
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
+        return False, "URL must not contain spaces or control characters"
+    try:
+        parsed = urlparse(url)
+    except Exception as e:  # pragma: no cover - urlparse is very tolerant
+        return False, f"unparseable URL: {e}"
+    if parsed.scheme.lower() not in ALLOWED_SCHEMES:
+        return False, f"scheme must be http or https, got '{parsed.scheme or '(none)'}'"
+    if "@" in (parsed.netloc or ""):
+        return False, "URL must not contain credentials"
+    if not parsed.hostname:
+        return False, "URL has no host"
+    return True, "ok"
+
+
 
 class OutboundAddressBlocked(PermissionError):
     """A non-HTTP outbound host resolves into a disallowed address range."""

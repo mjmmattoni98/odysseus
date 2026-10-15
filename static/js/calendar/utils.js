@@ -178,3 +178,93 @@ export function _localDateOf(isoStr) {
   }
   return isoStr.slice(0, 10);
 }
+
+// ── event time ranges ──
+
+const _TZ_SUFFIX = /[Zz]$|[+\-]\d{2}:?\d{2}$/;
+
+// Wall-clock `HH:MM` of an event timestamp. Tz-aware ISO is shown in the
+// browser's local timezone; naive timestamps keep their written time (the
+// same rule _localDateOf applies to the date part).
+export function _clockOf(isoStr) {
+  if (typeof isoStr !== 'string' || isoStr.length < 16) return '';
+  if (_TZ_SUFFIX.test(isoStr)) {
+    const d = new Date(isoStr);
+    if (!isNaN(d)) {
+      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    }
+  }
+  return isoStr.slice(11, 16);
+}
+
+// Whole calendar days from one `YYYY-MM-DD` to another. Compares dates, not
+// elapsed time, so DST days (23h/25h) still count as exactly one day.
+export function _calendarDayDiff(fromDs, toDs) {
+  const parse = (s) => {
+    const m = typeof s === 'string' ? s.match(/^(\d{4})-(\d{2})-(\d{2})$/) : null;
+    return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) : NaN;
+  };
+  const a = parse(fromDs);
+  const b = parse(toDs);
+  if (isNaN(a) || isNaN(b)) return 0;
+  return Math.round((b - a) / 86400000);
+}
+
+// How many local calendar days after its start day a timed event ends
+// (0 = same day). All-day events are date-only ranges with an exclusive end,
+// so they never get an overnight marker.
+export function _eventEndDayOffset(ev) {
+  if (!ev || ev.all_day || !ev.dtstart || !ev.dtend) return 0;
+  return Math.max(0, _calendarDayDiff(_localDateOf(ev.dtstart), _localDateOf(ev.dtend)));
+}
+
+export function _fmtDayOffset(days) {
+  if (!(days > 0)) return '';
+  return days === 1 ? '+1 day' : `+${days} days`;
+}
+
+// "Tue, Oct 13" for a `YYYY-MM-DD` string, in the user's locale.
+export function _fmtShortDate(ds) {
+  const d = new Date(`${ds}T00:00:00`);
+  if (isNaN(d)) return '';
+  return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+// The one formatter for every timed range the calendar renders. An end on a
+// later local day gets an explicit "(+N day)" marker, so 12:00 – 11:00 can't
+// read as a backwards same-day range. `onDay` (`YYYY-MM-DD`) is the day being
+// rendered: on the days after an event's start, the start date is prefixed so
+// the marker stays anchored to it.
+export function _fmtEventTimeRange(ev, { sep = ' – ', onDay = '' } = {}) {
+  if (!ev) return '';
+  if (ev.all_day) return 'All day';
+  const start = _clockOf(ev.dtstart);
+  if (!start) return '';
+  const end = _clockOf(ev.dtend);
+  if (!end) return start;
+  const startDs = _localDateOf(ev.dtstart);
+  const prefix = onDay && startDs && startDs < onDay ? `${_fmtShortDate(startDs)} ` : '';
+  const marker = _fmtDayOffset(_eventEndDayOffset(ev));
+  return `${prefix}${start}${sep}${end}${marker ? ` (${marker})` : ''}`;
+}
+
+// Tooltip companion: spells out the end date whenever the end is on a later
+// day ("12:00 – 11:00 (+1 day) · ends Tue, Oct 13").
+export function _eventTimeRangeTitle(ev) {
+  const range = _fmtEventTimeRange(ev);
+  if (!_eventEndDayOffset(ev)) return range;
+  return `${range} · ends ${_fmtShortDate(_localDateOf(ev.dtend))}`;
+}
+
+// Event-form hint for the end field. The form rolls an end time at or before
+// the start time on the same date over to the next day; say so instead of
+// doing it silently. Inputs are the raw form values (`YYYY-MM-DD`, `HH:MM`).
+export function _endDayHint({ startDate, endDate, startTime, endTime, allDay } = {}) {
+  if (allDay || !startDate || !startTime || !endTime) return '';
+  let end = endDate || startDate;
+  if (end === startDate && endTime <= startTime) end = _addDays(startDate, 1);
+  const days = _calendarDayDiff(startDate, end);
+  if (days <= 0) return '';
+  const when = _fmtShortDate(end);
+  return days === 1 ? `Ends the next day (${when})` : `Ends ${days} days later (${when})`;
+}

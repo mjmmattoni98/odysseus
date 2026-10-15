@@ -2,7 +2,7 @@
 // Admin-only: users, endpoints, MCP, RAG, embeddings, tokens, webhooks, features
 
 import uiModule from './ui.js?v=20260916largetoolscroll1';
-import settingsModule from './settings.js?v=20261011forksync1';
+import settingsModule from './settings.js?v=20261014audit1';
 import { providerLogo, providerLogoFromUrl } from './providers.js';
 import { sortModelObjects } from './modelSort.js';
 import { PROVIDER_DEVICE_FLOWS, formatDeviceFlowError, runProviderDeviceFlow } from './providerDeviceFlow.js';
@@ -13,6 +13,7 @@ import {
   renderUsageCardHtml as renderChatgptUsageCardHtml,
 } from './chatgptSubscriptionUsage.js';
 import { getSettings, getTools, invalidateSettings, invalidateTools } from './appConfig.js';
+import { initBackups, loadBackups, stopBackupsPolling } from './adminBackups.js';
 
 let initialized = false;
 let modalEl = null;
@@ -4175,7 +4176,7 @@ function initAll() {
   modalEl = el('settings-modal');
   const inits = [
     initSignupToggle, initShareDefaultsToggle, initAddUser, initEndpointForm, initMcpForm,
-    initCalDAV, initBackup, initDangerZone, initTokenForm, initLogsView,
+    initCalDAV, initBackup, initBackups, initDangerZone, initTokenForm, initLogsView,
     () => settingsModule.initIntegrations()
   ];
   for (const fn of inits) {
@@ -4193,6 +4194,7 @@ function refreshAll() {
   loadTokens();
   loadLogs(false);
   loadNotificationLogs();
+  loadBackups();
 }
 
 /* ═══════════════════════════════════════════
@@ -4210,6 +4212,7 @@ export function open(tab) {
 
 export function close() {
   stopLogsPolling();
+  stopBackupsPolling();
   settingsModule.close();
 }
 

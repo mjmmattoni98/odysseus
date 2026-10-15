@@ -52,7 +52,7 @@ from routes.cookbook_helpers import (
     _ps_squote, _bash_squote, _validate_serve_cmd, _parse_serve_phase, OLLAMA_MISSING_HINT,
     _safe_env_prefix, _local_windows_bash_env_prefix, _local_tooling_path_export, _append_serve_preflight_exit_lines,
     _append_serve_exit_code_lines, _append_llama_cpp_linux_accel_build_lines, _cached_model_scan_script,
-    load_stored_hf_token,
+    load_stored_hf_token, parse_ollama_library_card,
     _append_vllm_linux_preflight_lines, _ollama_bind_from_cmd, _pip_install_fallback_chain,
     _pip_install_no_cache, _user_shell_path_bootstrap, _venv_safe_local_pip_install_cmd,
     _diagnose_serve_output, run_ssh_command_async,
@@ -4136,6 +4136,13 @@ def setup_cookbook_routes() -> APIRouter:
         {"name": "olmo2", "description": "AI2 OLMo 2 open-weights.", "sizes": ["7b", "13b"]},
     ]
 
+    def _with_ollama_library_facets(entry: dict) -> dict:
+        """Attach task/runtime facets (services.hwfit.facets) to a library entry."""
+        from services.hwfit.facets import classify_model_facets
+        caps = [str(c).lower() for c in (entry.get("capabilities") or [])]
+        cloud_only = "cloud" in caps and not entry.get("sizes")
+        return {**entry, **classify_model_facets(entry, source="ollama_library", ollama_capabilities=caps, cloud_only=cloud_only)}
+
     @router.get("/api/cookbook/ollama/library")
     async def ollama_library(refresh: int = 0, request: Request = None, owner: str = Depends(require_user)):
         """List popular Ollama library models for the Browse picker.
@@ -4166,9 +4173,6 @@ def setup_cookbook_routes() -> APIRouter:
                         re.DOTALL,
                     )
                     desc_re = re.compile(r'<p[^>]*>([^<]{4,400})</p>', re.DOTALL)
-                    # Size tags on ollama.com cards look like "0.5b", "14b",
-                    # "8x7b", "27b". Pulled from short <span>-wrapped chips.
-                    size_re = re.compile(r'>\s*(\d+(?:\.\d+)?(?:x\d+)?[bBmM])\s*<')
                     seen: set[str] = set()
                     for bm in block_re.finditer(html):
                         name = bm.group(1).strip()
@@ -4178,14 +4182,11 @@ def setup_cookbook_routes() -> APIRouter:
                         body = bm.group(2)
                         dm = desc_re.search(body)
                         desc = (dm.group(1).strip() if dm else "").replace("\n", " ")
-                        sizes_raw = size_re.findall(body)
-                        # Dedup sizes preserving order
-                        sizes: list[str] = []
-                        for s in sizes_raw:
-                            s_low = s.lower()
-                            if s_low not in sizes:
-                                sizes.append(s_low)
-                        models.append({"name": name, "description": desc, "sizes": sizes})
+                        # Size tags ("0.5b", "8x7b", "270m") and capability chips
+                        # ("vision", "embedding", "cloud"...); download/pull/tag
+                        # counters like "3.7M" are skipped by context.
+                        card = parse_ollama_library_card(body)
+                        models.append({"name": name, "description": desc, "sizes": card["sizes"], "capabilities": card["capabilities"]})
                         if len(models) >= 80:
                             break
                 else:
@@ -4203,7 +4204,7 @@ def setup_cookbook_routes() -> APIRouter:
                 models = list(_OLLAMA_FALLBACK_LIBRARY)
                 if err is None:
                     err = "parsed 0 results — using fallback list"
-            _ollama_library_cache["models"] = models
+            _ollama_library_cache["models"] = [_with_ollama_library_facets(m) for m in models]
             _ollama_library_cache["fetched_at"] = now
             _ollama_library_cache["error"] = err
         return {

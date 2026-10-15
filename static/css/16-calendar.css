@@ -1172,4 +1172,7 @@
 .cal-input:focus { outline:none; border-color:var(--accent); }
 .cal-input-time { width:auto; flex:1; }
 .cal-form-row { display:flex; gap:8px; align-items:center; }
+/* "Ends the next day (Tue, Oct 13)" under the time row: an end time before
+   the start time rolls over to the next date, so say it out loud. */
+.cal-end-day-hint { font-size:11px; color:var(--warn); margin:-4px 0 8px; }
 .cal-form-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:4px; }

@@ -38,6 +38,9 @@ class ResearchPage:
     success: bool = False
     retrieval: str = "fetch"
     error: str = ""
+    # Where redirects ended ("" when unknown, e.g. browser reads). Source
+    # rules are checked against it as well as against ``url``.
+    final_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,79 @@ class ResearchSourceAssessment:
     kind: str
     score: int
     reason: str
+
+
+# Kinds that count as first-party evidence: government/academic pages
+# ("official") and project/vendor-owned pages ("primary"). Source coverage,
+# the visual report's evidence profile, and official-only source rules all
+# read this one set so their counts cannot disagree.
+FIRST_PARTY_SOURCE_KINDS = frozenset({"official", "primary"})
+
+
+def is_first_party_kind(kind: Any) -> bool:
+    return str(kind or "").strip().lower() in FIRST_PARTY_SOURCE_KINDS
+
+
+# Official-domain patterns. Every check below compares whole hostname labels
+# (``host == domain`` or ``host.endswith("." + domain)``), never substrings or
+# URL paths, so "nasa.gov.evil.com" or "/wiki/Official_language" cannot pass.
+# Top-level domains reserved for government, military, academic and
+# intergovernmental bodies.
+_OFFICIAL_TLDS = frozenset({"gov", "mil", "edu", "int"})
+# Second-level labels reserved under country codes: gov.uk, gob.mx, gouv.fr,
+# govt.nz, gv.at, go.jp, mil.br, edu.au, ac.uk.
+_OFFICIAL_CC_SECOND_LEVEL = frozenset({"gov", "gob", "gouv", "govt", "gv", "go", "mil", "edu", "ac"})
+# Official bodies on other domains: EU institutions, the Government of
+# Canada, and intergovernmental/standards organisations on .org.
+OFFICIAL_DOMAINS = (
+    "europa.eu", "canada.ca", "gc.ca",
+    "un.org", "oecd.org", "imf.org", "worldbank.org",
+    "iso.org", "ietf.org", "rfc-editor.org", "w3.org",
+)
+# Project/vendor-owned hosts (labelled "primary", never "official").
+_PRIMARY_DOMAINS = ("github.com", "huggingface.co", "readthedocs.io")
+_PRIMARY_SUBDOMAIN_LABELS = frozenset({"docs", "developer", "developers", "support"})
+_COMMUNITY_DOMAINS = ("reddit.com", "quora.com", "stackoverflow.com", "news.ycombinator.com")
+# Encyclopedias stay secondary even when a path or title says "official".
+_REFERENCE_DOMAINS = ("wikipedia.org", "wiktionary.org", "wikimedia.org")
+
+
+def _host_in(host: str, domains) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _url_hostname(url: Any) -> str:
+    try:
+        host = (urllib.parse.urlsplit(str(url or "")).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def is_official_host(host: Any) -> bool:
+    """True for government, military, academic or intergovernmental hosts."""
+    host = str(host or "").lower().rstrip(".")
+    labels = host.split(".") if host else []
+    if len(labels) < 2 or not all(labels):
+        return False
+    if labels[-1] in _OFFICIAL_TLDS:
+        return True
+    if len(labels[-1]) == 2 and labels[-2] in _OFFICIAL_CC_SECOND_LEVEL:
+        return True
+    return _host_in(host, OFFICIAL_DOMAINS)
+
+
+def is_official_url(url: Any) -> bool:
+    """URL-only official check used to enforce official-only source rules."""
+    return is_official_host(_url_hostname(url))
+
+
+def _is_primary_host(host: str) -> bool:
+    if _host_in(host, _PRIMARY_DOMAINS):
+        return True
+    # docs.python.org, developer.apple.com: a docs/developer/support label in
+    # the subdomain part, not merely those letters somewhere in the host.
+    return any(label in _PRIMARY_SUBDOMAIN_LABELS for label in host.split(".")[:-2])
 
 
 def parse_research_actions(text: str, *, allowed_tools: set[str] | None = None) -> list[ResearchAction]:
@@ -98,26 +174,35 @@ def assess_source(url: str, *, title: str = "", retrieval: str = "", summary: st
 
     This is deliberately coarse. The model still judges evidence content; this
     only gives the planner a compact map of whether it has official/primary
-    sources or mostly secondary/search-result material.
+    sources or mostly secondary/search-result material. Host checks match
+    whole labels; the wording heuristic only labels pages and is never used
+    to enforce source rules (see ``is_official_url``).
     """
-    parsed = urllib.parse.urlparse(str(url or ""))
-    host = (parsed.netloc or parsed.path.split("/", 1)[0]).lower().removeprefix("www.")
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+    except ValueError:
+        parsed = urllib.parse.urlparse("")
+    host = _url_hostname(url) if parsed.netloc else parsed.path.split("/", 1)[0].lower().removeprefix("www.")
     path = (parsed.path or "").lower()
-    text = " ".join([host, path, str(title or ""), str(summary or "")]).lower()
+    # The host is judged only by the label checks below; scanning it as text
+    # would let "mydocs.example.com" read as documentation.
+    text = " ".join([path, str(title or ""), str(summary or "")]).lower()
     retrieval = (retrieval or "fetch").lower()
 
     kind = "secondary"
     score = 55
     reason = "secondary web source"
 
-    if host.endswith((".gov", ".edu", ".ac.uk")) or ".gov." in host:
+    if is_official_host(host):
         kind, score, reason = "official", 90, "government/academic domain"
-    elif any(part in host for part in ("github.com", "huggingface.co", "docs.", "developer.", "support.")):
+    elif _is_primary_host(host):
         kind, score, reason = "primary", 82, "primary project/vendor source"
+    elif _host_in(host, _COMMUNITY_DOMAINS):
+        kind, score, reason = "community", 45, "community/forum source"
+    elif _host_in(host, _REFERENCE_DOMAINS):
+        reason = "reference/encyclopedia source"
     elif any(token in text for token in ("official", "documentation", "docs", "release notes", "press release")):
         kind, score, reason = "primary", 78, "primary-source wording"
-    elif any(part in host for part in ("reddit.com", "quora.com", "stackoverflow.com", "news.ycombinator.com")):
-        kind, score, reason = "community", 45, "community/forum source"
     elif any(token in text for token in ("affiliate", "coupon", "best-", "top-", "review")):
         kind, score, reason = "commercial", 40, "commercial/listicle source"
 
@@ -144,10 +229,14 @@ class ResearchNavigator:
         progress_callback=None,
         session_id: str = "",
         search_provider: str | None = None,
+        fresh_fetch: bool = False,
     ) -> None:
         self._progress = progress_callback
         self.session_id = session_id
         self.search_provider = (search_provider or "").strip()
+        # Re-download pages instead of reusing the web-content cache (a
+        # refresh must compare current page text, not a cached copy).
+        self.fresh_fetch = bool(fresh_fetch)
         self.providers_used: list[str] = []
         self.last_search_error = ""
         self.browser_fetches = 0
@@ -198,6 +287,8 @@ class ResearchNavigator:
             kwargs: dict[str, Any] = {"timeout": timeout}
             if max_bytes is not None:
                 kwargs["max_bytes"] = max_bytes
+            if self.fresh_fetch:
+                kwargs["bypass_cache"] = True
             page = await asyncio.to_thread(fetch_webpage_content, url, **kwargs)
         except Exception as e:
             return ResearchPage(url=url, success=False, error=str(e))
@@ -244,4 +335,5 @@ class ResearchNavigator:
             success=bool(page.get("success") and content),
             retrieval="fetch",
             error=str(page.get("error") or ""),
+            final_url=str(page.get("final_url") or ""),
         )

@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Optional, Dict
 
 from src.research_utils import strip_thinking, is_low_quality
+from src.research_sources import (
+    SourceRules, effective_source_rules, finding_allowed, usable_findings, verify_citations,
+)
 from src.constants import DEEP_RESEARCH_DIR
 
 logger = logging.getLogger(__name__)
@@ -273,15 +276,32 @@ class ResearchHandler:
         extraction_timeout: int = None,
         extraction_concurrency: int = None,
         owner: str = "",
+        report_length: str = None,
+        source_rules: dict = None,
+        run_settings: dict = None,
+        previous_version: dict = None,
+        fresh_fetch: bool = False,
     ) -> dict:
         """Start research as a background task. Returns task info dict.
 
         max_rounds=0 is Auto: the research preset caps the run and the AI's
         _should_stop decision (after the preset's small minimum) ends it
         earlier. An explicit count means roughly that many rounds.
+
+        ``report_length`` (auto/brief/standard/detailed) and ``source_rules``
+        are combined with any length or source restriction in ``query``.
+        ``run_settings`` is persisted so the research can be refreshed with
+        the same settings; ``previous_version`` (id, lineage_id, version,
+        sources, raw_report) makes this run a refresh saved as a new version.
+        ``fresh_fetch`` re-downloads pages instead of reusing the web-content
+        cache; a refresh always does, so its change summary compares the
+        pages as they are now.
         """
         if _research_json_path(session_id) is None:
             raise ValueError("Invalid research session_id")
+        from src.research_presets import resolve_report_length
+        rules = effective_source_rules(source_rules, query)
+        length_plan = resolve_report_length(report_length, query)
 
         # Resolve the hard wall-clock timeout from settings when the caller
         # didn't pin one. Local / edge models routinely need more than the
@@ -323,8 +343,17 @@ class ResearchHandler:
             "mode": "research",
             # SECURITY: track ownership so all reads / saves can filter by user.
             "owner": owner or "",
+            "source_rules": rules.to_dict(),
+            "report_length": length_plan.to_dict(),
+            "run_settings": dict(run_settings or {}),
+            "previous_version": previous_version or None,
         }
         self._active_tasks[session_id] = entry
+        seed_urls = None
+        if previous_version:
+            from src.research_versions import refresh_seed_urls
+            seed_urls = refresh_seed_urls(previous_version, rules) or None
+        fresh_fetch = bool(fresh_fetch or previous_version)
 
         def on_progress(event):
             entry["progress"] = event
@@ -359,10 +388,26 @@ class ResearchHandler:
                         session_id=session_id,
                         extraction_timeout=extraction_timeout,
                         extraction_concurrency=extraction_concurrency,
+                        report_length=report_length,
+                        source_rules=rules,
+                        seed_urls=seed_urls,
+                        fresh_fetch=fresh_fetch,
                     ),
                     timeout=hard_timeout,
                 )
                 entry["result"] = result
+                failure = self._failed_attempt(entry, previous_version)
+                if failure:
+                    # Same shape as other failed runs: in memory only, so the
+                    # stream/status/chat delivery report an error and nothing
+                    # reaches the library or the version history.
+                    entry["result"] = failure
+                    entry["status"] = "error"
+                    on_progress({"phase": "error", "message": failure[:300]})
+                    return
+                if previous_version:
+                    on_progress({"phase": "comparing", "message": "Comparing with the previous version..."})
+                    await self._summarize_refresh(entry, llm_endpoint, llm_model, llm_headers)
                 entry["status"] = "done"
                 self._save_result(session_id, entry)
                 # Persist to DB via callback (ensures result survives even if SSE disconnected)
@@ -378,15 +423,20 @@ class ResearchHandler:
                 entry["status"] = "error"
                 # If we have partial results, save what we have
                 researcher = entry.get("researcher")
-                if researcher and researcher.evolving_report:
+                failure = (self._failed_attempt(entry, previous_version,
+                                                f"Research timed out after {hard_timeout}s.")
+                           if previous_version else "")
+                if failure:
+                    entry["result"] = failure
+                elif researcher and researcher.evolving_report:
                     entry["result"] = self._format_research_report(
-                        query, researcher.evolving_report,
+                        query, self._partial_report(researcher),
                         researcher.get_stats(), hard_timeout,
                     )
                     entry["status"] = "done"
                     self._save_result(session_id, entry)
                     try:
-                        sources = self._extract_sources(researcher.findings) if researcher.findings else []
+                        sources = self._extract_sources(researcher.findings, rules) if researcher.findings else []
                         findings = self._extract_raw_findings(researcher.findings) if researcher.findings else []
                         _guarded_complete(session_id, entry["result"], sources, findings)
                     except Exception as e:
@@ -401,16 +451,21 @@ class ResearchHandler:
                 logger.error(f"Background research failed: {e}", exc_info=True)
                 # Preserve partial findings if available (mirrors timeout branch)
                 researcher = entry.get("researcher")
-                if researcher and researcher.evolving_report:
+                failure = (self._failed_attempt(entry, previous_version, f"Research failed: {e}.")
+                           if previous_version else "")
+                if failure:
+                    entry["result"] = failure
+                    entry["status"] = "error"
+                elif researcher and researcher.evolving_report:
                     _elapsed = time.time() - entry["started_at"]
                     entry["result"] = self._format_research_report(
-                        query, researcher.evolving_report,
+                        query, self._partial_report(researcher),
                         researcher.get_stats(), _elapsed,
                     )
                     entry["status"] = "done"
                     self._save_result(session_id, entry)
                     try:
-                        sources = self._extract_sources(researcher.findings) if researcher.findings else []
+                        sources = self._extract_sources(researcher.findings, rules) if researcher.findings else []
                         findings = self._extract_raw_findings(researcher.findings) if researcher.findings else []
                         _guarded_complete(session_id, entry["result"], sources, findings)
                     except Exception as cb_err:
@@ -422,7 +477,40 @@ class ResearchHandler:
 
         task = asyncio.create_task(_run())
         entry["task"] = task
-        return {"session_id": session_id, "status": "running", "query": query}
+        return {
+            "session_id": session_id, "status": "running", "query": query,
+            "source_rules": entry["source_rules"], "report_length": entry["report_length"],
+        }
+
+    @staticmethod
+    def _partial_report(researcher) -> str:
+        """The evolving report saved after a timeout or error, within the
+        run's hard word limit like every other way a report is returned."""
+        from src.research_presets import trim_report_to_words
+        return trim_report_to_words(researcher.evolving_report,
+                                    getattr(researcher, "report_word_limit", None))
+
+    async def _summarize_refresh(self, entry: dict, llm_endpoint: str, llm_model: str,
+                                 llm_headers: dict = None) -> None:
+        """Attach a change summary comparing this refresh with its previous version."""
+        from src.research_versions import build_change_summary, compare_sources, summarize_conclusion_changes
+        previous = entry.get("previous_version") or {}
+        try:
+            researcher = entry.get("researcher")
+            rules = SourceRules.from_dict(entry.get("source_rules"))
+            current = self._extract_sources(getattr(researcher, "findings", None) or [], rules)
+            note = await summarize_conclusion_changes(
+                entry.get("query", ""),
+                previous.get("raw_report") or "",
+                entry.get("raw_report") or "",
+                compare_sources(previous.get("sources") or [], current),
+                llm_endpoint=llm_endpoint,
+                llm_model=llm_model,
+                llm_headers=llm_headers,
+            )
+            entry["change_summary"] = build_change_summary(previous, current, conclusion_summary=note)
+        except Exception as e:
+            logger.warning(f"Research refresh comparison failed: {e}")
 
     def get_status(self, session_id: str) -> Optional[dict]:
         """Get current research status for a session."""
@@ -537,7 +625,7 @@ class ResearchHandler:
                 return entry["sources"]
             researcher = entry.get("researcher")
             if researcher and researcher.findings:
-                return self._extract_sources(researcher.findings)
+                return self._extract_sources(researcher.findings, SourceRules.from_dict(entry.get("source_rules")))
         # Check disk
         path = _research_json_path(session_id)
         if path is None:
@@ -556,7 +644,7 @@ class ResearchHandler:
             entry = self._active_tasks[session_id]
             researcher = entry.get("researcher")
             if researcher and researcher.findings:
-                return self._extract_raw_findings(researcher.findings)
+                return self._extract_raw_findings(researcher.findings, SourceRules.from_dict(entry.get("source_rules")))
         # Check disk
         path = _research_json_path(session_id)
         if path is None:
@@ -639,7 +727,7 @@ class ResearchHandler:
     @staticmethod
     def _source_metadata(f: dict) -> dict:
         meta = {}
-        for key in ("retrieval", "source_kind", "source_reason"):
+        for key in ("retrieval", "source_kind", "source_reason", "content_hash", "final_url"):
             value = f.get(key)
             if value:
                 meta[key] = value
@@ -651,33 +739,29 @@ class ResearchHandler:
         return meta
 
     @staticmethod
-    def _extract_sources(findings: list) -> list:
-        """Extract deduplicated [{url, title}] from findings, filtering low-quality ones."""
-        seen = set()
+    def _extract_sources(findings: list, rules: Optional[SourceRules] = None) -> list:
+        """Extract deduplicated [{url, title}] from findings, filtering low-quality
+        ones and any that break the run's source rules."""
         sources = []
-        for f in findings:
-            if not isinstance(f, dict):
-                continue
+        for f in usable_findings(findings, rules if rules is not None and rules.active else None):
             url = f.get("url", "")
-            title = f.get("title", "") or url
-            summary = f.get("summary", "") or f.get("evidence", "")
-            if url and url not in seen and not is_low_quality(summary):
-                seen.add(url)
-                entry = {"url": url, "title": title}
-                og_img = f.get("og_image", "")
-                if og_img:
-                    entry["image"] = og_img
-                entry.update(ResearchHandler._source_metadata(f))
-                sources.append(entry)
+            entry = {"url": url, "title": f.get("title", "") or url}
+            og_img = f.get("og_image", "")
+            if og_img:
+                entry["image"] = og_img
+            entry.update(ResearchHandler._source_metadata(f))
+            sources.append(entry)
         return sources
 
     @staticmethod
-    def _extract_raw_findings(findings: list) -> list:
+    def _extract_raw_findings(findings: list, rules: Optional[SourceRules] = None) -> list:
         """Extract [{url, title, summary}] for per-source findings display, filtering junk."""
         try:
             items = []
             for f in findings:
                 if not isinstance(f, dict):
+                    continue
+                if rules is not None and rules.active and not finding_allowed(f, rules):
                     continue
                 url = f.get("url", "")
                 title = f.get("title", "") or "Untitled"
@@ -740,10 +824,11 @@ class ResearchHandler:
             # Extract and cache sources + raw findings
             sources = []
             raw_findings = []
+            rules = SourceRules.from_dict(entry.get("source_rules"))
             researcher = entry.get("researcher")
             if researcher and researcher.findings:
-                sources = self._extract_sources(researcher.findings)
-                raw_findings = self._extract_raw_findings(researcher.findings)
+                sources = self._extract_sources(researcher.findings, rules)
+                raw_findings = self._extract_raw_findings(researcher.findings, rules)
             entry["sources"] = sources
             source_state = ""
             source_coverage = {}
@@ -764,6 +849,9 @@ class ResearchHandler:
                     source_state = ""
                     source_coverage = {}
 
+            citation_warnings = self._citation_warnings(entry, sources, analyzed_urls, navigation_trace, rules)
+            entry["citation_warnings"] = citation_warnings
+
             data = {
                 "query": entry["query"],
                 "status": entry["status"],
@@ -783,7 +871,29 @@ class ResearchHandler:
                 "completed_at": time.time(),
                 # SECURITY: stamp owner so route handlers can filter by user.
                 "owner": entry.get("owner", ""),
+                "settings": entry.get("run_settings") or {},
+                "source_rules": entry.get("source_rules") or {},
+                "report_length": entry.get("report_length") or {},
+                "citation_warnings": citation_warnings,
             }
+            previous = entry.get("previous_version")
+            if previous:
+                from src.research_versions import build_change_summary
+                # Timeout/error saves skip the LLM note but keep the
+                # deterministic evidence diff. Like the citation check it is
+                # a diagnostic: a failure must not stop the version saving.
+                change_summary = entry.get("change_summary") or {}
+                if not change_summary:
+                    try:
+                        change_summary = build_change_summary(previous, sources)
+                    except Exception as e:
+                        logger.warning(f"Research change summary failed for {session_id}: {e}")
+                data.update(
+                    lineage_id=previous.get("lineage_id") or previous.get("id"),
+                    version=int(previous.get("next_version") or 2),
+                    previous_version_id=previous.get("id"),
+                    change_summary=change_summary,
+                )
             path.write_text(json.dumps(data), encoding="utf-8")
             logger.info(f"Research result saved to {path}")
             try:
@@ -793,6 +903,32 @@ class ResearchHandler:
                 logger.debug("research_completed event dispatch failed", exc_info=True)
         except Exception as e:
             logger.error(f"Failed to save research result: {e}")
+
+    @staticmethod
+    def _read_urls(sources: list) -> list:
+        """URLs a report may cite as read: each source and where it redirected."""
+        return [u for s in sources for u in (s.get("url"), s.get("final_url")) if u]
+
+    @staticmethod
+    def _citation_warnings(entry: dict, sources: list, analyzed_urls: list,
+                           navigation_trace: list, rules: SourceRules) -> list:
+        """Flag cited links that were not read into the report's sources.
+
+        A diagnostic only: any failure here (for example a malformed link the
+        model wrote) yields no warnings rather than blocking the save.
+        """
+        try:
+            attempted = [str(u.get("url") or "") for u in analyzed_urls if isinstance(u, dict)]
+            attempted += [str(t.get("url") or "") for t in navigation_trace if isinstance(t, dict)]
+            return verify_citations(
+                entry.get("raw_report") or entry.get("result") or "",
+                read_urls=ResearchHandler._read_urls(sources),
+                attempted_urls=attempted,
+                rules=rules if rules.active else None,
+            )
+        except Exception as e:
+            logger.warning(f"Citation check failed; saving the report without it: {e}")
+            return []
 
     def _get_session_json(self, session_id: str) -> Optional[dict]:
         """Load the saved research JSON for a session, if it exists."""
@@ -881,12 +1017,16 @@ class ResearchHandler:
 
         try:
             from src.visual_report import generate_visual_report
+            from src.research_versions import lineage_id, list_versions
 
             data = json.loads(json_path.read_text(encoding="utf-8"))
             report_md = data.get("raw_report") or data.get("result", "")
             diagnostics = self._research_diagnostics_markdown(data)
             if diagnostics:
                 report_md = f"{report_md.rstrip()}\n{diagnostics}"
+            versions = list_versions(
+                RESEARCH_DATA_DIR, lineage_id(session_id, data), data.get("owner", ""),
+            )
             html_content = generate_visual_report(
                 question=data.get("query", ""),
                 report_markdown=report_md,
@@ -895,6 +1035,10 @@ class ResearchHandler:
                 category=data.get("category"),
                 session_id=session_id,
                 hidden_images=data.get("hidden_images") or [],
+                citation_warnings=data.get("citation_warnings") or [],
+                source_rules=data.get("source_rules") or {},
+                change_summary=data.get("change_summary") or {},
+                versions=versions,
             )
             logger.info(f"Visual report generated for {session_id}")
             return html_content
@@ -995,6 +1139,10 @@ class ResearchHandler:
         extraction_timeout: int = None,
         extraction_concurrency: int = None,
         session_id: str = "",
+        report_length: str = None,
+        source_rules=None,
+        seed_urls: list = None,
+        fresh_fetch: bool = False,
     ) -> str:
         """
         Run iterative deep research using the LLM-in-the-loop DeepResearcher.
@@ -1009,6 +1157,12 @@ class ResearchHandler:
             prior_findings: Previous findings to build on.
             prior_urls: URLs already visited (won't re-fetch).
             max_rounds: Round count; 0 = Auto (preset cap + AI stop decision).
+            report_length: auto/brief/standard/detailed; length wording in
+                the query ("briefly", "in 200 words") is honored too.
+            source_rules: allowed/excluded domains and official-only switch
+                (dict or SourceRules), merged with restrictions in the query.
+            seed_urls: pages to re-read in round 1 (refresh comparisons).
+            fresh_fetch: re-download pages past the web-content cache.
 
         Returns:
             Formatted research report with expandable section and summary
@@ -1031,6 +1185,13 @@ class ResearchHandler:
         if progress_callback:
             progress_callback({"phase": "probing", "model": llm_model})
         await self._probe_endpoint(llm_endpoint, llm_model, llm_headers)
+
+        # Resolved before the engine runs so the failure fallback below can
+        # honor them too (they are pure parsing and do not raise).
+        from src.research_presets import apply_report_length, resolve_report_length, research_round_limits
+        length_plan = resolve_report_length(report_length, query)
+        rules = (source_rules if isinstance(source_rules, SourceRules)
+                 else effective_source_rules(source_rules, query))
 
         try:
             from src.deep_research import DeepResearcher
@@ -1063,13 +1224,15 @@ class ResearchHandler:
             )
 
             profile = await self._resolve_profile(llm_endpoint, llm_model, _max_report_tokens)
-            preset = profile.preset
-            from src.research_presets import research_round_limits
+            preset = apply_report_length(profile.preset, length_plan)
             _max_rounds, _min_rounds, _auto_rounds = research_round_limits(max_rounds, preset)
             _preset_label = preset.label + (" (auto)" if profile.requested == "auto" else "")
+            _length_label = length_plan.describe(preset.report_min_words)
             logger.info(
                 f"Research preset: {_preset_label} — {profile.reason}; "
-                f"rounds {_min_rounds}..{_max_rounds}{' (auto)' if _auto_rounds else ''}"
+                f"rounds {_min_rounds}..{_max_rounds}{' (auto)' if _auto_rounds else ''}; "
+                f"length {_length_label} ({length_plan.source})"
+                + (f"; source rules: {rules.describe()}" if rules.active else "")
             )
 
             researcher = DeepResearcher(
@@ -1102,16 +1265,25 @@ class ResearchHandler:
                 search_provider=search_provider,
                 category=category,
                 session_id=session_id,
+                source_rules=rules if rules.active else None,
+                report_length=length_plan.name,
+                report_length_label=_length_label,
+                report_word_limit=length_plan.word_limit,
+                fresh_fetch=bool(fresh_fetch),
             )
             if _task_entry is not None:
                 _task_entry["researcher"] = researcher
+                _task_entry["source_rules"] = rules.to_dict()
+                _task_entry["report_length"] = {**length_plan.to_dict(), "description": _length_label}
 
             start_time = time.time()
+            research_kwargs = {"seed_urls": list(seed_urls)} if seed_urls else {}
             report = await researcher.research(
                 query,
                 prior_report=prior_report,
                 prior_findings=prior_findings,
                 prior_urls=prior_urls,
+                **research_kwargs,
             )
             elapsed = time.time() - start_time
 
@@ -1132,13 +1304,35 @@ class ResearchHandler:
 
         except Exception as e:
             logger.error(f"DeepResearcher failed: {e}", exc_info=True)
-            return await self._fallback_research(query, llm_endpoint, llm_model, max_time, str(e))
+            gaps = self._fallback_gaps(rules, bool(fresh_fetch))
+            if gaps and _task_entry is not None:
+                # The fallback will refuse to run; a background run then ends
+                # as an error (not a saved report) with a plain-text reason.
+                _task_entry["failure"] = self._constrained_failure_message(str(e), gaps)
+            return await self._fallback_research(
+                query, llm_endpoint, llm_model, max_time, str(e),
+                rules=rules, fresh_fetch=bool(fresh_fetch), word_limit=length_plan.word_limit,
+            )
 
     async def _fallback_research(
         self, query: str, llm_endpoint: str, llm_model: str,
-        max_time: int, primary_error: str,
+        max_time: int, primary_error: str, *,
+        rules: Optional[SourceRules] = None, fresh_fetch: bool = False,
+        word_limit: Optional[int] = None,
     ) -> str:
-        """Fall back to legacy engine, then to basic web search."""
+        """Fall back to legacy engine, then to basic web search.
+
+        Neither fallback can apply source rules or re-read pages past the
+        content cache, so a run that has rules or is a refresh fails closed
+        with an explanation instead of returning unrestricted or stale
+        results. Whatever is returned is cut to the run's word limit.
+        """
+        from src.research_presets import trim_report_to_words
+        unenforceable = self._fallback_gaps(rules, fresh_fetch)
+        if unenforceable:
+            logger.warning("Skipping research fallback; it cannot apply: %s", "; ".join(unenforceable))
+            return trim_report_to_words(
+                self._constrained_failure_report(primary_error, unenforceable), word_limit)
         # Try legacy orchestrator
         if self._legacy_engine:
             try:
@@ -1150,12 +1344,66 @@ class ResearchHandler:
                 )
                 stats = self._get_legacy_stats()
                 elapsed = float(stats.get("Duration", "0").rstrip("s") or 0)
-                return self._format_research_report(query, result, stats, elapsed)
+                return self._format_research_report(
+                    query, trim_report_to_words(result, word_limit), stats, elapsed)
             except Exception as e:
                 logger.error(f"Legacy engine also failed: {e}")
 
         # Fall back to basic web search
-        return self._handle_research_failure(query, primary_error)
+        return trim_report_to_words(self._handle_research_failure(query, primary_error), word_limit)
+
+    @staticmethod
+    def _fallback_gaps(rules: Optional[SourceRules], fresh_fetch: bool) -> list:
+        """Run settings the legacy/basic-search fallbacks cannot apply."""
+        gaps = []
+        if rules is not None and rules.active:
+            gaps.append(f"source rules ({rules.describe()})")
+        if fresh_fetch:
+            gaps.append("refresh, which must re-read pages instead of using cached copies")
+        return gaps
+
+    @staticmethod
+    def _constrained_failure_message(error: str, unenforceable: list) -> str:
+        """Plain-text reason a run failed instead of using the fallback."""
+        return (
+            f"Research failed: {error}. The basic web-search fallback was skipped because it "
+            "cannot apply this run's " + " or ".join(unenforceable)
+            + ", so no unrestricted results are shown. Fix the error or adjust those settings, "
+            "then run the research again."
+        )
+
+    @classmethod
+    def _constrained_failure_report(cls, error: str, unenforceable: list) -> str:
+        """Failure note returned instead of a fallback that would ignore the run's settings."""
+        return "## Research failed\n\n" + cls._constrained_failure_message(error, unenforceable)
+
+    def _entry_sources(self, entry: dict) -> list:
+        """The run's usable sources so far (rule-filtered), without saving."""
+        findings = getattr(entry.get("researcher"), "findings", None) or []
+        if not findings:
+            return []
+        return self._extract_sources(findings, SourceRules.from_dict(entry.get("source_rules")))
+
+    def _failed_attempt(self, entry: dict, previous_version: Optional[dict], reason: str = "") -> str:
+        """Why this run must end as an error instead of a saved report ("" when it is fine).
+
+        A run whose fallback failed closed has no report. A refresh that read
+        no sources is not a new version: saving it would replace the latest
+        good version and its change summary would list every previous source
+        as removed.
+        """
+        detail = str(entry.pop("failure", "") or "")
+        if not detail and previous_version and not self._entry_sources(entry):
+            outcome = re.sub(r"\s+", " ", str(entry.get("raw_report") or "").replace("**", "")).strip()
+            detail = " ".join(part for part in (
+                reason, "No sources could be read.", outcome[:300]) if part)
+        if not detail:
+            return ""
+        if previous_version:
+            from src.research_versions import version_number
+            return (f"Refresh failed, so no new version was saved; version "
+                    f"{version_number(previous_version)} is unchanged. {detail}")
+        return detail
 
     def _get_legacy_stats(self) -> dict:
         """Get statistics from the legacy research engine."""

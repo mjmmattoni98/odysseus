@@ -1,3 +1,5 @@
+import { formatBuildIdentity } from '../buildIdentity.js';
+
 const STORAGE_WIDTH = 'odysseus-settings-sidebar-width';
 const STORAGE_COLLAPSED = 'odysseus-settings-sidebar-collapsed';
 
@@ -124,45 +126,9 @@ export function setSettingsSidebarWidth(modalEl, width, options = {}) {
 /* ── Build provenance ──
    The bottom-left of the panel answers "which build am I actually looking
    at": the version this build registers and the commit its process loaded.
-   Both come from /api/version, which resolves the commit once at import via
-   `git rev-parse HEAD` and reports the string "unknown" when it cannot — a
-   read-only Docker tree with no .git, for instance. */
-const BUILD_COMMIT_SHORT_LEN = 8;
-const BUILD_UNKNOWN = 'unknown';
-const BUILD_COMMIT_SHA = /^[0-9a-f]{7,64}$/i;
-
-function buildField(value) {
-  const text = String(value ?? '').trim();
-  return text && text.toLowerCase() !== BUILD_UNKNOWN ? text : '';
-}
-
-/** Turn an /api/version payload into the two sidebar lines, or null when it
- *  carries nothing worth a footer. */
-export function formatSettingsBuildInfo(payload) {
-  const version = buildField(payload?.version);
-  const build = buildField(payload?.build);
-  const commit = buildField(payload?.source_commit);
-
-  const parts = [];
-  if (version) parts.push(`v${version}`);
-  // The preview harness versions itself separately from the public semver, so
-  // show both — but never the same number twice.
-  if (build && build !== version) parts.push(`build ${build}`);
-
-  // An ODYSSEUS_SOURCE_COMMIT override need not be a sha; leave those intact
-  // and let the CSS ellipsis deal with the width.
-  const commitLabel = BUILD_COMMIT_SHA.test(commit)
-    ? commit.slice(0, BUILD_COMMIT_SHORT_LEN).toLowerCase()
-    : commit;
-
-  if (!parts.length && !commitLabel) return null;
-
-  return {
-    versionLabel: parts.join(' \u00b7 '),
-    commitLabel,
-    commitTitle: commit,
-  };
-}
+   Both come from /api/version and are formatted by buildIdentity.js, the same
+   formatter the login footer uses, so the two pages always agree. The commit
+   gets its own line here because the sidebar is narrow. */
 
 function paintSettingsBuildInfo(modalEl, info) {
   const host = modalEl?.querySelector('#settings-sidebar-build');
@@ -182,6 +148,8 @@ function paintSettingsBuildInfo(modalEl, info) {
     // The short hash is what fits; keep the full one reachable on hover.
     if (info.commitTitle) commitEl.title = info.commitTitle;
   }
+  // The one-line form, exactly as the login footer shows it.
+  host.title = info.label;
 
   host.hidden = false;
 }
@@ -190,7 +158,7 @@ async function loadSettingsBuildInfo(modalEl) {
   try {
     const res = await fetch('/api/version', { credentials: 'same-origin' });
     if (!res.ok) return;
-    paintSettingsBuildInfo(modalEl, formatSettingsBuildInfo(await res.json()));
+    paintSettingsBuildInfo(modalEl, formatBuildIdentity(await res.json()));
   } catch {
     // Provenance is informational: a failed probe leaves the footer hidden
     // rather than putting an error in the middle of the settings nav.

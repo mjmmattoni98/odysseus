@@ -1484,3 +1484,88 @@ async def run_ssh_command_async(
         await proc.communicate()
         raise
     return proc.returncode or 0, stdout, stderr
+
+
+# ── ollama.com library cards ──
+
+# A model tag's size as ollama.com prints it on a card chip: lowercase
+# parameter counts like "0.5b", "8x7b", "270m" (also "e2b"-style effective
+# sizes). Pull/download counts are rendered uppercase ("3.7M", "120K") and
+# disk sizes as "4.7GB"; neither is a pullable `<name>:<size>` tag.
+_OLLAMA_SIZE_TAG_RE = re.compile(r"e?\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?)?[bm]")
+_OLLAMA_CAPABILITY_CHIPS = frozenset({"vision", "tools", "thinking", "embedding", "audio", "cloud"})
+# Markers of a counter (downloads / pulls / tag count / last-updated) — any
+# text inside such an element, or labelled by the following text, is a count.
+_OLLAMA_COUNT_WORDS = ("download", "pull", "tag", "updated")
+_HTML_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr",
+})
+
+
+def parse_ollama_library_card(card_html: str) -> dict:
+    """Extract ``{"sizes", "capabilities"}`` from one ollama.com model card.
+
+    Sizes are only lowercase parameter-tag chips that sit outside counter
+    elements, so "3.7M downloads" / "120K Pulls" / "5 Tags" / "4.7GB" never
+    become fake ``<name>:<size>`` tags (which also skewed the memory-fit
+    estimate built from them).
+    """
+    from html.parser import HTMLParser
+
+    texts: list[tuple[str, bool]] = []
+
+    class _CardParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.stack: list[tuple[str, bool]] = []
+
+        def _is_counter(self, attrs) -> bool:
+            for key, value in attrs:
+                key = (key or "").lower()
+                if key.startswith("x-test-") and any(w in key for w in _OLLAMA_COUNT_WORDS):
+                    return True
+                if key in ("title", "aria-label") and any(w in (value or "").lower() for w in _OLLAMA_COUNT_WORDS):
+                    return True
+            return False
+
+        def handle_starttag(self, tag, attrs):
+            if tag in _HTML_VOID_TAGS:
+                return
+            inside_counter = bool(self.stack and self.stack[-1][1])
+            self.stack.append((tag, inside_counter or self._is_counter(attrs)))
+
+        def handle_endtag(self, tag):
+            for i in range(len(self.stack) - 1, -1, -1):
+                if self.stack[i][0] == tag:
+                    del self.stack[i:]
+                    break
+
+        def handle_data(self, data):
+            text = data.strip()
+            if text:
+                texts.append((text, bool(self.stack and self.stack[-1][1])))
+
+    parser = _CardParser()
+    try:
+        parser.feed(card_html or "")
+        parser.close()
+    except Exception:
+        return {"sizes": [], "capabilities": []}
+
+    sizes: list[str] = []
+    capabilities: list[str] = []
+    for i, (text, in_counter) in enumerate(texts):
+        if in_counter:
+            continue
+        if text in _OLLAMA_CAPABILITY_CHIPS:
+            if text not in capabilities:
+                capabilities.append(text)
+            continue
+        if not _OLLAMA_SIZE_TAG_RE.fullmatch(text):
+            continue
+        following = texts[i + 1][0].lower() if i + 1 < len(texts) else ""
+        if any(following.startswith(w) for w in _OLLAMA_COUNT_WORDS):
+            continue  # e.g. older markup: <span>12m</span> <span>Pulls</span>
+        if text not in sizes:
+            sizes.append(text)
+    return {"sizes": sizes, "capabilities": capabilities}

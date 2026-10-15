@@ -30,6 +30,7 @@ const REAL_MODULES = new Set([
   path.join(JS, 'settings/peek.js'),
   path.join(JS, 'settings/oauthReturn.js'),
   path.join(JS, 'searchProviderIcons.js'),
+  path.join(JS, 'buildIdentity.js'),
 ]);
 
 const realModulesLoaded = new Set();

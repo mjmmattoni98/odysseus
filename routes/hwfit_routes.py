@@ -479,6 +479,11 @@ def setup_hwfit_routes():
         results = rank_image_models(system, search=search or None, sort=sort)
         if official_only:
             results = [m for m in results if _is_official_model(m)]
+        from services.hwfit.facets import classify_model_facets
+        results = [
+            {**m, **classify_model_facets({**m, "name": m.get("id") or m.get("name"), "pipeline_tag": m.get("pipeline_tag") or "text-to-image"})}
+            for m in results
+        ]
         return {"system": system, "models": results}
 
     return router

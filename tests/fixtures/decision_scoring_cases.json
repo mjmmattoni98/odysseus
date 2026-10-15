@@ -1,0 +1,192 @@
+{
+  "_comment": "Shared by tests/test_decision_notebook.py (src/decisions.py) and tests/decisionScoring.test.mjs (static/js/decisionScoring.js) so the server and the live editor score identically.",
+  "scoring": [
+    {
+      "name": "weights are normalized to shares",
+      "body": {
+        "constraints": [],
+        "criteria": [{"id": "cost", "name": "Cost", "weight": 3}, {"id": "speed", "name": "Speed", "weight": 1}],
+        "options": [
+          {"id": "a", "name": "A", "scores": {"cost": 8, "speed": 4}, "fails": []},
+          {"id": "b", "name": "B", "scores": {"cost": 5, "speed": 10}, "fails": []}
+        ]
+      },
+      "expect": {"weights": {"cost": 0.75, "speed": 0.25}, "totals": {"a": 7, "b": 6.25}, "ranking": ["a", "b"], "leader_id": "a", "tied": false}
+    },
+    {
+      "name": "a must-have violation ranks last and cannot lead",
+      "body": {
+        "constraints": [{"id": "c1", "text": "Under budget", "must_have": true}, {"id": "c2", "text": "Nice colour", "must_have": false}],
+        "criteria": [{"id": "q", "name": "Quality", "weight": 1}, {"id": "v", "name": "Value", "weight": 1}],
+        "options": [
+          {"id": "a", "name": "A", "scores": {"q": 9, "v": 9}, "fails": ["c1"]},
+          {"id": "b", "name": "B", "scores": {"q": 6, "v": 6}, "fails": ["c2"]}
+        ]
+      },
+      "expect": {"weights": {"q": 0.5, "v": 0.5}, "totals": {"a": 9, "b": 6}, "ranking": ["b", "a"], "leader_id": "b", "tied": false,
+                 "violations": {"a": ["c1"], "b": []}}
+    },
+    {
+      "name": "all-zero weights count equally",
+      "body": {
+        "constraints": [],
+        "criteria": [{"id": "x", "name": "X", "weight": 0}, {"id": "y", "name": "Y", "weight": 0}],
+        "options": [
+          {"id": "a", "name": "A", "scores": {"x": 10, "y": 0}, "fails": []},
+          {"id": "b", "name": "B", "scores": {"x": 4, "y": 4}, "fails": []}
+        ]
+      },
+      "expect": {"weights": {"x": 0.5, "y": 0.5}, "totals": {"a": 5, "b": 4}, "ranking": ["a", "b"], "leader_id": "a", "tied": false}
+    },
+    {
+      "name": "unscored cells count as zero and ties keep input order",
+      "body": {
+        "constraints": [],
+        "criteria": [{"id": "k1", "name": "K1", "weight": 1}, {"id": "k2", "name": "K2", "weight": 2}],
+        "options": [
+          {"id": "a", "name": "A", "scores": {"k1": 6}, "fails": []},
+          {"id": "b", "name": "B", "scores": {"k2": 3}, "fails": []}
+        ]
+      },
+      "expect": {"weights": {"k1": 0.3333, "k2": 0.6667}, "totals": {"a": 2, "b": 2}, "ranking": ["a", "b"], "leader_id": "a", "tied": true,
+                 "unscored": {"a": 1, "b": 1}}
+    },
+    {
+      "name": "no criteria means no leader",
+      "body": {
+        "constraints": [],
+        "criteria": [],
+        "options": [{"id": "a", "name": "A", "scores": {}, "fails": []}, {"id": "b", "name": "B", "scores": {}, "fails": []}]
+      },
+      "expect": {"weights": {}, "totals": {"a": 0, "b": 0}, "ranking": ["a", "b"], "leader_id": null, "tied": false}
+    },
+    {
+      "name": "every option failing a must-have leaves no leader",
+      "body": {
+        "constraints": [{"id": "m", "text": "Legal", "must_have": true}],
+        "criteria": [{"id": "q", "name": "Quality", "weight": 1}],
+        "options": [{"id": "a", "name": "A", "scores": {"q": 7}, "fails": ["m"]}, {"id": "b", "name": "B", "scores": {"q": 3}, "fails": ["m"]}]
+      },
+      "expect": {"weights": {"q": 1}, "totals": {"a": 7, "b": 3}, "ranking": ["a", "b"], "leader_id": null, "tied": false}
+    },
+    {
+      "name": "ids named like Object.prototype members are ordinary ids",
+      "body": {
+        "constraints": [{"id": "constructor", "text": "Legal", "must_have": true}, {"id": "__proto__", "text": "Nice colour", "must_have": false}],
+        "criteria": [{"id": "__proto__", "name": "Proto", "weight": 3}, {"id": "constructor", "name": "Ctor", "weight": 1}],
+        "options": [
+          {"id": "__proto__", "name": "A", "scores": {"__proto__": 8, "constructor": 4}, "fails": ["__proto__"]},
+          {"id": "constructor", "name": "B", "scores": {"__proto__": 5}, "fails": []},
+          {"id": "hasOwnProperty", "name": "C", "scores": {"__proto__": 10, "constructor": 10}, "fails": ["constructor"]}
+        ]
+      },
+      "expect": {"weights": {"__proto__": 0.75, "constructor": 0.25}, "totals": {"__proto__": 7, "constructor": 3.75, "hasOwnProperty": 10},
+                 "ranking": ["__proto__", "constructor", "hasOwnProperty"], "leader_id": "__proto__", "tied": false,
+                 "violations": {"__proto__": [], "constructor": [], "hasOwnProperty": ["constructor"]},
+                 "unscored": {"__proto__": 0, "constructor": 1, "hasOwnProperty": 0}}
+    }
+  ],
+  "comparison": [
+    {
+      "name": "re-weighting flips the leader but the original weights still pick the choice",
+      "snapshot": {
+        "chosen_option_id": "a",
+        "chosen_option_name": "A",
+        "decided_at": "2026-10-01T09:00:00Z",
+        "criteria": [{"id": "cost", "name": "Cost", "weight": 3, "share": 0.75}, {"id": "speed", "name": "Speed", "weight": 1, "share": 0.25}],
+        "options": [
+          {"id": "a", "name": "A", "scores": {"cost": 8, "speed": 4}, "fails": [], "total": 7, "rank": 1},
+          {"id": "b", "name": "B", "scores": {"cost": 5, "speed": 10}, "fails": [], "total": 6.25, "rank": 2}
+        ],
+        "ranking": ["a", "b"],
+        "leader_id": "a"
+      },
+      "body": {
+        "constraints": [],
+        "criteria": [{"id": "cost", "name": "Cost", "weight": 3}, {"id": "speed", "name": "Speed", "weight": 3}],
+        "options": [
+          {"id": "a", "name": "A", "scores": {"cost": 8, "speed": 4}, "fails": []},
+          {"id": "b", "name": "B", "scores": {"cost": 5, "speed": 10}, "fails": []}
+        ]
+      },
+      "expect": {
+        "changed": true,
+        "weight_changes": [{"criterion": "Cost", "before": 0.75, "after": 0.5}, {"criterion": "Speed", "before": 0.25, "after": 0.5}],
+        "score_changes": [],
+        "criteria_added": [], "criteria_removed": [], "options_added": [], "options_removed": [],
+        "ranking_before": ["A", "B"], "ranking_after": ["B", "A"], "ranking_changed": true,
+        "leader_before": "A", "leader_after": "B",
+        "chosen_still_wins": false, "chosen_removed": false,
+        "leader_under_original_weights": "A", "chosen_wins_under_original_weights": true
+      }
+    },
+    {
+      "name": "a deleted criterion is replayed from the recorded score; renames are not removals",
+      "snapshot": {
+        "chosen_option_id": "b",
+        "chosen_option_name": "B",
+        "decided_at": "2026-10-01T09:00:00Z",
+        "criteria": [{"id": "cost", "name": "Cost", "weight": 1, "share": 0.5}, {"id": "fun", "name": "Fun", "weight": 1, "share": 0.5}],
+        "options": [
+          {"id": "a", "name": "A", "scores": {"cost": 6, "fun": 2}, "fails": []},
+          {"id": "b", "name": "B", "scores": {"cost": 4, "fun": 9}, "fails": []}
+        ],
+        "ranking": ["b", "a"],
+        "leader_id": "b"
+      },
+      "body": {
+        "constraints": [],
+        "criteria": [{"id": "cost", "name": "Price", "weight": 1}],
+        "options": [
+          {"id": "a", "name": "A", "scores": {"cost": 6}, "fails": []},
+          {"id": "b", "name": "Option B", "scores": {"cost": 5}, "fails": []},
+          {"id": "c", "name": "C", "scores": {"cost": 9}, "fails": []}
+        ]
+      },
+      "expect": {
+        "changed": true,
+        "weight_changes": [{"criterion": "Price", "before": 0.5, "after": 1}],
+        "score_changes": [{"option": "Option B", "criterion": "Price", "before": 4, "after": 5}],
+        "criteria_added": [], "criteria_removed": ["Fun"], "options_added": ["C"], "options_removed": [],
+        "ranking_before": ["B", "A"], "ranking_after": ["C", "A", "Option B"], "ranking_changed": true,
+        "leader_before": "B", "leader_after": "C",
+        "chosen_still_wins": false, "chosen_removed": false,
+        "leader_under_original_weights": "Option B", "chosen_wins_under_original_weights": true
+      }
+    },
+    {
+      "name": "ids named like Object.prototype members compare by id",
+      "snapshot": {
+        "chosen_option_id": "constructor",
+        "chosen_option_name": "B",
+        "decided_at": "2026-10-01T09:00:00Z",
+        "criteria": [{"id": "__proto__", "name": "Proto", "weight": 1, "share": 0.5}, {"id": "constructor", "name": "Ctor", "weight": 1, "share": 0.5}],
+        "options": [
+          {"id": "__proto__", "name": "A", "scores": {"__proto__": 6, "constructor": 2}, "fails": []},
+          {"id": "constructor", "name": "B", "scores": {"__proto__": 4, "constructor": 9}, "fails": []}
+        ],
+        "ranking": ["constructor", "__proto__"],
+        "leader_id": "constructor"
+      },
+      "body": {
+        "constraints": [],
+        "criteria": [{"id": "__proto__", "name": "Proto", "weight": 1}],
+        "options": [
+          {"id": "__proto__", "name": "A", "scores": {"__proto__": 6}, "fails": []},
+          {"id": "constructor", "name": "B", "scores": {"__proto__": 5}, "fails": []},
+          {"id": "toString", "name": "C", "scores": {}, "fails": []}
+        ]
+      },
+      "expect": {
+        "changed": true,
+        "weight_changes": [{"criterion": "Proto", "before": 0.5, "after": 1}],
+        "score_changes": [{"option": "B", "criterion": "Proto", "before": 4, "after": 5}],
+        "criteria_added": [], "criteria_removed": ["Ctor"], "options_added": ["C"], "options_removed": [],
+        "ranking_before": ["B", "A"], "ranking_after": ["A", "B", "C"], "ranking_changed": true,
+        "leader_before": "B", "leader_after": "A",
+        "chosen_still_wins": false, "chosen_removed": false,
+        "leader_under_original_weights": "B", "chosen_wins_under_original_weights": true
+      }
+    }
+  ]
+}

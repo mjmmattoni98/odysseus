@@ -232,9 +232,9 @@ class TestRegistrationHelpers:
         caps = {"all-minilm:l6-v2": frozenset({"embedding"}), "qwen3.8:27b": frozenset({"completion", "vision"})}
         monkeypatch.setattr(oc, "capability_tokens", lambda url, model, **kw: caps.get(model))
         models = ["qwen3.8:27b", "all-minilm:l6-v2", "unknown:1b"]
-        assert mr._drop_ollama_embedding_models("http://localhost:11434", models) == ["qwen3.8:27b", "unknown:1b"]
+        assert mr._drop_ollama_non_chat_models("http://localhost:11434", models) == ["qwen3.8:27b", "unknown:1b"]
         # Non-Ollama lists are untouched.
-        assert mr._drop_ollama_embedding_models("http://localhost:1234/v1", models) == models
+        assert mr._drop_ollama_non_chat_models("http://localhost:1234/v1", models) == models
 
 
 # ── Item 9: probes don't load models ────────────────────────────────────

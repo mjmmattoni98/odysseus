@@ -49,6 +49,12 @@ from dotenv import load_dotenv
 # utf-8-sig reads plain UTF-8 (no BOM) identically, so this is safe everywhere.
 load_dotenv(encoding="utf-8-sig")
 
+# A restore confirmed in Settings > System > Backups is applied here, before
+# anything imports core.database: that import opens the SQLite database, and
+# swapping the file under an open engine corrupts it. No-op without one.
+from src.backup_archive import apply_pending_restore
+apply_pending_restore()
+
 import asyncio
 import logging
 import secrets
@@ -281,6 +287,14 @@ if AUTH_ENABLED:
         "/login",
     }
     AUTH_EXEMPT_PREFIXES = ["/static"]
+    # Public reads exempt for one method only, so a future write handler on the
+    # same path stays protected. /api/auth/policy returns the password minimum,
+    # reserved usernames, session lifetime, and signup_enabled (already public
+    # via /api/auth/status); the logged-out login page needs it for setup and
+    # signup validation.
+    AUTH_EXEMPT_METHOD_EXACT = {
+        ("GET", "/api/auth/policy"),
+    }
     # Dynamic paths whose own handler proves identity via a path-embedded
     # secret instead of the session/bearer auth. The route handler at
     # routes/task_routes.py validates the per-task `webhook_token` itself
@@ -294,8 +308,10 @@ if AUTH_ENABLED:
         _re.compile(r"^/api/tasks/[^/]+/webhook/[^/]+/?$"),
     ]
 
-    def _is_auth_exempt(path: str) -> bool:
+    def _is_auth_exempt(path: str, method: str = "") -> bool:
         if path in AUTH_EXEMPT_EXACT:
+            return True
+        if (method.upper(), path) in AUTH_EXEMPT_METHOD_EXACT:
             return True
         if any(path_is_route_or_child(path, p) for p in AUTH_EXEMPT_PREFIXES):
             return True
@@ -379,7 +395,7 @@ if AUTH_ENABLED:
             # header; never a credentialed request).
             if is_cors_preflight(request.method, request.headers):
                 return await call_next(request)
-            if _is_auth_exempt(path):
+            if _is_auth_exempt(path, request.method):
                 return await call_next(request)
             # In-process internal-tool token bypass. Used by the agent
             # tool layer when it HTTP-loopbacks to admin-gated routes
@@ -870,6 +886,10 @@ logger.info("Webhook & API token routes initialized")
 from routes.note.note_routes import setup_note_routes
 app.include_router(setup_note_routes(task_scheduler, upload_handler=upload_handler))
 
+# Decision notebook (weighted options, recorded choices, revisit dates)
+from routes.decision.decision_routes import setup_decision_routes
+app.include_router(setup_decision_routes())
+
 # Email
 from routes.email_routes import setup_email_routes
 email_router = setup_email_routes()
@@ -1321,6 +1341,9 @@ async def _startup_event():
     _tasks_inprocess = os.environ.get("ODYSSEUS_INPROCESS_TASKS", "1").strip().lower()
     if _tasks_inprocess not in ("0", "false", "no", "off", ""):
         await task_scheduler.start()
+        # Scheduled backups (Settings > System > Backups) follow the same gate.
+        from src.backup_service import backup_scheduler_loop
+        _startup_tasks.append(asyncio.create_task(backup_scheduler_loop()))
     else:
         logger.info(
             "In-process task scheduler disabled (ODYSSEUS_INPROCESS_TASKS=0); "

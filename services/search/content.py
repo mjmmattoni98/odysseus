@@ -282,26 +282,47 @@ def _empty_result(url: str, error: str = "") -> dict:
     }
 
 
+def _response_fields(response, url: str) -> dict:
+    """Size and redirect metadata carried by every fetched result.
+
+    ``final_url`` is where redirects ended, so callers that restrict sources
+    (Deep Research) can check the page the content actually came from rather
+    than the URL they asked for. getattr keeps plain httpx.Response stand-ins
+    (tests) working without the cap fields.
+    """
+    return {
+        "truncated": getattr(response, "truncated", False),
+        "fetched_bytes": len(response.content),
+        "total_bytes": getattr(response, "declared_bytes", None),
+        "final_url": str(getattr(response, "url", None) or url),
+    }
+
+
 # ----------------------------------------------------------------------
 # Main content fetcher
 # ----------------------------------------------------------------------
 def fetch_webpage_content(url: str, timeout: int = 5, retry_attempt: int = 0,
-                          max_bytes: int = None) -> dict:
+                          max_bytes: int = None, *, bypass_cache: bool = False) -> dict:
     """Fetch and extract meaningful content from a webpage with caching.
 
     ``max_bytes`` raises the download budget per call (clamped to the hard
     cap); the default is the soft cap. When the body is cut short the result
     carries ``truncated``/``fetched_bytes``/``total_bytes`` so callers can
     tell the model the content is partial (#3812).
+
+    ``bypass_cache`` skips a cached copy and re-downloads the page (a Deep
+    Research refresh compares current page text with the previous run); the
+    fresh result still replaces the cached one.
     """
     effective_cap = min(max_bytes or WEB_FETCH_SOFT_MAX_BYTES, WEB_FETCH_HARD_MAX_BYTES)
     # The cap is part of the cache identity: a truncated soft-cap fetch must
-    # not be served to a later full-budget request for the same URL.
-    cache_key = generate_cache_key(f"{url}#cap={effective_cap}#extract=semantic-links-v7")
+    # not be served to a later full-budget request for the same URL. v8 adds
+    # ``final_url``; older entries lack it and must not be served.
+    cache_key = generate_cache_key(f"{url}#cap={effective_cap}#extract=semantic-links-v8")
     cache_file = CONTENT_CACHE_DIR / f"{cache_key}.cache"
 
     # Check cache
-    if cache_file.exists():
+    if not bypass_cache and cache_file.exists():
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 cached_data = json.load(f)
@@ -345,13 +366,8 @@ def fetch_webpage_content(url: str, timeout: int = 5, retry_attempt: int = 0,
         error_logger.error(str(e))
         return _empty_result(url, str(e))
 
-    # Size bookkeeping shared by every content branch below. getattr keeps
-    # plain httpx.Response stand-ins (tests) working without the cap fields.
-    _size_fields = {
-        "truncated": getattr(response, "truncated", False),
-        "fetched_bytes": len(response.content),
-        "total_bytes": getattr(response, "declared_bytes", None),
-    }
+    # Size and redirect bookkeeping shared by every content branch below.
+    _size_fields = _response_fields(response, url)
 
     # PDF handling
     content_type = response.headers.get("Content-Type", "").lower()
@@ -371,11 +387,7 @@ def fetch_webpage_content(url: str, timeout: int = 5, retry_attempt: int = 0,
                     timeout=timeout,
                     max_bytes=WEB_FETCH_HARD_MAX_BYTES,
                 )
-                _size_fields = {
-                    "truncated": getattr(response, "truncated", False),
-                    "fetched_bytes": len(response.content),
-                    "total_bytes": getattr(response, "declared_bytes", None),
-                }
+                _size_fields = _response_fields(response, url)
                 effective_cap = WEB_FETCH_HARD_MAX_BYTES
             except BodyTooLargeError as e:
                 error_logger.warning(f"Refused oversized PDF body for {url}: {e}")

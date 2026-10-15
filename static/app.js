@@ -10,7 +10,7 @@ import modelsModule from './js/models.js';
 import ragModule from './js/rag.js';
 import presetsModule from './js/presets.js?v=20260908personaname1';
 import searchModule from './js/search.js';
-import chatModule from './js/chat.js?v=20261011forksync1';
+import chatModule from './js/chat.js?v=20261014audit1';
 import compareModule from './js/compare/index.js?v=20260909mobilepaneaddscroll1';
 import documentModule from './js/document.js?v=20260916docctx2';
 import searchChatModule from './js/search-chat.js';
@@ -22,7 +22,7 @@ import {
   settleSessionHydration
 } from './js/startupShell.js';
 import markdownModule from './js/markdown.js';
-import chatRenderer from './js/chatRenderer.js?v=20261011forksync1';
+import chatRenderer from './js/chatRenderer.js?v=20261014audit1';
 // Keep this specifier identical to every consumer (especially chat.js).
 // Different query strings create separate ES-module instances with separate
 // current-session state, so the picker can display one model while chat sends
@@ -37,8 +37,8 @@ import { UI_VIS_DEFAULT_OFF, resolveVisibility } from './js/ui_visibility.js?v=2
 import tasksModule from './js/tasks.js?v=20260914taskmodel1';
 import calendarModule from './js/calendar.js?v=20260914emailsource11';
 import notesModule from './js/notes.js?v=20260911notesselectioncancel1';
-import adminModule from './js/admin.js?v=20261011forksync1';
-import settingsModule from './js/settings.js?v=20261011forksync1';
+import adminModule from './js/admin.js?v=20261014audit1';
+import settingsModule from './js/settings.js?v=20261014audit1';
 // Eagerly bind unified minimize/restore behavior across all tool modals.
 import './js/modalManager.js';
 import './js/chipScroll.js?v=20260903calendarchips1';
@@ -53,13 +53,14 @@ import themeModule from './js/theme.js?v=20260911organsrain1';
 // unversioned so this can't recur.
 import cookbookModule from './js/cookbook.js';
 import groupModule from './js/group.js';
-import * as researchPanelModule from './js/research/panel.js?v=20260913researchrailerrors1';
+import * as researchPanelModule from './js/research/panel.js?v=20261012researchversions1';
 import ttsModule from './js/tts-ai.js';
 import spinnerModule from './js/spinner.js';
 import { initKeyboardShortcuts } from './js/keyboard-shortcuts.js?v=20260829chatstyle12';
 import { getSettings } from './js/appConfig.js';
 import { initSidebarLayout, syncRailSide } from './js/sidebar-layout.js?v=20260910sidebarbounce1';
-import { initSectionCollapse, initSectionDrag } from './js/section-management.js';
+import { initSectionCollapse, initSectionDrag, initToolPins } from './js/section-management.js';
+import { setActionLabel } from './js/a11yLabel.js';
 
 const API_BASE = window.location.origin;
 window.themeModule = themeModule;
@@ -4007,10 +4008,10 @@ function startOdysseusApp() {
     sendBtn.classList.remove('mic-mode', 'newchat-mode', 'newchat-expanded', 'anim-spin', 'anim-launch', 'anim-land');
     if (hasText) {
       sendBtn.innerHTML = _sendIcon;
-      sendBtn.title = 'Queue message';
+      setActionLabel(sendBtn, 'Queue message');
     } else {
       sendBtn.innerHTML = _stopIcon;
-      sendBtn.title = 'Stop generation';
+      setActionLabel(sendBtn, 'Stop generation');
     }
     return true;
   }
@@ -4030,7 +4031,7 @@ function startOdysseusApp() {
     if (!hasText && !hasFiles && _isSttEnabled()) {
       clearTimeout(sendBtn._collapseTimer);
       sendBtn.innerHTML = _micIcon;
-      sendBtn.title = 'Record voice';
+      setActionLabel(sendBtn, 'Record voice');
       newMode = 'mic';
       sendBtn.classList.add('mic-mode');
       sendBtn.classList.remove('newchat-mode', 'newchat-expanded');
@@ -4039,7 +4040,7 @@ function startOdysseusApp() {
       // Group chat: always show send button, never newchat mode
       if (groupModule && groupModule.isActive()) {
         sendBtn.innerHTML = _sendIcon;
-        sendBtn.title = 'Send to group';
+        setActionLabel(sendBtn, 'Send to group');
         newMode = 'idle';
         sendBtn.classList.remove('mic-mode', 'newchat-mode', 'newchat-expanded');
       } else {
@@ -4048,14 +4049,14 @@ function startOdysseusApp() {
       if (isEmptySession) {
         // Already on new chat — show arrow in muted style (ready to type)
         sendBtn.innerHTML = _sendIcon;
-        sendBtn.title = 'Send message';
+        setActionLabel(sendBtn, 'Send message');
         newMode = 'idle';
         sendBtn.classList.add('newchat-mode'); // muted gray style
         sendBtn.classList.remove('mic-mode', 'newchat-expanded');
         clearTimeout(sendBtn._expandTimer);
       } else {
         sendBtn.innerHTML = _newChatIcon + '<span class="send-btn-label">+ New</span>';
-        sendBtn.title = 'New chat';
+        setActionLabel(sendBtn, 'New chat');
         newMode = 'newchat';
         sendBtn.classList.add('newchat-mode');
         sendBtn.classList.remove('mic-mode');
@@ -4074,18 +4075,20 @@ function startOdysseusApp() {
       if (wasExpanded || wasNewchat) {
         // Collapse pill if expanded, then spin arrow in (same as + spin-in)
         if (wasExpanded) sendBtn.classList.remove('newchat-expanded');
+        // Only the icon swap waits for the animation; a click already sends,
+        // so the accessible name must not keep announcing "New chat".
+        setActionLabel(sendBtn, 'Send message');
         const delay = wasExpanded ? 300 : 0;
         setTimeout(() => {
           if (sendBtn.dataset.mode !== 'send') return;
           sendBtn.innerHTML = _sendIcon;
-          sendBtn.title = 'Send message';
           sendBtn.classList.remove('mic-mode', 'newchat-mode', 'anim-spin-swap');
           sendBtn.classList.add('anim-spin');
           sendBtn.addEventListener('animationend', () => sendBtn.classList.remove('anim-spin'), { once: true });
         }, delay);
       } else {
         sendBtn.innerHTML = _sendIcon;
-        sendBtn.title = 'Send message';
+        setActionLabel(sendBtn, 'Send message');
         sendBtn.classList.remove('mic-mode', 'newchat-mode', 'newchat-expanded', 'anim-spin', 'anim-launch', 'anim-land');
       }
     }
@@ -4150,7 +4153,7 @@ function startOdysseusApp() {
       // If input is empty and STT is enabled, start recording
       if (!hasText && !hasFiles && _isSttEnabled()) {
         sendBtn.innerHTML = _stopIcon;
-        sendBtn.title = 'Stop recording';
+        setActionLabel(sendBtn, 'Stop recording');
         sendBtn.dataset.mode = 'recording';
         sendBtn.classList.add('recording');
         voiceRecorderModule.startRecording(
@@ -4616,6 +4619,8 @@ function startOdysseusApp() {
   // Section collapse/expand + drag reorder (extracted to js/section-management.js)
   initSectionCollapse(Storage);
   initSectionDrag(Storage, loadUIVis);
+  // Everyday tools pinned first; the rest behind "More tools" (sidebar + rail)
+  initToolPins(Storage);
   
   // Handle drag over and out for individual sections
   const sections = document.querySelectorAll('.section[draggable="true"]');

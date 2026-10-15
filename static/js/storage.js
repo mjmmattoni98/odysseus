@@ -22,6 +22,7 @@ export const KEYS = {
   RAG_ACTIVE: 'odysseus-rag-active',
   MCP_ACTIVE: 'odysseus-mcp-active',
   SECTION_ORDER: 'sidebar-section-order',
+  TOOL_PINS: 'odysseus-tool-pins',
   ADMIN_LAST_TAB: 'admin-last-tab',
   DENSITY: 'odysseus-density',
   UI_SCALE: 'odysseus-ui-scale',

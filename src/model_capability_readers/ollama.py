@@ -53,7 +53,10 @@ def _family_from_ollama_capabilities(values: Any) -> str:
         return mc.FAMILY_EMBEDDING
     if "embedding" in tokens or "embeddings" in tokens:
         return mc.FAMILY_EMBEDDING
-    if tokens.intersection({"completion", "completions", "chat", "thinking", "reasoning", "tools", "tool", "vision"}):
+    # Ollama rejects chat for any model whose report lacks ``completion``,
+    # even when it lists ``vision`` or ``tools`` (e.g. a classifier reporting
+    # ``["decision", "vision"]``), so only these tokens make it a chat model.
+    if tokens.intersection({"completion", "completions", "chat"}):
         return mc.FAMILY_CHAT
     return mc.FAMILY_UNKNOWN
 

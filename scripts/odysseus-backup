@@ -180,9 +180,17 @@ def cmd_verify(args):
     }, args)
 
 
+# Archives written by Settings > System > Backups (src/backup_archive.py) carry
+# a root-level manifest.json next to data/. It is checked here like any other
+# entry but never extracted, so those archives restore with this CLI too.
+_MANIFEST_MEMBER = "manifest.json"
+
+
 def _validate_restore_members(members):
     """Reject archive entries that can escape data/ during restore."""
     for m in members:
+        if m.name == _MANIFEST_MEMBER and m.isreg():
+            continue
         rel = PurePosixPath(m.name)
         if rel.is_absolute() or ".." in rel.parts:
             fail(f"refusing tarball with absolute/parent path: {m.name!r}")
@@ -197,6 +205,8 @@ def _validate_restore_members(members):
 def _extract_restore_members(tar, members, root: Path) -> None:
     """Extract only regular files/directories after validation."""
     for m in members:
+        if m.name == _MANIFEST_MEMBER:
+            continue
         target = root.joinpath(*PurePosixPath(m.name).parts)
         if m.isdir():
             target.mkdir(parents=True, exist_ok=True)

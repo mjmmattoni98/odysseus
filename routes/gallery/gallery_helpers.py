@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from core.database import GalleryImage
 from src.auth_helpers import _auth_disabled
+from src.user_time import utc_isoformat
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +94,23 @@ def _extract_exif(content: bytes) -> dict:
 
 # ---- Helpers ----
 
+def _image_url(filename: str, file_hash: Optional[str] = None) -> str:
+    """URL for a gallery file, versioned by its content hash.
+
+    Rotate and replace overwrite the file under the same name, but the serve
+    route sends ``immutable`` cache headers. The ``v`` query, which the route
+    ignores, gives each content version its own browser cache entry. Rows
+    without a hash have never been edited in place, so their bytes are fixed.
+    """
+    url = f"/api/generated-image/{filename}"
+    return f"{url}?v={file_hash[:12]}" if file_hash else url
+
+
 def _image_to_dict(img: GalleryImage, session_name: str = None) -> Dict[str, Any]:
     return {
         "id": img.id,
         "filename": img.filename,
-        "url": f"/api/generated-image/{img.filename}",
+        "url": _image_url(img.filename, img.file_hash),
         "prompt": img.prompt,
         "caption": img.caption or "",
         "model": img.model,
@@ -111,14 +124,16 @@ def _image_to_dict(img: GalleryImage, session_name: str = None) -> Dict[str, Any
         "album_id": img.album_id,
         "is_active": img.is_active,
         "favorite": img.favorite or False,
+        # EXIF capture time is camera wall-clock time with no zone, so it
+        # stays offset-less; created_at/updated_at are stored UTC.
         "taken_at": img.taken_at.isoformat() if img.taken_at else None,
         "camera": f"{img.camera_make or ''} {img.camera_model or ''}".strip() or None,
         "gps": {"lat": img.gps_lat, "lng": img.gps_lng} if img.gps_lat else None,
         "width": img.width,
         "height": img.height,
         "file_size": img.file_size,
-        "created_at": img.created_at.isoformat() if img.created_at else None,
-        "updated_at": img.updated_at.isoformat() if img.updated_at else None,
+        "created_at": utc_isoformat(img.created_at),
+        "updated_at": utc_isoformat(img.updated_at),
     }
 
 

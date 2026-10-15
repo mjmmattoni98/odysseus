@@ -2197,6 +2197,40 @@ class Integration(TimestampMixin, Base):
     enabled = Column(Boolean, default=True)
 
 
+class Decision(TimestampMixin, Base):
+    """A decision notebook entry: options scored against weighted criteria.
+
+    ``body`` is the editable working copy (JSON, shape in src/decisions.py).
+    Recording a choice appends an immutable DecisionSnapshot so the reasoning
+    behind it survives later edits.
+    """
+    __tablename__ = "decisions"
+
+    id         = Column(String, primary_key=True, index=True)
+    owner      = Column(String, nullable=True, index=True)
+    title      = Column(String, default="")
+    status     = Column(String, default="open")    # open | decided | archived
+    body       = Column(Text, nullable=True)
+    chosen_option_id = Column(String, nullable=True)
+    rationale  = Column(Text, nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    revisit_on = Column(String, nullable=True, index=True)  # YYYY-MM-DD
+    # Calendar event created for revisit_on, when the user opted in.
+    revisit_event_uid = Column(String, nullable=True)
+
+
+class DecisionSnapshot(Base):
+    """Append-only record of a decision as it stood when a choice was made."""
+    __tablename__ = "decision_snapshots"
+
+    id          = Column(String, primary_key=True)
+    decision_id = Column(String, ForeignKey("decisions.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner       = Column(String, nullable=True, index=True)
+    seq         = Column(Integer, nullable=False, default=1)
+    payload     = Column(Text, nullable=False)
+    created_at  = Column(DateTime, default=utcnow_naive, nullable=False)
+
+
 
 
 

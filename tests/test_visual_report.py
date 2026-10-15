@@ -62,6 +62,7 @@ def test_visual_report_surfaces_evidence_profile_and_source_quality():
         "sources": 2,
         "domains": 2,
         "primary": 1,
+        "official": 0,
         "browser": 1,
         "average_score": 80,
         "rated": 2,

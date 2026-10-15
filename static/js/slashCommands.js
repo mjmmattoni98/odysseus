@@ -13,12 +13,12 @@ import Storage from './storage.js';
 import uiModule from './ui.js?v=20260916largetoolscroll1';
 import sessionModule from './sessions.js';
 import modelsModule from './models.js';
-import chatRenderer from './chatRenderer.js?v=20261011forksync1';
+import chatRenderer from './chatRenderer.js?v=20261014audit1';
 import spinnerModule from './spinner.js';
 import themeModule from './theme.js?v=20260911organsrain1';
 import documentModule from './document.js?v=20260916docctx2';
 import workspaceModule from './workspace.js';
-import settingsModule from './settings.js?v=20261011forksync1';
+import settingsModule from './settings.js?v=20261014audit1';
 import cookbookModule from './cookbook.js';
 import { EVAL_PROMPTS } from './compare/index.js?v=20260909mobilepaneaddscroll1';
 import { PROVIDER_DEVICE_FLOWS, formatDeviceFlowError, runProviderDeviceFlow } from './providerDeviceFlow.js';
@@ -1385,6 +1385,7 @@ async function _cmdOpen(args, ctx) {
     const targets = {
       gallery: ['tool-gallery-btn', 'rail-gallery'],
       notes: ['tool-notes-btn', 'rail-notes'],
+      decisions: ['tool-decisions-btn', 'rail-decisions'],
       tasks: ['tool-tasks-btn', 'rail-tasks'],
       library: ['tool-library-btn', 'rail-archive'],
       documents: ['tool-library-btn', 'rail-archive'],

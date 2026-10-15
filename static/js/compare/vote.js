@@ -2,10 +2,11 @@
 import Storage from '../storage.js';
 import state from './state.js';
 import { _modelDisplayNames } from './models.js';
-import { getModelCost } from '../chatRenderer.js?v=20261011forksync1';
+import { getModelCost } from '../chatRenderer.js?v=20261014audit1';
 import uiModule from '../ui.js?v=20260916largetoolscroll1';
 import { VOTES_STORAGE_KEY, VOTES_MAX } from './icons.js?v=20260908compareprompts1';
 import { showScoreboard } from './scoreboard.js?v=20260909voteconfirmalign1';
+import { voteAvailability } from './streamOutcome.js';
 
 var escapeHtml = uiModule.esc;
 
@@ -21,6 +22,38 @@ function registerCompareActions({ stopAll, resetCompare }) {
 }
 
 function _slotChar(i) { return state._parallel ? String.fromCharCode(65 + i) : String(i + 1); }
+
+/** Response state of each pane's latest answer (stamped by stream.js). */
+function _paneResponseStates() {
+  return state._selectedModels.map((_, i) => {
+    const replies = document.querySelectorAll('#cmp-history-' + i + ' .msg-ai');
+    const last = replies[replies.length - 1];
+    return (last && last.dataset.responseState) || '';
+  });
+}
+
+function _voteAvailability() {
+  return voteAvailability(_paneResponseStates(), { hasPrompt: !!state._lastPrompt, voted: !!state._voted });
+}
+
+/** Enable only the vote controls the panes' outcomes allow: only a pane that
+ *  finished with an answer can win or tie, and voting needs two of them.
+ *  stream.js and the search flow call this whenever a pane's state changes. */
+function syncVoteControls() {
+  const avail = _voteAvailability();
+  for (let i = 0; i < state._selectedModels.length; i++) {
+    const paneBtn = document.querySelector('.compare-pane[data-pane="' + i + '"] .pane-vote-btn');
+    if (!paneBtn) continue;
+    paneBtn.disabled = !avail.panes[i];
+    paneBtn.style.opacity = avail.panes[i] ? '' : '0.4';
+    paneBtn.title = avail.reasons[i];
+  }
+  const tieBtn = document.querySelector('#compare-vote-bar .compare-vote-tie');
+  if (tieBtn) {
+    tieBtn.disabled = !avail.tie;
+    tieBtn.style.opacity = avail.tie ? '' : '0.25';
+  }
+}
 
 function addFinishBadge(paneIdx) {
   const hist = document.getElementById('cmp-history-' + paneIdx);
@@ -45,18 +78,16 @@ function buildVoteBar(n) {
   bar.classList.remove('hidden');
 
   bar.innerHTML = '';
-  // Vote buttons are disabled until a prompt has been sent.
+  // Reveal stays disabled until a prompt has been sent; the vote buttons
+  // are synced below (syncVoteControls).
   const noPrompt = !state._lastPrompt;
 
-  // Sync per-pane vote button state to match the prompt-sent / blind-mode
-  // state — these elements were created when the panes were built, but
-  // their enabled/labelled state needs to refresh whenever this bar is
-  // (re)built (e.g. after sending the first prompt or revealing models).
+  // Refresh per-pane vote button labels for the blind-mode state — these
+  // elements were created when the panes were built, but their labels need
+  // to refresh whenever this bar is (re)built (e.g. after revealing models).
   for (let i = 0; i < n; i++) {
     const paneBtn = document.querySelector('.compare-pane[data-pane="' + i + '"] .pane-vote-btn');
     if (!paneBtn) continue;
-    paneBtn.disabled = noPrompt;
-    paneBtn.style.opacity = noPrompt ? '0.4' : '';
     const label = state._blindMode
       ? 'Vote ' + _slotChar(i)
       : 'Vote ' + state._selectedModels[i].name;
@@ -66,9 +97,10 @@ function buildVoteBar(n) {
   const tieBtn = document.createElement('button');
   tieBtn.className = 'compare-vote-btn compare-vote-tie';
   tieBtn.textContent = 'Tie';
-  if (noPrompt) { tieBtn.disabled = true; tieBtn.style.opacity = '0.25'; }
   tieBtn.addEventListener('click', () => handleVote(-1));
   bar.appendChild(tieBtn);
+  // Pane vote buttons and Tie follow the prompt and each pane's outcome.
+  syncVoteControls();
 
   // Scoreboard button — sits next to Tie. Stays enabled even after a vote (and
   // before a prompt) since viewing the scoreboard is always allowed.
@@ -101,10 +133,17 @@ function buildVoteBar(n) {
 
 /** Persist a vote record to localStorage and fire-and-forget to backend. */
 function _saveVote(winnerIdx) {
-  const modelNames = _modelDisplayNames(state._selectedModels);
-  const winner = winnerIdx === -1 ? 'tie' : modelNames[winnerIdx];
+  const allNames = _modelDisplayNames(state._selectedModels);
+  const winner = winnerIdx === -1 ? 'tie' : allNames[winnerIdx];
+  // Only panes that finished with an answer took part in the round: a
+  // failed, stopped or still-streaming pane records neither a loss nor a
+  // share of the tie.
+  const { contestants } = _voteAvailability();
+  const judged = state._selectedModels.map((_, i) => i).filter(i => contestants[i]);
+  const modelNames = judged.map(i => allNames[i]);
   // Calculate per-model costs
-  const costs = state._selectedModels.map((m, i) => {
+  const costs = judged.map(i => {
+    const m = state._selectedModels[i];
     const pm = state._paneMetrics[i];
     if (!pm) return null;
     return getModelCost(pm.model || m.model, pm.input_tokens || 0, pm.output_tokens || 0);
@@ -161,6 +200,9 @@ function handleVote(winnerIdx) {
   // aren't covered by the .compare-vote-btn disable below, so without this a
   // user could spam a pane's vote button and record a score on every click.
   if (state._voted) return;
+  // Only a finished answer can win or share a tie, even if a stale button fires.
+  const avail = _voteAvailability();
+  if (winnerIdx === -1 ? !avail.tie : !avail.panes[winnerIdx]) return;
   state._voted = true;
 
   // Persist vote
@@ -177,7 +219,7 @@ function handleVote(winnerIdx) {
     if (!el) continue;
     const name = displayNames[i];
     const isWinner = winnerIdx === i;
-    const isTie = winnerIdx === -1;
+    const isTie = winnerIdx === -1 && avail.contestants[i];
 
     let html = '';
     const caret = ' <span class="pane-title-caret">&#x25BE;</span>';
@@ -188,7 +230,7 @@ function handleVote(winnerIdx) {
 
     if (pane) {
       if (isWinner) { pane.classList.add('winner'); }
-      else if (winnerIdx >= 0) pane.classList.add('loser'); }
+      else if (winnerIdx >= 0 && avail.contestants[i]) pane.classList.add('loser'); }
   }
 
   // Swap "AI" role labels to real model names in each pane's messages
@@ -251,4 +293,4 @@ function spawnConfetti(cx, cy, count) {
   }
 }
 
-export { _saveVote, handleVote, buildVoteBar, addFinishBadge, spawnConfetti, registerCompareActions };
+export { _saveVote, handleVote, buildVoteBar, syncVoteControls, addFinishBadge, spawnConfetti, registerCompareActions };

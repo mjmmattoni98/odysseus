@@ -7,10 +7,13 @@ the build registers plus the commit its process loaded.
 
 Three things can break independently, so each is covered on its own:
 
-* ``formatSettingsBuildInfo`` decides what the two lines say, including what
-  to do with the ``"unknown"`` the backend reports when it cannot resolve a
-  commit. That is real logic, so it is exercised in node against the shipped
-  module rather than asserted on as text.
+* ``formatBuildIdentity`` (``static/js/buildIdentity.js``) decides what the
+  two lines say, including what to do with the ``"unknown"`` the backend
+  reports when it cannot resolve a commit. That is real logic, so it is
+  exercised in node against the shipped module rather than asserted on as
+  text. The login footer uses the same formatter, so the two pages cannot
+  drift apart again (QA audit 2026-10-12: login showed "v0.20.19" while
+  Settings showed "v1.0.3 · build 0.20.19").
 * the footer's *position* is the requirement — below the scrolling nav, inside
   the sidebar. Only the markup's structure records that.
 * the layouts that have no bottom-left to write in (the collapsed rail, the
@@ -41,9 +44,9 @@ requires_node = pytest.mark.skipif(
 def _format_build_info(payload):
     """Run the shipped formatter over one payload and return its result."""
     source = (
-        "import { formatSettingsBuildInfo } from "
-        "'./static/js/settings/sidebar.js';\n"
-        f"console.log(JSON.stringify(formatSettingsBuildInfo({json.dumps(payload)})));\n"
+        "import { formatBuildIdentity } from "
+        "'./static/js/buildIdentity.js';\n"
+        f"console.log(JSON.stringify(formatBuildIdentity({json.dumps(payload)})));\n"
     )
     result = subprocess.run(
         ["node", "--input-type=module", "-e", source],
@@ -74,6 +77,9 @@ def test_shows_registered_version_and_short_commit():
     assert info["commitLabel"] == "8a28c5f9"
     # The short hash is what fits the sidebar; the full one stays on hover.
     assert info["commitTitle"] == "8a28c5f9c0ffee1234567890abcdef1234567890"
+    # The one-line identity the login footer shows: the same fields, in the
+    # same order, as the two sidebar lines.
+    assert info["label"] == "v1.0.3 · build 0.20.19 · 8a28c5f9"
 
 
 @requires_node
@@ -97,6 +103,7 @@ def test_unresolvable_commit_leaves_only_the_version():
     assert info["versionLabel"] == "v1.0.3"
     assert info["commitLabel"] == ""
     assert info["commitTitle"] == ""
+    assert info["label"] == "v1.0.3"
 
 
 @requires_node
@@ -105,6 +112,7 @@ def test_commit_only_build_still_gets_a_footer():
 
     assert info["versionLabel"] == ""
     assert info["commitLabel"] == "01234567"
+    assert info["label"] == "01234567"
 
 
 @requires_node
@@ -129,6 +137,22 @@ def test_non_sha_commit_override_is_left_intact():
 )
 def test_nothing_to_report_means_no_footer(payload):
     assert _format_build_info(payload) is None
+
+
+def test_login_footer_and_settings_footer_share_one_formatter():
+    """Both footers must name the build through ``formatBuildIdentity``. This
+    is a source check because the login page only runs in a browser; the
+    formatter's output is exercised behaviorally above."""
+    login = (ROOT / "static" / "login.html").read_text(encoding="utf-8")
+    sidebar_js = (ROOT / "static" / "js" / "settings" / "sidebar.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "appUrl('/static/js/buildIdentity.js')" in login
+    assert "formatBuildIdentity(payload)" in login
+    # The old footer printed the harness build as if it were the version.
+    assert "'v' + (vd.build" not in login
+    assert "from '../buildIdentity.js'" in sidebar_js
 
 
 # ---------------------------------------------------------------------------

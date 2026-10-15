@@ -414,7 +414,7 @@ body.bg-pattern-ascii-fireflies {
     #user-bar-avatar { position: relative; left: -4px; }
 
     .user-bar-name {
-      font-size: 9.75px;
+      font-size: 11px;
       font-weight: 500;
       color: var(--fg);
       opacity: 0.8;
@@ -543,6 +543,34 @@ body.bg-pattern-ascii-fireflies {
     }
     #tools-section .list-item {
       padding: 8px 8px;
+    }
+    /* Tool pins (initToolPins in section-management.js): unpinned tools sit
+       behind the "More tools" row, mirrored on the icon rail. A tool with a
+       live indicator (minimized window, notification) stays visible while
+       the group is collapsed. */
+    #tools-section.tools-more-collapsed > .list-item.tool-unpinned:not(.rail-minimized):not(.tool-attention),
+    #tools-section > .tools-more-toggle.tools-more-empty {
+      display: none;
+    }
+    .tools-more-toggle .grow,
+    .tools-more-toggle .tools-more-count {
+      color: var(--color-muted);
+    }
+    .tools-more-toggle .tools-more-count {
+      flex-shrink: 0;
+      margin-right: 4px;
+    }
+    .tools-more-chevron {
+      flex-shrink: 0;
+      opacity: 0.5;
+      transition: transform 0.2s;
+    }
+    .tools-more-collapsed .tools-more-chevron {
+      transform: rotate(-90deg);
+    }
+    #icon-rail.rail-more-collapsed > .icon-rail-btn.tool-unpinned:not(.rail-minimized):not(.rail-notify),
+    #icon-rail > .rail-more-tools.tools-more-empty {
+      display: none !important;
     }
     .sidebar.right-side .sidebar-header {
       justify-content: flex-start;
@@ -1129,7 +1157,9 @@ body.bg-pattern-ascii-fireflies {
       flex: 1; cursor: pointer; user-select: none;
       display: flex; align-items: center; gap: 6px;
       margin: 0; padding: 0; border: none;
-      font-size: 10px; font-weight: 400; font-family: inherit;
+      /* Comfortable (default) density; compact keeps the tighter 10px in
+         00-tokens.css. */
+      font-size: 11px; font-weight: 400; font-family: inherit;
       /* 1.3 (not 1) so Fira Code's tall glyph box isn't vertically clipped in
          Chromium/Edge — mirrors the .list-item fix. The title is flex-centred
          in a fixed-height (29px) header, so this adds headroom without reflow. */
@@ -1733,7 +1763,9 @@ body.bg-pattern-ascii-fireflies {
     }
     .list-item span {
       color: var(--fg);
-      font-size: 9.75px;
+      /* Comfortable (default) density; compact keeps the previous 9.75px in
+         00-tokens.css. */
+      font-size: 11px;
     }
     .grow {
       flex: 1;
@@ -6146,6 +6178,7 @@ body.bg-pattern-ascii-fireflies {
       #calendar-modal,
       #gallery-modal,
       #tasks-modal,
+      #decisions-modal,
       #memory-modal,
       #doclib-modal,
       #compare-model-overlay,

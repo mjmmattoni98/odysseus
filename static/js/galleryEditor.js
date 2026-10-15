@@ -6256,6 +6256,13 @@ function _buildEditor(container) {
         try { const j = await resp.json(); detail = j.detail || j.error || ''; } catch {}
         throw new Error(`HTTP ${resp.status}${detail ? `: ${detail}` : ''}`);
       }
+      // The returned url is versioned by the new content hash; track it so a
+      // refresh-restore reloads the saved pixels, not the cached original.
+      const saved = await resp.json().catch(() => null);
+      if (saved?.image?.url) {
+        state.imageUrl = saved.image.url;
+        _writeActiveEditorSession();
+      }
       const totalMs = Math.round(performance.now() - t0);
       if (uiModule) uiModule.showToast(`Saved over original (${(blob.size / 1024 / 1024).toFixed(1)}MB · ${(totalMs / 1000).toFixed(1)}s)`, 4000);
       window.dispatchEvent(new CustomEvent('gallery-refresh'));

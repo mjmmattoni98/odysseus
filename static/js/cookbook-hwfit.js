@@ -38,6 +38,7 @@ import { _loadTasks, _tmuxGracefulKill, _nextAvailablePort, _taskPort } from './
 import { openCookbookDependencies } from './cookbook-diagnosis.js';
 import { fetchInstalledForHost, pullViaApiForHost } from './cookbookOllama.js';
 import { findInstalled, allocatedContext, installedFootprintGb } from './cookbookOllamaFormat.js';
+import { memoryFitFacet, runtimeFacet, taskFacet, partitionChatFirst, installedOllamaFacets, withInstalledOllamaFacets } from './cookbookFacets.js';
 
 // Map a serve-backend code (vllm / sglang / llamacpp / mlx) → the package name
 // the Dependencies API reports. Used to look up "is this backend installed
@@ -693,7 +694,9 @@ function _ollamaToHwfitRows(libModels, vramAvail, ramAvail, installedInfo = null
     const vramGb = installedFootprintGb(inst, ctx);
     const params = parseFloat(String(inst.parameter_size || '').replace(/[^0-9.]/g, '')) || row.params_b || 0;
     return {
-      ...row,
+      // The installed model's own capability report outranks the library
+      // card's hint (a decision/vision classifier is not a vision chat model).
+      ...withInstalledOllamaFacets(row, inst.capabilities),
       quant: inst.quantization || row.quant,
       parameter_count: inst.parameter_size || row.parameter_count,
       params_b: params,
@@ -730,6 +733,12 @@ function _ollamaToHwfitRows(libModels, vramAvail, ramAvail, installedInfo = null
         _olName: m.name,
         _olSize: sz,
         _description: m.description || '',
+        // Task/runtime facets classified server-side for the library entry.
+        task: m.task,
+        task_label: m.task_label,
+        task_source: m.task_source,
+        chat_capable: m.chat_capable,
+        runtime: m.runtime,
       };
       const inst = findInstalled(installed, tag);
       if (inst) {
@@ -757,6 +766,7 @@ function _ollamaToHwfitRows(libModels, vramAvail, ramAvail, installedInfo = null
       _olName: olName,
       _olSize: olSize,
       _description: 'Installed on your Ollama server',
+      ...installedOllamaFacets(inst.capabilities),
     }, inst));
   }
   return out;
@@ -1415,19 +1425,46 @@ function _modeLabel(model) {
   return String(model?.run_mode || '').replace('_', '+');
 }
 
+// Memory / Task / Engine are three separate facets: memory fit says nothing
+// about what the model is for or whether the shown engine can load it.
 export const _hwfitColumns = [
-  { key: 'fit', label: 'Fit',    cls: 'hwfit-fit' },
+  { key: 'fit', label: 'Memory', cls: 'hwfit-fit', title: 'Memory fit: whether weights + KV cache fit the selected GPU/RAM budget. Not a quality or compatibility rating.' },
   { key: 'newest', label: 'Model (latest)',  cls: 'hwfit-name' },
+  { key: null,    label: 'Task',   cls: 'hwfit-c-task', title: 'What the model is for (chat, embedding, speech, time series...). Non-chat models are listed after chat models.' },
   { key: 'vram',  label: 'VRAM',   cls: 'hwfit-c-vram' },
   { key: 'params',label: 'Param', cls: 'hwfit-c-params' },
   { key: null,    label: 'Quant',  cls: 'hwfit-c-quant' },
   { key: 'context',label: 'Ctx',   cls: 'hwfit-c-ctx' },
   { key: 'speed', label: 'Speed',  cls: 'hwfit-c-speed' },
   { key: 'score', label: 'Score',  cls: 'hwfit-c-score' },
-  { key: null,    label: 'Engine', cls: 'hwfit-c-mode' },
+  { key: null,    label: 'Engine', cls: 'hwfit-c-mode', title: 'Engine the row would use, with runtime support: check = compatible (documented), ? = unverified (format matches, not tested), slashed circle = not supported.' },
 ];
 
+// Monochrome status glyphs for the Engine cell's runtime facet.
+const _RUNTIME_GLYPHS = {
+  compatible: '<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>',
+  unverified: '<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"></path><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>',
+  not_supported: '<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><line x1="5.6" y1="5.6" x2="18.4" y2="18.4"></line></svg>',
+};
+
+// Engine key used for the runtime facet lookup — the same detection the
+// serve commands use, so the facet describes the engine actually displayed.
+function _rowEngineKey(model) {
+  try { return _detectBackend(model)?.backend || ''; } catch { return ''; }
+}
+
+// Chat-oriented views list non-chat rows after the chat-capable ones (see
+// partitionChatFirst); image mode is all image models, so nothing to split.
+function _chatFirstView() {
+  return (document.getElementById('hwfit-usecase')?.value || '') !== 'image_gen';
+}
+
 function _sortHwfitRows(models) {
+  const rows = _sortHwfitRowsByColumn(models);
+  return _chatFirstView() ? partitionChatFirst(rows).rows : rows;
+}
+
+function _sortHwfitRowsByColumn(models) {
   const rows = Array.isArray(models) ? [...models] : [];
   const sortSel = document.getElementById('hwfit-sort');
   const sortKey = sortSel?.value || 'newest';
@@ -1524,10 +1561,18 @@ export function _hwfitRenderList(el, models) {
     } else if (col.key === 'newest') {
       label = 'Model (latest)';
     }
-    html += `<span class="hwfit-col ${col.cls}${sortable}${active}"${dataAttr}>${label}${arrow}</span>`;
+    const titleAttr = col.title ? ` title="${esc(col.title)}"` : '';
+    html += `<span class="hwfit-col ${col.cls}${sortable}${active}"${dataAttr}${titleAttr}>${label}${arrow}</span>`;
   }
   html += '</div>';
-  for (const m of models) {
+  // Rows arrive chat-first (see _sortHwfitRows); mark where the non-chat
+  // models start so they can't read as lower-ranked chat recommendations.
+  const _otherStart = _chatFirstView() ? partitionChatFirst(models).firstOtherIndex : -1;
+  models.forEach((m, _rowIdx) => {
+    if (_rowIdx === _otherStart) {
+      const _otherCount = models.length - _otherStart;
+      html += `<div class="hwfit-row hwfit-task-divider" role="separator">Not chat models — embeddings, speech, time series, base checkpoints… (${_otherCount})</div>`;
+    }
     const fitColor = _fitColors[m.fit_level] || 'var(--fg-muted)';
     const score = m.score?.toFixed?.(1) ?? m.score ?? '0';
     let tpsRaw = m.speed_tps ?? 0;
@@ -1535,14 +1580,17 @@ export function _hwfitRenderList(el, models) {
     const tps = tpsRaw > 0 ? (tpsRaw >= 100 ? Math.round(tpsRaw) : tpsRaw.toFixed(1)) : '?';
     const pcount = m.parameter_count || '?';
     const ctx = m.context ? (m.context >= 1024 ? (m.context / 1024).toFixed(0) + 'k' : m.context) : '?';
-    const fitLabel = (m.fit_level || '').replace('_', ' ');
+    const memory = memoryFitFacet(m.fit_level);
+    const task = taskFacet(m);
     const modeLabel = _modeLabel(m);
+    const runtime = runtimeFacet(m, _rowEngineKey(m));
     const vramLabel = m.required_gb ? m.required_gb.toFixed(1) + 'G' : '?';
     const moeBadge = m.is_moe ? '<span class="hwfit-badge hwfit-moe">MoE</span>' : '';
     const imgBadge = m.is_image_gen ? '<span class="hwfit-badge" style="background:color-mix(in srgb, var(--red) 20%, transparent);color:var(--red);font-size:8px;padding:1px 4px;border-radius:3px;margin-left:4px;">IMG</span>' : '';
     const dlDot = (_cachedModelIds && (_cachedModelIds.has(m.name) || [..._cachedModelIds].some(id => id === m.name?.split('/').pop()))) ? '<span class="hwfit-dl-dot" title="Downloaded">\u25CF</span>' : '';
     html += `<div class="hwfit-row" data-model="${esc(m.name)}">`;
-    html += `<span class="hwfit-col hwfit-fit" style="color:${fitColor}">${esc(fitLabel)}</span>`;
+    const memoryTitle = m.required_gb ? `${memory.title} Needs ~${Number(m.required_gb).toFixed(1)} GB.` : memory.title;
+    html += `<span class="hwfit-col hwfit-fit" style="color:${fitColor}" title="${esc(memoryTitle)}">${esc(memory.text)}</span>`;
     // Append quant to the title when it's not already in the repo name. The
     // suffix strips quant-parts the name already contains — e.g. for
     // QuantTrio/MiniMax-M2-AWQ + quant=AWQ-4bit we just show "(4bit)", not
@@ -1562,6 +1610,7 @@ export function _hwfitRenderList(el, models) {
       }
     }
     html += `<span class="hwfit-col hwfit-name">${modelLogo(m.name)}${esc(_short)}${_quantSuffix}${moeBadge}${imgBadge}${dlDot}</span>`;
+    html += `<span class="hwfit-col hwfit-c-task${task.chatCapable === false ? ' hwfit-task-other' : ''}" title="${esc(task.title)}">${esc(task.label)}</span>`;
     html += `<span class="hwfit-col hwfit-c-vram" title="Estimated loaded footprint for this quant/backend/context, including model weights and KV/runtime allowance.">${vramLabel}</span>`;
     html += `<span class="hwfit-col hwfit-c-params" title="Original total model parameters, not quantized storage size.">${esc(pcount)}</span>`;
     // Truncate the Quant cell to 9 chars + ellipsis so long tags like
@@ -1572,9 +1621,11 @@ export function _hwfitRenderList(el, models) {
     html += `<span class="hwfit-col hwfit-c-ctx">${m.is_image_gen ? '\u2014' : ctx}</span>`;
     html += `<span class="hwfit-col hwfit-c-speed">${m.is_image_gen ? '\u2014' : tps + ' t/s'}</span>`;
     html += `<span class="hwfit-col hwfit-c-score">${score}</span>`;
-    html += `<span class="hwfit-col hwfit-c-mode" title="${_requiresAcceleratorBackend(m) ? 'Requires vLLM or SGLang with a visible CUDA/ROCm accelerator. llama.cpp and Ollama need GGUF files.' : ''}">${esc(modeLabel)}</span>`;
+    const runtimeTitle = `Runtime on ${modeLabel}: ${runtime.label}${runtime.reason ? ' \u2014 ' + runtime.reason : ''}`
+      + (_requiresAcceleratorBackend(m) ? ' Requires vLLM or SGLang with a visible CUDA/ROCm accelerator. llama.cpp and Ollama need GGUF files.' : '');
+    html += `<span class="hwfit-col hwfit-c-mode hwfit-runtime hwfit-runtime-${runtime.status}" title="${esc(runtimeTitle)}" aria-label="${esc(runtimeTitle)}">${_RUNTIME_GLYPHS[runtime.status] || ''}${esc(modeLabel)}</span>`;
     html += `</div>`;
-  }
+  });
   el.innerHTML = html;
   // Paint the complete table first, then let it settle in on the next frame.
   // This avoids the large unstyled-looking text flash when a remote scan
@@ -1786,6 +1837,15 @@ export function _expandModelRow(row, modelData) {
   html += `<span class="hwfit-panel-model">${esc(modelData.name)}${dlSource.kind ? ` <span style="opacity:0.5;font-size:10px;">(${esc(dlSource.kind)} ${esc(modelData.quant || '')})</span>` : (modelData.quant_repo ? ` <span style="opacity:0.5;font-size:10px;">(${esc(modelData.quant)})</span>` : '')}</span>`;
   html += `<span class="hwfit-panel-badge">${esc(label)}</span>`;
   html += `<a href="${esc(hfUrl)}" target="_blank" rel="noopener" class="hwfit-panel-hf-link" title="View download source on HuggingFace">HF \u2197</a>`;
+  html += `</div>`;
+  // The three facets spelled out: a memory fit is not a task or engine verdict.
+  const _memory = memoryFitFacet(modelData.fit_level);
+  const _task = taskFacet(modelData);
+  const _runtime = runtimeFacet(modelData, backend);
+  html += `<div class="hwfit-panel-facets">`;
+  html += `<span><span class="hwfit-panel-facet-key">Memory</span>${esc(_memory.text)}${modelData.required_gb ? ` \u00b7 ~${Number(modelData.required_gb).toFixed(1)} GB` : ''}</span>`;
+  html += `<span><span class="hwfit-panel-facet-key">Task</span>${esc(_task.label)}${_task.chatCapable === false ? ' \u00b7 not a chat model' : ''}</span>`;
+  html += `<span class="hwfit-runtime hwfit-runtime-${_runtime.status}"><span class="hwfit-panel-facet-key">Runtime (${esc(label)})</span>${_RUNTIME_GLYPHS[_runtime.status] || ''}${esc(_runtime.label)}${_runtime.reason ? ` \u00b7 ${esc(_runtime.reason)}` : ''}</span>`;
   html += `</div>`;
   html += `<div class="hwfit-panel-actions">`;
   html += `<button class="cookbook-btn hwfit-dl-btn">Download</button>`;

@@ -82,6 +82,16 @@ Context fitting: when the window is known, generation budgets are capped at half
 
 Structured outputs: the plan, query list, extraction, category (string `enum`) and stop check (`{"answer": "YES"|"NO", "reason"}`) calls pass `response_schema`; prompts and the tolerant parsers stay because cloud providers ignore the schema. Truncated extraction JSON is salvaged field by field.
 
+### Report length
+
+`report_length` (`auto`, `brief`, `standard`, `detailed`) comes from the panel Length picker or `/api/research/start`. `research_presets.resolve_report_length()` combines it with wording in the question ("briefly", "in 200 words", "one paragraph", "at least 2500 words"): an explicit launch choice picks the work profile, Auto follows the question, and a word count named in the question is always the target. `apply_report_length()` reshapes the resolved preset. Brief caps Auto rounds at 2 (stop check from round 1), uses at most 3/2 queries and 2 URLs per query, skips per-round LLM synthesis (the writer reads compiled findings), never expands, and writes ~250 words by default. Any explicit or brief target sets a hard word limit (target × 1.25) that the final prompt states as a ceiling and the output budget enforces (`3 tokens × limit`, minimum 1,536); a draft over 1.5 × the limit gets one condense pass. Detailed raises the target length by half.
+
+### Source rules and citation check
+
+`src.research_sources.SourceRules` holds per-run allowed domains, excluded domains and an official-only switch. Entries are normalized (`https://www.nasa.gov/x` → `nasa.gov`); a dotted entry matches the domain and its subdomains, a single label (`nasa`, `wikipedia`) matches any host with that label. Official-only keeps pages whose hostname is official (`research_navigator.is_official_host`: `.gov`/`.mil`/`.edu`/`.int`, country second levels such as `gov.uk`/`gob.mx`/`gouv.fr`/`ac.uk`, and `OFFICIAL_DOMAINS` such as `europa.eu`), matched on label boundaries and never on URL paths, titles or host substrings, plus explicitly allowed dotted domains. Vendor and project pages are labelled `primary` for counting but need an explicit allowed domain under official-only. Exclusions never empty a non-empty allow-list (that would mean "anywhere"); rules whose exclusions cover every allowed domain `permits_nothing` and `/api/research/start` rejects them with 400. `effective_source_rules()` merges launch rules with unambiguous wording in the question (`site:`/`-site:`, "only nasa.gov", "only NASA sources", "only official sources", "no Wikipedia"); explicit allowed domains replace inferred ones. Rules apply when search results are ranked, when the planner proposes a fetch, at fetch time in `_fetch_and_extract`, to prior findings, and to the saved source list; a single allowed domain also scopes searches with `site:` (falling back to the plain query when that returns nothing). After synthesis `verify_citations()` flags every cited link that is not one of the read sources (`not_opened`, `unread`, or `excluded`), saves them as `citation_warnings`, and the visual report lists them and marks the links.
+
+`source_coverage.primary_or_official` and the visual report's "Primary sources" metric both count `FIRST_PARTY_SOURCE_KINDS` (`official`, `primary`) over `usable_findings()`, the same population that becomes the saved source list.
+
 Panel runtime behavior:
 
 - reconnects to active jobs through `/api/research/active`;
@@ -103,7 +113,9 @@ Spinoff/Discuss creates a new chat session from a saved report. It seeds the rep
 
 ## Reports And Persistence
 
-Research persistence uses `data/deep_research/<session_id>.json`. Current JSON can include result/report text, raw report, sources, raw findings, stats, category, archived state, hidden images, owner, timestamps, and consumed state.
+Research persistence uses `data/deep_research/<session_id>.json`. Current JSON can include result/report text, raw report, sources (with a `content_hash` page fingerprint), raw findings, stats, category, archived state, hidden images, owner, timestamps, consumed state, launch `settings`, effective `source_rules`, `report_length`, and `citation_warnings`.
+
+Refresh: `POST /api/research/{id}/refresh` re-runs a saved question with its saved settings and effective source rules, re-reads up to six previous sources first, and saves a new file with `lineage_id` (the first version's id), `version`, `previous_version_id` and `change_summary` (sources added/removed/content-changed/unchanged by canonical URL and `content_hash`, plus a short model-written note on how the conclusions changed). The previous file is never modified. `GET /api/research/{id}/versions` lists a lineage; the library shows only the newest version (`version_count`); the visual report shows the version strip, the change summary and a Refresh button.
 
 Route access to persisted report files is path-confined. Browser routes validate
 session ids against `^[a-zA-Z0-9-]{1,128}$`, enumerate trusted `*.json` files

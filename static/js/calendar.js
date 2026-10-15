@@ -16,6 +16,7 @@ import {
   _isCalBgImage, _calBgImageUrl, _calBgCss, _cssUrlEscape,
   _calReadableTextColor,
   _ds, _addDays, _shiftDT, _tzOffset, _localDateOf,
+  _clockOf, _fmtDayOffset, _fmtEventTimeRange, _eventTimeRangeTitle, _endDayHint,
 } from './calendar/utils.js';
 
 const API_BASE = window.location.origin;
@@ -1261,7 +1262,7 @@ async function _renderMonth() {
           }
         } catch (_) { startFrac = 0; endFrac = 1; }
       }
-      h += `<div class="cal-multiday" style="--col:${startColInt};--span:${span};--slot:${barSlot};--start-frac:${startFrac.toFixed(4)};--end-frac:${endFrac.toFixed(4)};background:${_calColor(md)};--cal-event-fg:${_calEventFg(md)}" draggable="true" data-uid="${_e(md.uid)}" title="${_e(md.summary)}">${_e(md.summary)}${_eventReminderHtml(md)}${_eventSourceHtml(md)}</div>`;
+      h += `<div class="cal-multiday" style="--col:${startColInt};--span:${span};--slot:${barSlot};--start-frac:${startFrac.toFixed(4)};--end-frac:${endFrac.toFixed(4)};background:${_calColor(md)};--cal-event-fg:${_calEventFg(md)}" draggable="true" data-uid="${_e(md.uid)}" title="${_e(md.all_day ? md.summary : `${md.summary} · ${_eventTimeRangeTitle(md)}`)}">${_e(md.summary)}${_eventReminderHtml(md)}${_eventSourceHtml(md)}</div>`;
       barSlot++;
     }
     h += '</div>';
@@ -1725,7 +1726,7 @@ async function _renderWeek() {
     // for drag-to-resize (extend duration without opening the form).
     for (const item of _wkLayoutTimedEvents(timedEvents, ds)) {
       const { ev, top, height, lane, laneCount } = item;
-      const t = _fmtTime(ev.dtstart) + '–' + _fmtTime(ev.dtend);
+      const t = _fmtEventTimeRange(ev, { sep: '–', onDay: ds });
       const crowdedClass = laneCount > 1 ? ' cal-wk-block-crowded' : '';
       const laneRight = ((lane + 1) / laneCount) * 100;
       // Custom-bg events get the image as the tile background; solid-color
@@ -1740,7 +1741,7 @@ async function _renderWeek() {
       colsHtml += `<div class="cal-wk-block${crowdedClass}" data-uid="${_e(ev.uid)}" style="--lane:${lane};--lane-count:${laneCount};--lane-right:${laneRight}%;--event-height:${height}px;top:${top}px;height:${height}px;border-left-color:${_calColor(ev)};${bgDecl}">`;
       colsHtml += `<div class="cal-wk-block-label">`;
       colsHtml += `<div class="cal-wk-block-name">${_e(ev.summary)}${_eventReminderHtml(ev)}${_eventSourceHtml(ev)}</div>`;
-      colsHtml += `<div class="cal-wk-block-time">${t}</div>`;
+      colsHtml += `<div class="cal-wk-block-time" title="${_e(_eventTimeRangeTitle(ev))}">${_e(t)}</div>`;
       colsHtml += `</div>`;
       colsHtml += `<div class="cal-wk-block-resize" title="Drag to resize"></div>`;
       colsHtml += `</div>`;
@@ -1876,10 +1877,12 @@ async function _renderWeek() {
         ghost.style.height = height + 'px';
         const hh = String(Math.floor(nextStartMin / 60)).padStart(2, '0');
         const mm = String(nextStartMin % 60).padStart(2, '0');
-        const hh2 = String(Math.floor((nextStartMin + durationMin) / 60)).padStart(2, '0');
-        const mm2 = String((nextStartMin + durationMin) % 60).padStart(2, '0');
+        const endTotal = nextStartMin + durationMin;
+        const hh2 = String(Math.floor((endTotal % 1440) / 60)).padStart(2, '0');
+        const mm2 = String(endTotal % 60).padStart(2, '0');
+        const endMarker = _fmtDayOffset(Math.floor(endTotal / 1440));
         const timeEl = ghost.querySelector('.cal-wk-block-time');
-        if (timeEl) timeEl.textContent = `${hh}:${mm}–${hh2}:${mm2}`;
+        if (timeEl) timeEl.textContent = `${hh}:${mm}–${hh2}:${mm2}${endMarker ? ` (${endMarker})` : ''}`;
       };
       const onUp = async (up) => {
         document.removeEventListener('mousemove', onMove);
@@ -2204,7 +2207,7 @@ async function _renderAgenda() {
         h += '<div class="cal-agenda-empty">No events</div>';
       }
       for (const ev of evs) {
-        const t = ev.all_day ? 'All day' : _fmtTime(ev.dtstart) + ' – ' + _fmtTime(ev.dtend);
+        const t = _fmtEventTimeRange(ev);
         const _typeTag = ev.event_type
           ? `<span class="cal-event-tag" style="color:${_TYPE_PALETTE[ev.event_type] || _TYPE_PALETTE.other};border-color:${_TYPE_PALETTE[ev.event_type] || _TYPE_PALETTE.other}">#${_e(ev.event_type)}</span>`
           : '';
@@ -2214,7 +2217,7 @@ async function _renderAgenda() {
           <div class="cal-event-dot" style="background:${_calColor(ev)}"></div>
           <div class="cal-event-info">
             <div class="cal-event-name">${_impMark}${_e(ev.summary)}${_eventReminderHtml(ev)}${_eventSourceHtml(ev)} ${_typeTag}</div>
-            <div class="cal-event-time">${t}${ev.location ? ' · ' + _locHTML(ev.location, ev.description) : ''}</div>
+            <div class="cal-event-time" title="${_e(_eventTimeRangeTitle(ev))}">${_e(t)}${ev.location ? ' · ' + _locHTML(ev.location, ev.description) : ''}</div>
           </div>
           <button class="cal-event-more" data-uid="${_e(ev.uid)}" title="More">${_moreIcon}</button>
         </div>`;
@@ -2276,12 +2279,12 @@ async function _renderSearch() {
   } else {
     for (const ev of results) {
       const evDate = _localDateOf(ev.dtstart);
-      const t = ev.all_day ? 'All day' : _fmtTime(ev.dtstart) + ' – ' + _fmtTime(ev.dtend);
+      const t = _fmtEventTimeRange(ev);
       h += `<div class="cal-agenda-event" data-uid="${_e(ev.uid)}">
         <div class="cal-event-dot" style="background:${_calColor(ev)}"></div>
         <div class="cal-event-info">
           <div class="cal-event-name">${_e(ev.summary)}${_eventReminderHtml(ev)}${_eventSourceHtml(ev)}</div>
-          <div class="cal-event-time">${_fmtDate(evDate)} · ${t}${ev.location ? ' · ' + _locHTML(ev.location, ev.description) : ''}</div>
+          <div class="cal-event-time" title="${_e(_eventTimeRangeTitle(ev))}">${_fmtDate(evDate)} · ${_e(t)}${ev.location ? ' · ' + _locHTML(ev.location, ev.description) : ''}</div>
         </div>
         <button class="cal-event-more" data-uid="${_e(ev.uid)}" title="More">${_moreIcon}</button>
       </div>`;
@@ -2405,13 +2408,13 @@ function _dayDetailHTML(dateStr) {
     } else {
       results.forEach(ev => {
         const date = ev.all_day ? ev.dtstart : _localDateOf(ev.dtstart);
-        const t = ev.all_day ? 'All day' : _fmtTime(ev.dtstart) + ' – ' + _fmtTime(ev.dtend);
+        const t = _fmtEventTimeRange(ev);
         const bgStyle = _calItemBgStyle(ev);
         h += `<div class="cal-event-item${bgStyle ? ' cal-event-item-bg' : ''}" data-uid="${_e(ev.uid)}"${bgStyle ? ` style="${bgStyle}"` : ''}>
           <div class="cal-event-dot" style="background:${_calColor(ev)}"></div>
           <div class="cal-event-info">
             <div class="cal-event-name">${_e(ev.summary)}${_eventReminderHtml(ev)}${_eventSourceHtml(ev)}</div>
-            <div class="cal-event-time">${_fmtDate(date)} · ${t}</div>
+            <div class="cal-event-time" title="${_e(_eventTimeRangeTitle(ev))}">${_fmtDate(date)} · ${_e(t)}</div>
           ${ev.location ? `<div class="cal-event-loc">${_locHTML(ev.location, ev.description)}</div>` : ''}
           </div>
           <button class="cal-event-more" data-uid="${_e(ev.uid)}" title="More">${_moreIcon}</button>
@@ -2423,9 +2426,9 @@ function _dayDetailHTML(dateStr) {
   const evs = _eventsForDay(dateStr);
   if (!evs.length) h += '<div class="cal-empty">No events</div>';
   else evs.forEach(ev => {
-    const t = ev.all_day ? 'All day' : _fmtTime(ev.dtstart) + ' – ' + _fmtTime(ev.dtend);
+    const t = _fmtEventTimeRange(ev, { onDay: dateStr });
     const _bgStyle = _calItemBgStyle(ev);
-    h += `<div class="cal-event-item${_bgStyle ? ' cal-event-item-bg' : ''}" data-uid="${_e(ev.uid)}"${_bgStyle ? ` style="${_bgStyle}"` : ''}><div class="cal-event-dot" style="background:${_calColor(ev)}"></div><div class="cal-event-info"><div class="cal-event-name">${_e(ev.summary)}${_eventReminderHtml(ev)}${_eventSourceHtml(ev)}</div><div class="cal-event-time">${t}</div>${ev.location ? `<div class="cal-event-loc">${_locHTML(ev.location, ev.description)}</div>` : ''}</div><button class="cal-event-more" data-uid="${_e(ev.uid)}" title="More">${_moreIcon}</button></div>`;
+    h += `<div class="cal-event-item${_bgStyle ? ' cal-event-item-bg' : ''}" data-uid="${_e(ev.uid)}"${_bgStyle ? ` style="${_bgStyle}"` : ''}><div class="cal-event-dot" style="background:${_calColor(ev)}"></div><div class="cal-event-info"><div class="cal-event-name">${_e(ev.summary)}${_eventReminderHtml(ev)}${_eventSourceHtml(ev)}</div><div class="cal-event-time" title="${_e(_eventTimeRangeTitle(ev))}">${_e(t)}</div>${ev.location ? `<div class="cal-event-loc">${_locHTML(ev.location, ev.description)}</div>` : ''}</div><button class="cal-event-more" data-uid="${_e(ev.uid)}" title="More">${_moreIcon}</button></div>`;
   });
   return h + '</div>';
 }
@@ -3494,6 +3497,7 @@ function _showEventForm(existing, defaultDate, defaultEndDate) {
         <span style="opacity:0.3">–</span>
         <input type="time" id="cal-f-end" value="${et}" class="cal-input cal-input-time" />
       </div>
+      <div class="cal-end-day-hint" id="cal-f-end-hint" aria-live="polite" hidden></div>
       <div class="cal-loc-row">
         <div class="cal-loc-input-wrap">
           <input type="text" id="cal-f-loc" placeholder=" " value="${_e(existing?.location || '')}" class="cal-input" />
@@ -3723,17 +3727,43 @@ function _showEventForm(existing, defaultDate, defaultEndDate) {
 
       const dv = document.getElementById('cal-f-date')?.value;
       const dvEndEl = document.getElementById('cal-f-date-end');
-      if (!dv || !dvEndEl || dvEndEl.value !== dv) return;
+      if (!dv || !dvEndEl) return;
 
       const sVal = startEl.value;
       const eVal = endEl.value;
+
+      // Undo our own roll-over once the end is after the start again, so a
+      // corrected 12:00 – 13:00 doesn't silently stay a 25-hour event.
+      if (dvEndEl.dataset.autoAdvanced === '1' && dvEndEl.value === _addDays(dv, 1) && sVal && eVal && eVal > sVal) {
+        dvEndEl.value = dv;
+        delete dvEndEl.dataset.autoAdvanced;
+        return;
+      }
+      if (dvEndEl.value !== dv) return;
 
       if (sVal && eVal && eVal <= sVal) {
         const d = new Date(`${dv}T00:00:00`);
         d.setDate(d.getDate() + 1);
 
         dvEndEl.value = _ds(d);
+        dvEndEl.dataset.autoAdvanced = '1';
       }
+    };
+
+    // Say when the event ends on a later day (the hint sits under the end
+    // field) instead of rolling the end date over silently.
+    const _syncEndDayHint = () => {
+      const hintEl = document.getElementById('cal-f-end-hint');
+      if (!hintEl) return;
+      const text = _endDayHint({
+        startDate: document.getElementById('cal-f-date')?.value,
+        endDate: document.getElementById('cal-f-date-end')?.value,
+        startTime: startEl.value,
+        endTime: endEl.value,
+        allDay: !!document.getElementById('cal-f-allday')?.checked,
+      });
+      hintEl.textContent = text;
+      hintEl.hidden = !text;
     };
 
     let prevStartMin = _toMin(startEl.value);
@@ -3766,6 +3796,20 @@ function _showEventForm(existing, defaultDate, defaultEndDate) {
       prevStartMin = newStartMin;
       _autoAdvanceEndDate();
     });
+
+    // Registered after the roll-over handlers above so the hint reflects the
+    // end date they settle on.
+    for (const el of [startEl, endEl]) {
+      el.addEventListener('input', _syncEndDayHint);
+      el.addEventListener('change', _syncEndDayHint);
+    }
+    const dateEndEl = document.getElementById('cal-f-date-end');
+    dateEndEl?.addEventListener('input', () => { delete dateEndEl.dataset.autoAdvanced; });
+    for (const id of ['cal-f-date', 'cal-f-date-end', 'cal-f-allday']) {
+      document.getElementById(id)?.addEventListener('change', _syncEndDayHint);
+      document.getElementById(id)?.addEventListener('input', _syncEndDayHint);
+    }
+    _syncEndDayHint();
   })();
   // Custom reminder picker
   document.getElementById('cal-f-remind')?.addEventListener('change', (e) => {
@@ -4081,17 +4125,10 @@ function _stopToolbarClock() {
 }
 
 function _fmtTime(s) {
-  if (!s || s.length < 16) return '';
   // Tz-aware timestamps from CalDAV/import are stored as UTC instants and
   // serialized with Z/offset. Display them in the browser's local timezone;
   // legacy naive timestamps keep their written wall-clock time.
-  if (/[Zz]$|[+\-]\d{2}:?\d{2}$/.test(s)) {
-    const d = new Date(s);
-    if (!isNaN(d)) {
-      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-    }
-  }
-  return s.slice(11, 16);
+  return _clockOf(s);
 }
 
 function _fmtTimeSeconds(s) {

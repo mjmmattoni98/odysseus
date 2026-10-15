@@ -65,15 +65,20 @@
   --color-danger: #c0392b;
   --color-recording: #ff3b30;
   --color-recording-hover: #d63031;
-  --color-muted: #888;
-  --color-muted-alt: #6b7280;
+  /* Muted/secondary text follows the active theme instead of fixed greys:
+     a mix of --fg into --bg keeps WCAG AA (>= 4.5:1) on --bg and --panel
+     for every built-in theme whose own --fg passes. The fixed #888/#6b7280
+     greys measured ~4.0:1 / 2.9:1 on the dark default and 3.2:1 / 4.4:1
+     on light. */
+  --color-muted: color-mix(in srgb, var(--fg) 82%, var(--bg));
+  --color-muted-alt: color-mix(in srgb, var(--fg) 76%, var(--bg));
   --color-accent: #00aaff;
   --color-agent-active: #00ff00;
   --color-brand-blue: #3b82f6;
   --color-blind-orange: #ff9800;
   --color-save-green: var(--color-success);
   --color-link-hover: #66c7ff;
-  --color-subheader: #6b8a94;
+  --color-subheader: var(--color-muted-alt);
   --select-bg: var(--bg);
   --select-fg: var(--fg);
   --select-option-bg: color-mix(in srgb, var(--panel) 74%, var(--bg));
@@ -174,6 +179,12 @@ html {
 :root.density-compact .msg { padding: 6px 10px; margin-bottom: 4px; }
 :root.density-compact .list-item { padding: 4px 8px; }
 :root.density-compact .sidebar .section { padding: 0; }
+/* Sidebar row text: comfortable (default) is 11px in 01-agent-chat.css;
+   compact keeps the previous tighter sizes, spacious goes one step up. */
+:root.density-compact .list-item .grow { font-size: 9.75px; }
+:root.density-compact .section-header-flex .section-title { font-size: 10px; }
+:root.density-spacious .list-item .grow { font-size: 12px; }
+:root.density-spacious .section-header-flex .section-title { font-size: 12px; }
 :root.density-spacious { font-size: 16px; }
 :root.density-spacious .msg { padding: 14px 18px; margin-bottom: 12px; }
 :root.density-spacious .list-item { padding: 8px 12px; }

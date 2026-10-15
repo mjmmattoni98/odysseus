@@ -48,9 +48,10 @@ ODYSSEUS_IMAGE=ghcr.io/odysseus-dev/odysseus:1.0.2-7c8070f
 
 Browse current tags at <https://github.com/odysseus-dev/odysseus/pkgs/container/odysseus>. (Until this package is made public and linked to the repo by an org owner, pulls fall back to the local build automatically — that fallback is intentional.)
 
-Open `http://localhost:7000` when the containers are healthy. Docker Compose
-binds the web UI to `127.0.0.1` by default. If the port is taken, set
-`APP_PORT=7001` in `.env` and recreate the container. Set `APP_BIND=0.0.0.0`
+Open `http://localhost:7011` when the containers are healthy. Docker Compose
+publishes the web UI on host port `7011` (the app listens on `7000` inside the
+container) and binds it to `127.0.0.1` by default. If the port is taken, set
+`APP_PORT=7012` in `.env` and recreate the container. Set `APP_BIND=0.0.0.0`
 only when you intentionally want LAN/reverse-proxy access.
 
 > **On Apple Silicon (M-series) Macs:** Docker can't reach the Metal GPU, so
@@ -529,12 +530,12 @@ Odysseus is a self-hosted workspace with powerful local tools: shell access, fil
 ### Private or proxied deployments
 Odysseus serves plain HTTP on its app port. Docker Compose binds Odysseus and the bundled services to `127.0.0.1` by default, so a typical production/private setup is:
 
-1. Keep Odysseus on localhost, for example `127.0.0.1:7000`.
+1. Keep Odysseus on localhost: `127.0.0.1:7011` with Docker Compose (or your `APP_PORT`), `127.0.0.1:7000` for the native `uvicorn` command.
 2. Terminate HTTPS at a trusted reverse proxy or private access gateway.
 3. Put the authenticated Odysseus web/API entrypoint behind that layer.
 4. Keep raw service and model ports internal-only.
 
-Cloudflare Access, Tailscale, Caddy, nginx, and Traefik can all fit this pattern; none are required by Odysseus. If your access layer reaches Odysseus on the same host, proxy to `http://127.0.0.1:7000` and keep `AUTH_ENABLED=true` and `LOCALHOST_BYPASS=false`. Any proxy that forwards `X-Forwarded-Proto: https` gets `Secure` session cookies without configuration, so `SECURE_COOKIES` only needs setting when you want to override that — force it on for a proxy that forwards no scheme at all, or off while you still serve plain HTTP.
+Cloudflare Access, Tailscale, Caddy, nginx, and Traefik can all fit this pattern; none are required by Odysseus. If your access layer reaches Odysseus on the same host, proxy to that address (for example `http://127.0.0.1:7011` for Docker Compose) and keep `AUTH_ENABLED=true` and `LOCALHOST_BYPASS=false`. Any proxy that forwards `X-Forwarded-Proto: https` gets `Secure` session cookies without configuration, so `SECURE_COOKIES` only needs setting when you want to override that — force it on for a proxy that forwards no scheme at all, or off while you still serve plain HTTP.
 `ALLOWED_ORIGINS` lists exact permitted origins for cross-origin browser/API clients; ordinary same-origin reverse-proxy access usually does not need a special CORS entry.
 
 #### Faster over the network: HTTP/2
@@ -558,8 +559,8 @@ HTTPS but not HTTP/2 — uvicorn does not speak it.
 for your platform; on macOS, `brew install caddy`.
 
 **2. Write a `Caddyfile`.** Pick the block that matches how you reach the
-machine. Replace `7000` if Odysseus listens elsewhere — the macOS start script
-uses `7860`.
+machine. Replace `7000` if Odysseus listens elsewhere — Docker Compose publishes
+`7011` by default, and the macOS start script uses `7860`.
 
 Public domain, Caddy obtains and renews the certificate itself:
 
@@ -694,7 +695,8 @@ Common internal-only ports from the default docs/compose setup:
 
 | Port | Service |
 |---|---|
-| `7000` | Odysseus raw app port |
+| `7000` | Odysseus raw app port (native `uvicorn`; also the port inside the Docker container) |
+| `7011` | Odysseus web UI host port published by Docker Compose (`APP_PORT`) |
 | `8080` | SearXNG |
 | `8091` | ntfy |
 | `8100` | ChromaDB host port for manual/compose access |
@@ -714,7 +716,7 @@ Key settings:
 | `SEARXNG_INSTANCE` | `http://localhost:8080` | SearXNG URL. Docker overrides this to `http://searxng:8080`. |
 | `SEARXNG_SECRET` | generated on first Docker boot | Optional SearXNG cookie/CSRF secret. Leave blank unless you need to pin it. |
 | `APP_BIND` | `127.0.0.1` | Docker Compose host bind address for the web UI. Use `0.0.0.0` only for intentional LAN/reverse-proxy access. |
-| `APP_PORT` | `7000` | Docker Compose host port for the web UI. |
+| `APP_PORT` | `7011` | Docker Compose host port for the web UI. |
 | `APP_DATA_DIR` | `./data` | Docker Compose host directory for application data volumes. |
 | `APP_LOGS_DIR` | `./logs` | Docker Compose host directory for application logs. |
 | `AUTH_ENABLED` | `true` | Enable/disable login |

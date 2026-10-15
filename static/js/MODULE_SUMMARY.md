@@ -136,7 +136,7 @@ The largest and most central subsystem. Chat submission → backend SSE → prog
 
 | Module | Responsibility |
 |---|---|
-| **`gallery.js`** / **`galleryEditor.js`** | Gallery/image library and canvas editor entry points. |
+| **`gallery.js`** / **`galleryEditor.js`** | Gallery/image library and canvas editor entry points. `galleryImageRecord.js` holds the pure record helpers (display/edited dates, applying rotate/replace responses). |
 | **`emailInbox.js`** / **`emailLibrary/`** | Email inbox reader and library modal. `emailLibrary.js` is a re-export wrapper; `emailLibrary/index.js` owns the panel, list and cards, with `settingsPage.js`, `unsubscribe.js`, `reader.js`, `menus.js`, `bodyRender.js`, `attachments.js` and `aiReply.js` alongside it plus the `utils.js` / `signatureFold.js` / `replyRecipients.js` / `state.js` leaves. |
 | **`calendar.js`** / **`calendar/utils.js`** / **`calendar/reminders.js`** | Calendar views, event forms, reminders. |
 | **`tasks.js`** | Scheduled task/recurring LLM job UI. |
@@ -161,11 +161,13 @@ The largest and most central subsystem. Chat submission → backend SSE → prog
 | **`compare/index.js`** (with `compare/state.js`, `compare/stream.js`, `compare/panes.js`, `compare/selector.js`, `compare/scoreboard.js`, `compare/probe.js`, `compare/vote.js`, `compare/icons.js`) | Model compare mode: parallel streams, panes, scoring, vote UI. |
 | **`censor.js`** | Text/image censor overlay toggles. |
 | **`a11y.js`** | Accessibility helpers. |
+| **`a11yLabel.js`** | `setActionLabel()`: sets `title` and `aria-label` together for controls whose action changes with state (composer send/queue/stop/new chat, Compare send/stop). Side-effect free, unlike `a11y.js`. |
+| **`buildIdentity.js`** | `formatBuildIdentity()`: formats `/api/version` into the build identity shown by both the login footer and the Settings sidebar footer. |
 | **`platform.js`** | Platform detection (macOS/Windows/Linux) and keyboard-modifier helpers. |
 | **`escMenuStack.js`** | Stack manager for dismissible popups. |
 | **`dragSort.js`** | Drag-to-sort shared behavior. |
 | **`tourHints.js`** / **`tourAutoplay.js`** | Onboarding tour helpers. |
-| **`color/hex.js`**, **`colorPicker.js`**, **`langIcons.js`**, **`util/ordinal.js`** | Small utility modules for color, language icons, and formatting. |
+| **`color/hex.js`**, **`colorPicker.js`**, **`langIcons.js`**, **`util/ordinal.js`**, **`util/utcTimestamp.js`** | Small utility modules for color, language icons, formatting, and parsing UTC-column timestamps. |
 
 ---
 

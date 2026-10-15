@@ -5,6 +5,7 @@ from services.hwfit.models import (
     get_models, is_prequantized, _active_params_b, QUANT_BYTES_PER_PARAM,
     QUANT_SPEED_MULT, QUANT_QUALITY_PENALTY,
 )
+from services.hwfit.facets import classify_model_facets, chat_rank_tier
 
 GPU_BANDWIDTH = {
     "5090": 1792, "5080": 960, "5070 ti": 896, "5070": 672, "5060 ti": 448, "5060": 256,
@@ -705,6 +706,11 @@ def _matches_search(model, search):
     return True
 
 
+# use_case filters that explicitly ask for a non-chat model family; every other
+# view (None/general/chat/coding/reasoning/multimodal) ranks chat models first.
+_NON_CHAT_USE_CASES = frozenset({"embedding", "tts", "stt", "image_gen"})
+
+
 def rank_models(system, use_case=None, limit=50, search=None, sort="score", quant=None, target_context=None, fit_only=False):
     """Rank all models against detected hardware. Returns sorted list of fit results.
 
@@ -749,6 +755,7 @@ def rank_models(system, use_case=None, limit=50, search=None, sort="score", quan
                 "capabilities": im.get("capabilities", []),
                 "description": im.get("description", ""),
                 "dependency_package": im.get("dependency_package", ""),
+                **classify_model_facets({**im, "name": im["id"], "pipeline_tag": im.get("pipeline_tag") or "text-to-image"}),
             })
         if use_case == "image_gen":
             sort_fn = SORT_KEYS.get(sort, SORT_KEYS["score"])
@@ -854,6 +861,10 @@ def rank_models(system, use_case=None, limit=50, search=None, sort="score", quan
             if use_case != model_uc and use_case != "general":
                 continue
 
+        # Memory fit (fit_level) is only one facet; label what the model is
+        # for and which engines can load it so "perfect" never reads as
+        # "a good chat model that runs here".
+        result.update(classify_model_facets(m))
         results.append(result)
 
     # Pick the visible SET by the REQUESTED column. Per-user feedback: sorting
@@ -872,5 +883,11 @@ def rank_models(system, use_case=None, limit=50, search=None, sort="score", quan
     # ascending → truncate kept the 50 SMALLEST models and "highest VRAM"
     # could never appear, breaking the column-click toggle.
     results.sort(key=sort_fn, reverse=True)
+    if use_case not in _NON_CHAT_USE_CASES:
+        # Chat-oriented views (the default): stable partition so embeddings,
+        # TTS, time-series, base checkpoints... never outrank chat models just
+        # because they are tiny and fit "perfectly". They stay in the list,
+        # after the chat-capable (and unknown-task) rows.
+        results.sort(key=chat_rank_tier)
     results = results[:limit]
     return results

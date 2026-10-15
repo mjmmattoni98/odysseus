@@ -2054,7 +2054,10 @@ def _recover_empty_session_model(sess, session_id: str, owner: str | None = None
                 return False
         if not visible:
             return False
-        model = visible[0]
+        # Same picker as default resolution: never a model the endpoint
+        # reported as unable to chat (cached capabilities, no probe).
+        from src.endpoint_resolver import _first_chat_model
+        model = _first_chat_model(visible, url=getattr(ep, "base_url", "") or None)
         if not isinstance(model, str) or not model.strip():
             return False
         model = model.strip()

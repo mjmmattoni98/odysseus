@@ -3438,11 +3438,17 @@ async def action_cookbook_serve(
                     if _ep and _ep.cached_models:
                         _models = json.loads(_ep.cached_models or "[]")
                         if isinstance(_models, list) and _models:
-                            selected_model = str(_models[0])
+                            from src.endpoint_resolver import _first_chat_model
+                            selected_model = _first_chat_model(_models, url=_ep.base_url)
                 finally:
                     _db.close()
             except Exception:
                 pass
+            if not selected_model:
+                # Every model the serve lists reported it cannot chat: keep
+                # the working defaults rather than route chat to it.
+                raise RuntimeError("the served endpoint lists no chat-capable model")
+            selected_model = str(selected_model)
             from src.settings import load_settings as _load_settings, save_settings as _save_settings
             _settings = _load_settings()
             _settings["default_endpoint_id"] = endpoint_id

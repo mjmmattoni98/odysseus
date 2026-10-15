@@ -2195,3 +2195,140 @@ def test_manual_refresh_timeout_keeps_cached_models_and_warns(monkeypatch):
     assert db.commits == 0
     assert response.headers["X-Model-Refresh-Status"] == "failed"
     assert "kept cached models" in response.headers["X-Model-Refresh-Warning"]
+
+
+# ── chat eligibility from Ollama capability reports (QA audit 2026-10-12) ──
+# clef-flash:latest reports ["decision", "vision"] and Ollama rejects chat for
+# it with HTTP 400; it must not be listed, auto-selected, or probed "ok".
+
+_OLLAMA_BASE = "http://localhost:11434"
+_OLLAMA_SHOW = {
+    "clef-flash:latest": ["decision", "vision"],
+    "all-minilm:l6-v2": ["embedding"],
+    "gemma4:12b": ["completion", "vision", "tools", "thinking"],
+}
+_OLLAMA_TAGS = ["clef-flash:latest", "all-minilm:l6-v2", "mystery:1b", "gemma4:12b"]
+
+
+@pytest.fixture
+def ollama_caps(monkeypatch):
+    """Stub the local Ollama: /api/show from _OLLAMA_SHOW, /api/tags listing."""
+    import src.ollama_capabilities as oc
+
+    oc.reset_cache()
+    monkeypatch.setattr(oc, "_registered_kind", lambda url: None)
+
+    def fake_post(url, json=None, timeout=None, **kwargs):
+        if not url.endswith("/api/show"):
+            pytest.fail(f"unexpected generation request to {url}")
+        caps = _OLLAMA_SHOW.get(json["model"])
+        payload = {"capabilities": caps} if caps is not None else {"details": {}}
+        return SimpleNamespace(is_success=True, status_code=200, json=lambda: payload)
+
+    def fake_list(url, headers=None, **kwargs):
+        payload = {"models": [{"name": name} for name in _OLLAMA_TAGS]}
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+
+    monkeypatch.setattr(oc.httpx, "post", fake_post)
+    monkeypatch.setattr("src.llm_core.httpx_get_kimi_aware", fake_list)
+    yield oc
+    oc.reset_cache()
+
+
+def test_post_ollama_endpoint_skips_non_chat_models_and_defaults_to_verified_chat(monkeypatch, ollama_caps):
+    db = _PinnedFakeDb([])
+    settings = _patch_create_deps(monkeypatch, db, settings={})
+    create = _get_route("/api/model-endpoints", "POST")
+
+    result = create(_PinnedFakeRequest(), base_url=_OLLAMA_BASE, **_create_form_kwargs(skip_probe="false"))
+
+    assert result["models"] == ["mystery:1b", "gemma4:12b"]
+    assert json.loads(db.added[0].cached_models) == ["mystery:1b", "gemma4:12b"]
+    # Listed first but unverified loses to the model the server verifies.
+    assert settings["default_endpoint_id"] == db.added[0].id
+    assert settings["default_model"] == "gemma4:12b"
+    assert result["non_chat_models"] == [
+        {"model": "all-minilm:l6-v2", "reason": "Embedding model (no chat)"},
+        {"model": "clef-flash:latest", "reason": "Model does not support chat (capabilities: decision, vision)"},
+    ]
+    assert result["capability_source"] == "ollama"
+    assert result["capability_unknown_models"] == ["mystery:1b"]
+
+
+def test_list_model_endpoints_hides_cached_non_chat_models_and_marks_unknown(monkeypatch, ollama_caps):
+    # A list cached before the model was known to be non-chat.
+    ep = _make_endpoint(base_url=_OLLAMA_BASE, cached_models=json.dumps(["clef-flash:latest", "mystery:1b", "gemma4:12b"]))
+    db = _PinnedFakeDb([ep])
+    monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+    list_endpoints = _get_route("/api/model-endpoints", "GET")
+
+    # Cache-only: before any capability report exists nothing is hidden and
+    # every model is explicitly unknown.
+    cold = list_endpoints(_PinnedFakeRequest())[0]
+    assert cold["models"] == ["clef-flash:latest", "mystery:1b", "gemma4:12b"]
+    assert cold["capability_unknown_models"] == cold["models"]
+
+    for model in ("clef-flash:latest", "mystery:1b", "gemma4:12b"):
+        ollama_caps.capability_tokens(_OLLAMA_BASE, model)
+    warm = list_endpoints(_PinnedFakeRequest())[0]
+    assert warm["models"] == ["mystery:1b", "gemma4:12b"]
+    assert warm["non_chat_models"] == [
+        {"model": "clef-flash:latest", "reason": "Model does not support chat (capabilities: decision, vision)"},
+    ]
+    assert warm["capability_source"] == "ollama"
+    assert warm["capability_unknown_models"] == ["mystery:1b"]
+
+
+def test_list_model_endpoints_without_capability_source_reports_none(monkeypatch):
+    ep = _make_endpoint(base_url="http://localhost:1234/v1", cached_models=json.dumps(["local-model"]))
+    db = _PinnedFakeDb([ep])
+    monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+    monkeypatch.setattr("src.ollama_capabilities._registered_kind", lambda url: None)
+    monkeypatch.setattr("src.ollama_capabilities._probe_version", lambda root, timeout: None)
+
+    row = _get_route("/api/model-endpoints", "GET")(_PinnedFakeRequest())[0]
+
+    assert row["models"] == ["local-model"]
+    assert row["capability_source"] is None
+    assert row["non_chat_models"] == []
+
+
+def test_probe_selected_reports_non_chat_model_as_incompatible(monkeypatch, ollama_caps):
+    ep = _make_endpoint(base_url=_OLLAMA_BASE, cached_models=json.dumps(_OLLAMA_TAGS))
+    db = _PinnedFakeDb([ep])
+    monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+    monkeypatch.setattr(model_routes, "_resolve_probe_key", lambda ep: None)
+    probe = _get_route("/api/probe-selected", "POST")
+
+    result = probe(_PinnedFakeRequest(), {"models": [
+        {"model": "clef-flash:latest", "endpoint_id": "ep1"},
+        {"model": "gemma4:12b", "endpoint_id": "ep1"},
+    ]})["results"]
+
+    assert result[0]["status"] == "fail"
+    assert result[0]["incompatible"] is True
+    assert "does not support chat" in result[0]["error"]
+    assert result[1]["status"] == "ok"
+
+
+def test_default_chat_without_a_model_skips_a_cached_non_chat_model(monkeypatch, ollama_caps):
+    import src.auth_helpers as auth_helpers
+
+    ep = _make_endpoint(base_url=_OLLAMA_BASE, cached_models=json.dumps(["clef-flash:latest", "gemma4:12b"]))
+    monkeypatch.setattr(model_routes, "SessionLocal", lambda: _PinnedFakeDb([ep]))
+    monkeypatch.setattr(model_routes, "_load_settings", lambda: {"default_endpoint_id": "ep1", "default_model": ""})
+    monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda u: u)
+    monkeypatch.setattr(auth_helpers, "get_current_user", lambda req: None)
+    # A model-list refresh cached both reports; the composer default is
+    # resolved on page load, so it must read that cache, not probe.
+    for model in ("clef-flash:latest", "gemma4:12b"):
+        ollama_caps.capability_tokens(_OLLAMA_BASE, model)
+    monkeypatch.setattr(ollama_caps.httpx, "post", lambda *a, **k: pytest.fail("default-chat probed /api/show"))
+
+    result = _get_route("/api/default-chat", "GET")(_PinnedFakeRequest())
+
+    assert result["endpoint_id"] == "ep1"
+    assert result["model"] == "gemma4:12b"

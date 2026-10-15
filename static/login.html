@@ -323,14 +323,19 @@
 <script nonce="{{CSP_NONCE}}">
 (async () => {
   const appUrl = window.__odysseusLoginAppUrl || ((path) => path);
-  // Load version
-  try {
-    const vr = await fetch(appUrl('/api/version'));
-    if (vr.ok) {
-      const vd = await vr.json();
-      document.getElementById('version-label').textContent = 'v' + (vd.build || vd.version);
-    }
-  } catch(e) {}
+  // Load version through the formatter the Settings footer uses, so both
+  // pages name the running build identically. Not awaited: the form below
+  // must not wait on an informational footer.
+  Promise.all([
+    fetch(appUrl('/api/version')).then((res) => (res.ok ? res.json() : null)),
+    import(appUrl('/static/js/buildIdentity.js')),
+  ]).then(([payload, { formatBuildIdentity }]) => {
+    const identity = payload && formatBuildIdentity(payload);
+    if (!identity) return;
+    const footer = document.getElementById('version-label');
+    footer.textContent = identity.label;
+    if (identity.commitTitle) footer.title = identity.commitTitle;
+  }).catch(() => {});
 
   // Prefill last username
   const usernameInput = document.getElementById('username');
@@ -648,6 +653,10 @@ if (window.visualViewport) {
 // early-returns at `#themeGrid` which doesn't exist on this page, so
 // `applyBgPattern` would never fire on its own. We call it directly
 // here against the pattern the bootstrap already chose.
+//
+// This page has no session, so tell theme.js to skip its cross-device sync:
+// the per-user theme-preference endpoints would only answer 401 here.
+window.__odysseusLoggedOutPage = true;
 try {
   const tm = await import((window.__odysseusLoginAppUrl || ((path) => path))('/static/js/theme.js'));
   const pattern = window.__loginBgPattern;

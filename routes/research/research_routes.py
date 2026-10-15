@@ -7,7 +7,7 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -71,15 +71,6 @@ def _find_owned_research_path(session_id: str, user: str) -> Path | None:
 
 logger = logging.getLogger(__name__)
 
-# Model-name substrings that are NOT chat/generation models — research must
-# never pick these as its model. An OpenAI-style endpoint often lists
-# `text-embedding-ada-002` etc. first in its model list, which is why research
-# was failing with "Cannot reach model 'text-embedding-ada-002'".
-_NON_CHAT_MODEL = (
-    "text-embedding", "embedding", "tts-", "whisper", "dall-e",
-    "moderation", "rerank", "reranker", "clip", "stable-diffusion",
-)
-
 _RESEARCH_IMAGE_BLOCKLIST = {
     "cdn.shopify.com/s/files/1/0179/4388/7926/files/icon.png",
 }
@@ -127,14 +118,6 @@ def _research_thumbnail(data: dict) -> str:
             seen.add(image)
             return image
     return ""
-
-
-def _first_chat_model(models) -> str:
-    """First model that isn't an embedding/tts/etc. — falls back to models[0]."""
-    for m in (models or []):
-        if not any(p in str(m).lower() for p in _NON_CHAT_MODEL):
-            return m
-    return (models[0] if models else "")
 
 
 def _resolve_research_endpoint(sess, owner: Optional[str] = None) -> tuple:
@@ -198,12 +181,114 @@ def _resolve_endpoint_runtime(ep, owner=None, model: Optional[str] = None):
         try:
             models = json.loads(ep.cached_models) if ep.cached_models else []
             if models:
-                ep_model = _first_chat_model(models)
+                # Shared picker: skips embedding/tts names and models whose
+                # cached capability report says they cannot chat (no probe).
+                from src.endpoint_resolver import _first_chat_model
+                ep_model = _first_chat_model(models, url=base) or ""
         except Exception:
             pass
     if not ep_model:
         return None
     return build_chat_url(base), ep_model, build_headers(api_key, base)
+
+
+def _resolve_start_endpoint(user: str, endpoint_id: Optional[str], model: Optional[str]) -> tuple:
+    """(url, model, headers) for a research launch; raises HTTPException.
+
+    An explicit endpoint_id must be one of the caller's enabled endpoints.
+    Otherwise use research → utility → default → chat, then the caller's
+    first enabled endpoint.
+    """
+    if endpoint_id:
+        from src.database import SessionLocal
+        db = SessionLocal()
+        try:
+            # Owner-scoped: never resolve another user's private endpoint
+            # (and its decrypted api_key / internal base_url). A scoped miss
+            # reads as 404 so the endpoint's existence isn't revealed.
+            ep = _owned_enabled_endpoint(db, user, endpoint_id)
+            if not ep:
+                raise HTTPException(404, "Endpoint not found or disabled")
+            resolved = _resolve_endpoint_runtime(ep, owner=user, model=model)
+            if not resolved:
+                raise HTTPException(400, "Endpoint is not configured with a usable model.")
+            return resolved
+        finally:
+            db.close()
+
+    ep_url, ep_model, ep_headers = resolve_endpoint("research", owner=user)
+    if not ep_url:
+        ep_url, ep_model, ep_headers = resolve_endpoint("utility", owner=user)
+    # When neither research nor utility is configured, use the user's
+    # configured DEFAULT model (default_endpoint_id/default_model) rather
+    # than arbitrarily grabbing the first enabled endpoint's first model
+    # (which surfaced gpt-3.5). "Default" should mean the default model.
+    if not ep_url:
+        ep_url, ep_model, ep_headers = resolve_endpoint("default", owner=user)
+    if not ep_url:
+        ep_url, ep_model, ep_headers = resolve_endpoint("chat", owner=user)
+    if not ep_url:
+        from src.database import SessionLocal
+        db = SessionLocal()
+        try:
+            # Owner-scoped first-enabled fallback: the caller's own rows
+            # + legacy null-owner shared rows only — never borrow another
+            # user's private endpoint/api_key. Same fix as the
+            # /api/v1/chat fallback (webhook_routes._first_enabled_endpoint).
+            ep = _owned_enabled_endpoint(db, user)
+            if ep:
+                resolved = _resolve_endpoint_runtime(ep, owner=user)
+                if resolved:
+                    ep_url, ep_model, ep_headers = resolved
+        finally:
+            db.close()
+    if not ep_url:
+        raise HTTPException(400, "No endpoints configured. Add one in Settings first.")
+    if model:
+        ep_model = model
+    return ep_url, ep_model, ep_headers
+
+
+def _validated_source_rules(allowed, excluded, official_only) -> dict:
+    """Normalize launch-time source rules; invalid domains are a 400."""
+    from src.research_sources import normalize_domain_list
+    try:
+        return {
+            "allowed_domains": list(normalize_domain_list(allowed, field_name="allowed domains")),
+            "excluded_domains": list(normalize_domain_list(excluded, field_name="excluded domains")),
+            "official_only": bool(official_only),
+        }
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+def _reject_rules_that_permit_nothing(source_rules: dict, query: str) -> None:
+    """400 when exclusions (from the form or the question) rule out every
+    allowed domain, instead of starting a run that can read nothing."""
+    from src.research_sources import effective_source_rules
+    rules = effective_source_rules(source_rules, query)
+    if rules.permits_nothing:
+        raise HTTPException(
+            400,
+            "The excluded domains rule out every allowed domain ("
+            + ", ".join(rules.allowed_domains)
+            + "), so nothing could be read. Remove an exclusion or allow another domain.",
+        )
+
+
+def _library_items_latest_versions(items: list) -> list:
+    """Collapse refreshed research to its newest version per question."""
+    groups: dict = {}
+    for item in items:
+        key = item.get("lineage_id") or item["id"]
+        groups.setdefault(key, []).append(item)
+    latest = []
+    for versions in groups.values():
+        versions.sort(key=lambda x: (x.get("version") or 1, x.get("completed_at") or 0))
+        newest = dict(versions[-1])
+        newest["version_count"] = len(versions)
+        latest.append(newest)
+    return latest
 
 
 def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
@@ -446,9 +531,20 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                     "completed_at": d.get("completed_at", 0),
                     "archived": bool(d.get("archived")),
                     "thumbnail": _research_thumbnail(d),
+                    "lineage_id": d.get("lineage_id") or p.stem,
+                    "version": d.get("version") or 1,
+                    "previous_version_id": d.get("previous_version_id") or "",
+                    "citation_warning_count": len(d.get("citation_warnings") or []),
+                    "change_counts": (d.get("change_summary") or {}).get("counts") or {},
+                    "report_length": (d.get("report_length") or {}).get("name") or "",
+                    "source_rules": d.get("source_rules") or {},
                 })
             except Exception:
                 continue
+
+        # A refreshed question appears once, as its newest version; older
+        # versions stay on disk and are reachable from the report's history.
+        items = _library_items_latest_versions(items)
 
         # Sort
         if sort == "recent":
@@ -533,6 +629,12 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
         extraction_timeout: Optional[int] = Field(default=None, ge=15, le=3600)
         extraction_concurrency: Optional[int] = Field(default=None, ge=1, le=12)
         category: Optional[Literal["product", "comparison", "howto", "factcheck"]] = None
+        # Auto follows length wording in the query ("briefly", "in 200 words").
+        report_length: Optional[Literal["auto", "brief", "standard", "detailed"]] = None
+        # Source rules; merged with restrictions stated in the query.
+        allowed_domains: Optional[List[str]] = Field(default=None, max_length=50)
+        excluded_domains: Optional[List[str]] = Field(default=None, max_length=50)
+        official_only: bool = False
 
     @router.post("/api/research/start")
     async def research_start(body: ResearchStartRequest, request: Request):
@@ -564,53 +666,14 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             if delivery is None:
                 raise HTTPException(503, 'Background chat delivery is unavailable')
 
-        if body.endpoint_id:
-            from src.database import SessionLocal
-            db = SessionLocal()
-            try:
-                # Owner-scoped: never resolve another user's private endpoint
-                # (and its decrypted api_key / internal base_url). A scoped miss
-                # reads as 404 so the endpoint's existence isn't revealed.
-                ep = _owned_enabled_endpoint(db, user, body.endpoint_id)
-                if not ep:
-                    raise HTTPException(404, "Endpoint not found or disabled")
-                resolved = _resolve_endpoint_runtime(ep, owner=user, model=body.model)
-                if not resolved:
-                    raise HTTPException(400, "Endpoint is not configured with a usable model.")
-                ep_url, ep_model, ep_headers = resolved
-            finally:
-                db.close()
-        else:
-            ep_url, ep_model, ep_headers = resolve_endpoint("research", owner=user)
-            if not ep_url:
-                ep_url, ep_model, ep_headers = resolve_endpoint("utility", owner=user)
-            # When neither research nor utility is configured, use the user's
-            # configured DEFAULT model (default_endpoint_id/default_model) rather
-            # than arbitrarily grabbing the first enabled endpoint's first model
-            # (which surfaced gpt-3.5). "Default" should mean the default model.
-            if not ep_url:
-                ep_url, ep_model, ep_headers = resolve_endpoint("default", owner=user)
-            if not ep_url:
-                ep_url, ep_model, ep_headers = resolve_endpoint("chat", owner=user)
-            if not ep_url:
-                from src.database import SessionLocal
-                db = SessionLocal()
-                try:
-                    # Owner-scoped first-enabled fallback: the caller's own rows
-                    # + legacy null-owner shared rows only — never borrow another
-                    # user's private endpoint/api_key. Same fix as the
-                    # /api/v1/chat fallback (webhook_routes._first_enabled_endpoint).
-                    ep = _owned_enabled_endpoint(db, user)
-                    if ep:
-                        resolved = _resolve_endpoint_runtime(ep, owner=user)
-                        if resolved:
-                            ep_url, ep_model, ep_headers = resolved
-                finally:
-                    db.close()
-            if not ep_url:
-                raise HTTPException(400, "No endpoints configured. Add one in Settings first.")
-            if body.model:
-                ep_model = body.model
+        source_rules = _validated_source_rules(
+            getattr(body, "allowed_domains", None),
+            getattr(body, "excluded_domains", None),
+            getattr(body, "official_only", False),
+        )
+        _reject_rules_that_permit_nothing(source_rules, body.query)
+        report_length = getattr(body, "report_length", None) or "auto"
+        ep_url, ep_model, ep_headers = _resolve_start_endpoint(user, body.endpoint_id, body.model)
 
         # 0 = auto research capped at 20.
         effective_max_rounds = body.max_rounds
@@ -618,7 +681,21 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             effective_max_rounds = 2
         if body.origin_chat_id:
             delivery.register(session_id, body.origin_chat_id, user, 'research', body.query, effective_max_rounds)
-        research_handler.start_research(
+        # Persisted with the result so a later refresh re-runs the question
+        # with the same settings.
+        run_settings = {
+            "max_rounds": effective_max_rounds,
+            "search_provider": body.search_provider or "",
+            "endpoint_id": body.endpoint_id or "",
+            "model": body.model or "",
+            "max_time": body.max_time,
+            "extraction_timeout": body.extraction_timeout,
+            "extraction_concurrency": body.extraction_concurrency,
+            "category": body.category or "",
+            "report_length": report_length,
+            "source_rules": source_rules,
+        }
+        started = research_handler.start_research(
             session_id=session_id,
             query=body.query,
             llm_endpoint=ep_url,
@@ -633,13 +710,134 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             owner=user,
             on_complete=(lambda sid, result, sources, findings: delivery.complete(sid, result, sources))
                 if body.origin_chat_id else None,
+            report_length=report_length,
+            source_rules=source_rules,
+            run_settings=run_settings,
         )
+        started = started if isinstance(started, dict) else {}
         return {
             "session_id": session_id,
             "status": "running",
             "query": body.query,
             "category": body.category or "",
             "mode": "research",
+            # Effective rules/length after merging the query's own wording.
+            "source_rules": started.get("source_rules") or source_rules,
+            "report_length": started.get("report_length") or {"name": report_length},
+        }
+
+    @router.post("/api/research/{session_id}/refresh")
+    async def research_refresh(session_id: str, request: Request):
+        """Re-run a saved research question with its saved settings and source
+        rules. The result is saved as a new version linked to this one; this
+        version's file is left untouched."""
+        from src.auth_helpers import require_privilege
+        from src.research_versions import lineage_id, next_version_number, version_number
+        user = require_privilege(request, "can_use_research")
+        _validate_session_id(session_id)
+        path = _find_owned_research_path(session_id, user)
+        if path is None:
+            raise HTTPException(404, "Research not found")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            raise HTTPException(404, "Research not found")
+        query = str(data.get("query") or "").strip()
+        if not query or data.get("status", "done") != "done":
+            raise HTTPException(400, "Only completed research with a saved question can be refreshed.")
+        settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
+
+        try:
+            ep_url, ep_model, ep_headers = _resolve_start_endpoint(
+                user, settings.get("endpoint_id") or None, settings.get("model") or None,
+            )
+        except HTTPException as e:
+            if e.status_code != 404:
+                raise
+            # The saved endpoint was removed or disabled since the run; use
+            # the current research default instead of refusing to refresh.
+            ep_url, ep_model, ep_headers = _resolve_start_endpoint(user, None, None)
+
+        def _bounded(value, low, high, default=None):
+            try:
+                return max(low, min(high, int(value)))
+            except (TypeError, ValueError):
+                return default
+
+        category = data.get("category") or settings.get("category") or None
+        if category not in {"product", "comparison", "howto", "factcheck"}:
+            category = None
+        lineage = lineage_id(session_id, data)
+        new_version = next_version_number(Path(DEEP_RESEARCH_DIR), lineage, user)
+        new_session_id = f"rp-{uuid.uuid4().hex[:12]}"
+        previous_version = {
+            "id": session_id,
+            "lineage_id": lineage,
+            "version": version_number(data),
+            "next_version": new_version,
+            "sources": data.get("sources") or [],
+            "raw_report": data.get("raw_report") or data.get("result") or "",
+        }
+        # Effective rules from the saved run (explicit + read from the query).
+        source_rules = data.get("source_rules") or settings.get("source_rules") or {}
+        report_length = settings.get("report_length") or (data.get("report_length") or {}).get("name") or "auto"
+        max_rounds = _bounded(settings.get("max_rounds"), 0, 20, 0)
+        run_settings = {**settings, "max_rounds": max_rounds, "report_length": report_length,
+                        "source_rules": source_rules, "category": category or ""}
+        started = research_handler.start_research(
+            session_id=new_session_id,
+            query=query,
+            llm_endpoint=ep_url,
+            llm_model=ep_model,
+            max_time=_bounded(settings.get("max_time"), 60, 1800, 300),
+            llm_headers=ep_headers,
+            max_rounds=max_rounds,
+            search_provider=settings.get("search_provider") or None,
+            category=category,
+            extraction_timeout=_bounded(settings.get("extraction_timeout"), 15, 3600),
+            extraction_concurrency=_bounded(settings.get("extraction_concurrency"), 1, 12),
+            owner=user,
+            report_length=report_length,
+            source_rules=source_rules,
+            run_settings=run_settings,
+            previous_version=previous_version,
+            # Re-read every page: the content cache would otherwise hand the
+            # refresh the previous run's bytes and report them "unchanged".
+            fresh_fetch=True,
+        )
+        started = started if isinstance(started, dict) else {}
+        return {
+            "session_id": new_session_id,
+            "status": "running",
+            "query": query,
+            "category": category or "",
+            "mode": "research",
+            "refresh_of": session_id,
+            "lineage_id": lineage,
+            "version": new_version,
+            "settings": run_settings,
+            "source_rules": started.get("source_rules") or source_rules,
+            "report_length": started.get("report_length") or {"name": report_length},
+        }
+
+    @router.get("/api/research/{session_id}/versions")
+    async def research_versions(session_id: str, request: Request):
+        """All saved versions of this research question, oldest first."""
+        from src.research_versions import lineage_id, list_versions
+        user = _require_user(request)
+        _validate_session_id(session_id)
+        path = _find_owned_research_path(session_id, user)
+        if path is None:
+            raise HTTPException(404, "Research not found")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            raise HTTPException(404, "Research not found")
+        lineage = lineage_id(session_id, data)
+        return {
+            "lineage_id": lineage,
+            "current": session_id,
+            "versions": list_versions(Path(DEEP_RESEARCH_DIR), lineage, user),
         }
 
     @router.get('/api/research/chat-jobs/{chat_id}')
@@ -754,11 +952,26 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
         user = _require_user(request)
         _validate_session_id(session_id)
         owned_disk_path = _require_owned_or_active_research_path(session_id, user)
+        saved = {}
+        if owned_disk_path is not None:
+            try:
+                saved = json.loads(owned_disk_path.read_text(encoding="utf-8"))
+            except Exception:
+                saved = {}
+        # Rules, citation check and version links only exist once saved.
+        extras = {
+            "source_rules": saved.get("source_rules") or {},
+            "report_length": saved.get("report_length") or {},
+            "citation_warnings": saved.get("citation_warnings") or [],
+            "version": saved.get("version") or 1,
+            "lineage_id": saved.get("lineage_id") or session_id,
+            "previous_version_id": saved.get("previous_version_id") or "",
+            "change_summary": saved.get("change_summary") or {},
+        }
         result = research_handler.get_result(session_id)
         if result is None:
-            p = owned_disk_path
-            if p is not None:
-                d = json.loads(p.read_text(encoding="utf-8"))
+            if owned_disk_path is not None:
+                d = saved
                 return {
                     "result": d.get("result", ""),
                     "sources": d.get("sources", []),
@@ -769,6 +982,7 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                     "navigation_trace": d.get("navigation_trace", []),
                     "action_trace": d.get("action_trace", []),
                     "category": d.get("category") or "",
+                    **extras,
                 }
             raise HTTPException(404, "No research result available")
         sources = research_handler.get_sources(session_id) or []
@@ -789,6 +1003,7 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             "action_trace": action_trace,
             "category": research_handler.get_category(session_id),
             "mode": research_handler.get_mode(session_id),
+            **extras,
         }
 
     @router.post("/api/research/spinoff/{session_id}")
@@ -875,7 +1090,8 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                         try:
                             models = json.loads(ep.cached_models)
                             if models:
-                                fallback_model = _first_chat_model(models)
+                                from src.endpoint_resolver import _first_chat_model
+                                fallback_model = _first_chat_model(models, url=base) or ""
                         except Exception:
                             pass
                     _merge(fallback_url, fallback_model, fallback_headers)

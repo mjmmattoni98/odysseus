@@ -91,6 +91,14 @@
       // order stays valid regardless of the tag the markup happens to use.
       if (!heading.hasAttribute('aria-level')) heading.setAttribute('aria-level', '2');
     }
+
+    // The header close control is the visible way back on mobile sheets, but
+    // most are glyph-only ("✖", "×"). Name it after the dialog it closes.
+    var close = mc.querySelector('.modal-header .close-btn, .modal-header .modal-close');
+    if (close && !close.getAttribute('aria-label')) {
+      var title = heading ? (heading.textContent || '').replace(/\s+/g, ' ').trim() : '';
+      close.setAttribute('aria-label', title && title.length <= 40 ? 'Close ' + title : 'Close');
+    }
   }
 
   function enhanceModals(root) {

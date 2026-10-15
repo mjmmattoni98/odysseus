@@ -6,12 +6,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict
 
-from core.constants import DATA_DIR
+from core.constants import WEB_CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
 # Cache directories
-CACHE_DIR = Path(DATA_DIR) / "cache"
+CACHE_DIR = Path(WEB_CACHE_DIR)
 SEARCH_CACHE_DIR = CACHE_DIR / "search"
 CONTENT_CACHE_DIR = CACHE_DIR / "content"
 CACHE_MAX_ENTRIES = 1000

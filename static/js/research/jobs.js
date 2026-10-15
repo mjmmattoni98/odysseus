@@ -157,10 +157,11 @@ async function _syncLibrary(options = {}) {
             thumbnail: item.thumbnail || existing.thumbnail || '',
             category: item.category || existing.category || '',
             mode: item.mode || existing.mode || 'research',
+            ..._libraryVersionFields(item),
             _fromLibrary: true,
           };
           for (const [key, value] of Object.entries(updates)) {
-            if (existing[key] !== value) {
+            if (existing[key] !== value && JSON.stringify(existing[key]) !== JSON.stringify(value)) {
               existing[key] = value;
               changed = true;
             }
@@ -178,9 +179,19 @@ async function _syncLibrary(options = {}) {
           mode: item.mode || 'research',
           errorMsg: null, avgDuration: null, modelName: null,
           settings: { max_rounds: item.rounds || 8 },
+          ..._libraryVersionFields(item),
           _es: null, _timerInterval: null, _fromLibrary: true,
         });
       }
+      // The library lists only the newest version of a refreshed question;
+      // drop older versions that are still on screen from an earlier sync.
+      const newestByLineage = new Map((libData.research || [])
+        .map(item => [item.lineage_id || item.id, item.id]));
+      _jobs = _jobs.filter((job) => {
+        if (job.status !== 'done' || !job.lineageId) return true;
+        const newest = newestByLineage.get(job.lineageId);
+        return !newest || newest === job.id;
+      });
     }
     _lastLibrarySyncAt = Date.now();
     _notify();
@@ -188,6 +199,17 @@ async function _syncLibrary(options = {}) {
   finally {
     _librarySyncInFlight = false;
   }
+}
+
+function _libraryVersionFields(item) {
+  return {
+    lineageId: item.lineage_id || item.id,
+    version: item.version || 1,
+    versionCount: item.version_count || 1,
+    previousVersionId: item.previous_version_id || '',
+    citationWarningCount: item.citation_warning_count || 0,
+    changeCounts: item.change_counts || {},
+  };
 }
 
 function _parseDuration(s) {
@@ -253,6 +275,51 @@ export async function retryJob(jobId) {
   await _launchJob(job);
 }
 
+/** Re-run a saved research with its saved settings and source rules. The
+ *  server saves the result as a new version; the old version is kept. */
+export async function refreshJob(jobId) {
+  const previous = _jobs.find(j => j.id === jobId);
+  const job = _makeJob(previous?.query || '', {});
+  job.refreshOf = jobId;
+  _jobs.push(job);
+  _notify();
+  try {
+    const res = await fetch(`${_apiBase}/api/research/${encodeURIComponent(jobId)}/refresh`, {
+      method: 'POST', credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      try { job.errorMsg = JSON.parse(txt).detail || txt; } catch { job.errorMsg = txt; }
+      _jobs = _jobs.filter(j => j !== job);
+      job.status = 'error';
+      _notify();
+      return job;
+    }
+    const data = await res.json();
+    job.id = data.session_id;
+    job.query = data.query || job.query;
+    job.category = data.category || '';
+    job.version = data.version || 2;
+    job.lineageId = data.lineage_id || jobId;
+    job.settings = {
+      ...(data.settings || {}),
+      ...(data.source_rules || {}),
+      report_length: data.report_length?.name || data.settings?.report_length,
+    };
+  } catch (e) {
+    job.errorMsg = e.message;
+    _jobs = _jobs.filter(j => j !== job);
+    job.status = 'error';
+    _notify();
+    return job;
+  }
+  job.status = 'running';
+  job.startedAt = Date.now();
+  _connectStream(job);
+  _notify();
+  return job;
+}
+
 export async function cancelJob(id) {
   const job = _jobs.find(j => j.id === id);
   if (!job) return;
@@ -303,6 +370,7 @@ export function formatPhase(progress, maxRounds) {
     case 'reading': return `${rn}Reading ${p.total_sources || 0} sources`;
     case 'analyzing': return `${rn}Analyzing ${p.total_findings || 0} findings`;
     case 'writing': return `Writing report -- ${p.total_sources || 0} sources`;
+    case 'comparing': return 'Comparing with the previous version...';
     default: return p.phase;
   }
 }
@@ -421,6 +489,11 @@ function _finishJob(job, status) {
   if (job._es) { job._es.close(); job._es = null; }
   if (job._timerInterval) { clearInterval(job._timerInterval); job._timerInterval = null; }
   job.elapsed = Date.now() - (job.startedAt || Date.now());
+  if (status === 'done' && job.refreshOf) {
+    // The refreshed version replaces its predecessor in the list; the old
+    // version stays on disk and is linked from the new report.
+    _jobs = _jobs.filter(j => j === job || j.id !== job.refreshOf);
+  }
   if (status === 'done') {
     if ('Notification' in window && Notification.permission === 'granted') {
       try { new Notification('Research Complete', { body: job.query.slice(0, 80) }); } catch {}
@@ -450,6 +523,10 @@ async function _fetchResult(job) {
     job.action_trace = Array.isArray(d.action_trace) ? d.action_trace : [];
     if (d.category) job.category = d.category;
     if (d.mode) job.mode = d.mode;
+    job.citationWarningCount = Array.isArray(d.citation_warnings) ? d.citation_warnings.length : 0;
+    job.version = d.version || job.version || 1;
+    job.lineageId = d.lineage_id || job.lineageId || job.id;
+    job.changeCounts = d.change_summary?.counts || {};
     _notify();
   } catch {}
 }

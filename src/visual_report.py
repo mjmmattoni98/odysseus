@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Tuple
 
 from bs4 import BeautifulSoup
 
+from src.research_navigator import is_first_party_kind
+from src.research_sources import SourceRules, canonical_url
 from src.research_utils import strip_thinking
 from urllib.parse import urlparse
 
@@ -287,9 +289,15 @@ def _inject_images(
 
 
 def _source_evidence_summary(sources: List[Dict]) -> Dict[str, object]:
-    """Summarize source diversity and quality for the visible report chrome."""
+    """Summarize source diversity and quality for the visible report chrome.
+
+    ``primary`` counts first-party evidence (official and primary kinds, the
+    same classification as ``source_coverage.primary_or_official``);
+    ``official`` is the government/academic share of it.
+    """
     domains = set()
     primary_count = 0
+    official_count = 0
     browser_count = 0
     scores = []
     for source in sources:
@@ -303,8 +311,11 @@ def _source_evidence_summary(sources: List[Dict]) -> Dict[str, object]:
                 domains.add(hostname)
         except Exception:
             pass
-        if str(source.get("source_kind") or "").lower() == "primary":
+        kind = str(source.get("source_kind") or "").strip().lower()
+        if is_first_party_kind(kind):
             primary_count += 1
+            if kind == "official":
+                official_count += 1
         if str(source.get("retrieval") or "").lower() == "browser":
             browser_count += 1
         try:
@@ -317,10 +328,149 @@ def _source_evidence_summary(sources: List[Dict]) -> Dict[str, object]:
         "sources": len(sources),
         "domains": len(domains),
         "primary": primary_count,
+        "official": official_count,
         "browser": browser_count,
         "average_score": round(sum(scores) / len(scores)) if scores else None,
         "rated": len(scores),
     }
+
+
+_CITATION_STATUS_LABELS = {
+    "not_opened": "Never opened",
+    "unread": "Opened, not read",
+    "excluded": "Outside source rules",
+}
+
+
+def _short_url(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").removeprefix("www.")
+    path = parsed.path.rstrip("/")
+    text = f"{host}{path}" if host else str(url or "")
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _mark_citation_warnings(report_html: str, warnings: List[Dict]) -> str:
+    """Flag report links whose page was not read during research."""
+    by_url = {
+        canonical_url(w.get("url")): w for w in warnings or []
+        if isinstance(w, dict) and w.get("url")
+    }
+    if not by_url:
+        return report_html
+    soup = BeautifulSoup(report_html, "html.parser")
+    changed = False
+    for link in soup.find_all("a", href=True):
+        warning = by_url.get(canonical_url(link["href"]))
+        if not warning:
+            continue
+        link["class"] = [*(link.get("class") or []), "citation-unverified"]
+        link["title"] = str(warning.get("reason") or "Not read during research")
+        changed = True
+    return str(soup) if changed else report_html
+
+
+def _citation_check_html(warnings: List[Dict]) -> str:
+    items = [w for w in warnings or [] if isinstance(w, dict) and w.get("url")]
+    if not items:
+        return ""
+    rows = []
+    for warning in items[:20]:
+        url = str(warning["url"])
+        label = _CITATION_STATUS_LABELS.get(str(warning.get("status") or ""), "Not read")
+        rows.append(
+            f'<li><span class="source-badge">{html.escape(label)}</span> '
+            f'<a href="{html.escape(url)}" target="_blank" rel="noopener noreferrer">'
+            f'{html.escape(_short_url(url))}</a>'
+            f'<span class="notice-detail">{html.escape(str(warning.get("reason") or ""))}</span></li>'
+        )
+    count = len(items)
+    return (
+        '<aside class="report-notice citation-check" role="note" aria-label="Citation check">'
+        f'<p class="notice-title">Citation check: {count} cited link{"" if count == 1 else "s"} '
+        f'{"was" if count == 1 else "were"} not read during this research</p>'
+        f'<ul>{"".join(rows)}</ul></aside>'
+    )
+
+
+def _source_rules_html(source_rules: Optional[Dict]) -> str:
+    rules = SourceRules.from_dict(source_rules)
+    if not rules.active:
+        return ""
+    inferred = ""
+    if rules.inferred:
+        inferred = (f'<span class="notice-detail">Read from the question: '
+                    f'{html.escape("; ".join(rules.inferred))}</span>')
+    # A <div>, not <p>: the report styles its first paragraph as a drop cap.
+    return (
+        '<div class="report-notice source-rules-note">'
+        f'<strong>Source rules:</strong> {html.escape(rules.describe())}{inferred}</div>'
+    )
+
+
+def _change_summary_html(change_summary: Optional[Dict]) -> str:
+    if not isinstance(change_summary, dict) or not change_summary.get("previous_version_id"):
+        return ""
+    previous = int(change_summary.get("previous_version") or 1)
+    counts = change_summary.get("counts") if isinstance(change_summary.get("counts"), dict) else {}
+    badges = []
+    for key, label in (("added", "added"), ("removed", "removed"), ("changed", "content changed"),
+                       ("unchanged", "unchanged"), ("unverified", "not comparable")):
+        n = int(counts.get(key) or 0)
+        if n:
+            badges.append(f'<span class="source-badge">{n} {html.escape(label)}</span>')
+    conclusions = str(change_summary.get("conclusions") or "").strip()
+    body = (_md_to_html(conclusions) if conclusions
+            else '<p>No written comparison is available; the evidence changes are listed below.</p>')
+    groups = []
+    for key, label in (("added", "Added sources"), ("removed", "Removed sources"),
+                       ("changed", "Sources whose content changed"),
+                       ("unverified", "Re-read sources without a previous fingerprint")):
+        entries = [e for e in change_summary.get(key) or [] if isinstance(e, dict) and e.get("url")]
+        if not entries:
+            continue
+        links = "".join(
+            f'<li><a href="{html.escape(str(e["url"]))}" target="_blank" rel="noopener noreferrer">'
+            f'{html.escape(str(e.get("title") or _short_url(e["url"])))}</a></li>'
+            for e in entries
+        )
+        groups.append(f'<p class="notice-detail">{html.escape(label)}</p><ul>{links}</ul>')
+    details = (
+        f'<details><summary>Evidence changes</summary>{"".join(groups)}</details>' if groups else ""
+    )
+    return (
+        '<section class="report-notice change-summary" aria-label="What changed">'
+        f'<p class="notice-title">What changed since version {previous}</p>'
+        f'<div class="change-counts">{"".join(badges)}</div>'
+        f'<div class="notice-body">{body}</div>{details}</section>'
+    )
+
+
+def _versions_html(versions: Optional[List[Dict]], session_id: Optional[str]) -> str:
+    items = [v for v in versions or [] if isinstance(v, dict) and v.get("id")]
+    if len(items) < 2 or not session_id:
+        return ""
+    current = next((v for v in items if v["id"] == session_id), None)
+    parts = []
+    for version in items:
+        stamp = ""
+        try:
+            if version.get("completed_at"):
+                stamp = datetime.fromtimestamp(float(version["completed_at"])).strftime("%b %d, %Y")
+        except (TypeError, ValueError, OSError):
+            stamp = ""
+        label = f'v{int(version.get("version") or 1)}' + (f" · {stamp}" if stamp else "")
+        if version["id"] == session_id:
+            parts.append(f'<span class="version-current" aria-current="page">{html.escape(label)}</span>')
+        else:
+            href = f'/api/research/report/{version["id"]}'
+            parts.append(f'<a href="{html.escape(href)}">{html.escape(label)}</a>')
+    position = (f'Version {int(current.get("version") or 1)} of {len(items)}'
+                if current else f"{len(items)} versions")
+    return (
+        '<nav class="version-strip" aria-label="Report versions">'
+        f'<span class="version-position">{html.escape(position)}</span>{"".join(parts)}</nav>'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1196,6 +1346,61 @@ body[class^="standard-report-"] .report-section:nth-of-type(even) {{
   white-space: nowrap;
 }}
 
+/* ── Versions, source rules, citation check, change summary ── */
+.version-strip {{
+  max-width: calc(var(--max-w) + 260px);
+  margin: 0 auto;
+  padding: 0.6rem 2rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}}
+.version-position {{ color: var(--text); font-weight: 650; }}
+.version-strip a {{ color: var(--accent); text-decoration: none; }}
+.version-strip a:hover {{ text-decoration: underline; }}
+.version-current {{ color: var(--text); font-weight: 600; }}
+.report-notice {{
+  margin: 0 0 1.5rem;
+  padding: 0.9rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  font-size: 0.86rem;
+  line-height: 1.55;
+}}
+.report-notice ul {{ margin: 0.4rem 0 0 1.1rem; }}
+.report-notice li {{ margin-bottom: 0.3rem; }}
+.report-notice p {{ margin: 0 0 0.35rem; }}
+.notice-title {{ color: var(--text); font-weight: 650; }}
+.notice-detail {{ display: block; color: var(--text-muted); font-size: 0.78rem; }}
+.citation-check {{
+  border-color: color-mix(in srgb, var(--gold) 45%, var(--border));
+  background: var(--gold-bg);
+}}
+.citation-check .source-badge {{ margin-right: 0.3rem; }}
+.change-summary {{ border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }}
+.change-counts {{ display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.5rem; }}
+.change-summary details summary {{
+  margin-top: 0.4rem;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  cursor: pointer;
+}}
+.content a.citation-unverified {{
+  text-decoration-style: dashed;
+  text-decoration-color: var(--gold);
+}}
+.content a.citation-unverified::after {{
+  content: ' [not read]';
+  color: var(--gold);
+  font-size: 0.72em;
+  font-weight: 650;
+}}
+
 /* ── Research trace ─────────────────────────────────── */
 .research-trace {{
   margin: 3rem 0 0;
@@ -1383,6 +1588,7 @@ body[class^="standard-report-"] .report-section:nth-of-type(even) {{
 
 <!-- Toolbar: Export and report display actions -->
 <div class="toolbar">
+  {refresh_btn_html}
   {restore_btn_html}
   <div class="dropdown export-bookmark">
     <button id="btn-export" type="button" title="Export" aria-haspopup="menu" aria-expanded="false">
@@ -1410,6 +1616,8 @@ body[class^="standard-report-"] .report-section:nth-of-type(even) {{
 
 {evidence_profile_html}
 
+{versions_html}
+
 {mobile_toc_html}
 
 <div class="layout">
@@ -1420,6 +1628,7 @@ body[class^="standard-report-"] .report-section:nth-of-type(even) {{
     </nav>
   </aside>
   <main class="content">
+    {notices_html}
     {report_html}
 
     {sources_html}
@@ -1491,6 +1700,8 @@ body[class^="standard-report-"] .report-section:nth-of-type(even) {{
     var exportedDocument = document.documentElement.cloneNode(true);
     var exportedToolbar = exportedDocument.querySelector('.toolbar .dropdown');
     if (exportedToolbar) exportedToolbar.remove();
+    var exportedRefresh = exportedDocument.querySelector('#btn-refresh-research');
+    if (exportedRefresh) exportedRefresh.remove();
     var blob = new Blob(['<!DOCTYPE html>\\n' + exportedDocument.outerHTML], {{ type: 'text/html' }});
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1655,6 +1866,56 @@ body[class^="standard-report-"] .report-section:nth-of-type(even) {{
           restoreBtn.textContent = 'Failed — retry?';
           console.warn('unhide-images POST failed', err);
         }});
+    }});
+  }}
+
+  // Refresh — re-run this question as a new version, then open that version
+  // once it completes. This version stays saved and linked from the new one.
+  var refreshBtn = document.getElementById('btn-refresh-research');
+  if (refreshBtn && __sessionId) {{
+    var refreshLabel = refreshBtn.querySelector('.refresh-label');
+    var setRefreshLabel = function(text) {{ if (refreshLabel) refreshLabel.textContent = text; }};
+    refreshBtn.addEventListener('click', function() {{
+      refreshBtn.disabled = true;
+      setRefreshLabel('Starting…');
+      fetch('/api/research/' + encodeURIComponent(__sessionId) + '/refresh', {{
+        method: 'POST', credentials: 'same-origin',
+      }}).then(function(res) {{
+        if (!res.ok) {{
+          return res.json().then(function(d) {{
+            throw new Error(d && d.detail ? d.detail : ('HTTP ' + res.status));
+          }}, function() {{ throw new Error('HTTP ' + res.status); }});
+        }}
+        return res.json();
+      }}).then(function(data) {{
+        var newId = data && data.session_id;
+        if (!newId) throw new Error('Server did not return a session id');
+        setRefreshLabel('Refreshing…');
+        refreshBtn.title = 'Refreshing in Deep Research; the new version opens here when it finishes.';
+        var poll = function() {{
+          fetch('/api/research/status/' + encodeURIComponent(newId), {{ credentials: 'same-origin' }})
+            .then(function(res) {{ return res.ok ? res.json() : null; }})
+            .then(function(status) {{
+              var st = status && status.status;
+              if (st === 'done') {{
+                window.location.href = '/api/research/report/' + encodeURIComponent(newId);
+                return;
+              }}
+              if (!status || st === 'error' || st === 'cancelled') {{
+                refreshBtn.disabled = false;
+                setRefreshLabel('Refresh failed, retry');
+                return;
+              }}
+              setTimeout(poll, 4000);
+            }})
+            .catch(function() {{ setTimeout(poll, 8000); }});
+        }};
+        setTimeout(poll, 4000);
+      }}).catch(function(err) {{
+        refreshBtn.disabled = false;
+        setRefreshLabel('Refresh');
+        alert('Could not refresh research: ' + err.message);
+      }});
     }});
   }}
 
@@ -2731,10 +2992,15 @@ def generate_visual_report(
     category: Optional[str] = None,
     session_id: Optional[str] = None,
     hidden_images: Optional[List[str]] = None,
+    citation_warnings: Optional[List[Dict]] = None,
+    source_rules: Optional[Dict] = None,
+    change_summary: Optional[Dict] = None,
+    versions: Optional[List[Dict]] = None,
 ) -> str:
     sources = sources or []
     stats = stats or {}
     hidden_images_set = set(hidden_images or [])
+    citation_warnings = [w for w in citation_warnings or [] if isinstance(w, dict)]
 
     # Strip thinking artifacts
     report_markdown = strip_thinking(report_markdown)
@@ -2758,7 +3024,7 @@ def generate_visual_report(
         allow_html_fallback=category == "visual",
     )
     report_markdown, visual_diagrams = _extract_visual_diagrams(report_markdown)
-    report_html = _md_to_html(report_markdown)
+    report_html = _mark_citation_warnings(_md_to_html(report_markdown), citation_warnings)
 
     headings = _extract_headings(report_markdown)
     report_html = _apply_heading_ids(report_html, headings)
@@ -2871,7 +3137,7 @@ def generate_visual_report(
     word_count = len(re.findall(r"\b[\w'-]+\b", visible_text))
     reading_minutes = max(1, (word_count + 224) // 225)
     stat_items = []
-    for key, label in [("Duration", "Duration"), ("Rounds", "Rounds"), ("Queries", "Queries"), ("URLs", "URLs Analyzed"), ("Model", "Model"), ("Search", "Search")]:
+    for key, label in [("Duration", "Duration"), ("Rounds", "Rounds"), ("Queries", "Queries"), ("URLs", "URLs Analyzed"), ("Model", "Model"), ("Search", "Search"), ("Length", "report")]:
         val = stats.get(key)
         if val is not None:
             stat_items.append(
@@ -2901,8 +3167,13 @@ def generate_visual_report(
             '<span class="evidence-label">Sources used</span></div>'
             f'<div class="evidence-metric"><span class="evidence-value">{evidence["domains"]}</span>'
             '<span class="evidence-label">Distinct domains</span></div>'
-            f'<div class="evidence-metric"><span class="evidence-value">{evidence["primary"]}</span>'
-            '<span class="evidence-label">Primary sources</span></div>'
+            '<div class="evidence-metric" title="Official (government/academic) and primary '
+            '(project/vendor-owned) pages that were read">'
+            f'<span class="evidence-value">{evidence["primary"]}</span>'
+            '<span class="evidence-label">Primary sources'
+            + (f'<span class="evidence-caption">incl. {evidence["official"]} official</span>'
+               if evidence["official"] else '')
+            + '</span></div>'
             f'<div class="evidence-metric"><span class="evidence-value">{quality_value}</span>'
             f'<span class="evidence-label">{quality_label}</span></div>'
             '</section>'
@@ -2931,7 +3202,7 @@ def generate_visual_report(
                 score = None
             badges = []
             if kind:
-                kind_class = " primary" if kind == "primary" else ""
+                kind_class = " primary" if is_first_party_kind(kind) else ""
                 badges.append(
                     f'<span class="source-badge{kind_class}">{html.escape(kind)}</span>'
                 )
@@ -2992,6 +3263,27 @@ def generate_visual_report(
             '</div>'
         )
 
+    # Refresh re-runs the question with the saved settings and opens the new
+    # version when it finishes; this version is kept and linked from it.
+    refresh_btn_html = ""
+    if session_id:
+        refresh_btn_html = (
+            '<button id="btn-refresh-research" type="button" '
+            'title="Re-run this question with the same settings and source rules; '
+            'the result is saved as a new version">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+            'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+            '<polyline points="23 4 23 10 17 10"/>'
+            '<path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>'
+            '<span class="refresh-label">Refresh</span>'
+            '</button>'
+        )
+    notices_html = "".join((
+        _change_summary_html(change_summary),
+        _source_rules_html(source_rules),
+        _citation_check_html(citation_warnings),
+    ))
+
     # Visual explanations are presentation-first, so their toolbar never
     # exposes the image restoration control. Other report formats retain it.
     restore_btn_html = ""
@@ -3016,11 +3308,14 @@ def generate_visual_report(
         hero_image_html=hero_image_html,
         stats_html=stats_html,
         evidence_profile_html=evidence_profile_html,
+        versions_html=_versions_html(versions, session_id),
         mobile_toc_html=mobile_toc_html,
         toc_html=toc_html,
+        notices_html=notices_html,
         report_html=report_html,
         sources_html=sources_html,
         chat_cta_html=chat_cta_html,
+        refresh_btn_html=refresh_btn_html,
         restore_btn_html=restore_btn_html,
         timestamp=timestamp,
         category_css=_category_css(category, standard_variant),

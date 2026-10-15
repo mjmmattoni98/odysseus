@@ -90,9 +90,31 @@ def _rewrite_docker_host_for_native_runtime(base: str) -> str:
     return urlunparse(parsed._replace(netloc=netloc))
 
 
-def _first_chat_model(models) -> Optional[str]:
-    """First model that isn't an embedding/tts/etc.; falls back to models[0]."""
-    for m in (models or []):
+def _first_chat_model(models, url: Optional[str] = None) -> Optional[str]:
+    """First model that isn't an embedding/tts/etc.; falls back to models[0].
+
+    With ``url`` (the endpoint the model will be sent to), cached capability
+    reports (Ollama ``/api/show``) also count: models verified as
+    chat-capable come first, unknown ones next, and models reported as
+    unable to chat are never picked, not even by the ``models[0]`` fallback.
+    Reads the cache only: selection runs on request paths, so it never
+    probes. Model-list refreshes are what fill the cache.
+    """
+    models = list(models or [])
+    if url and models:
+        try:
+            from src.ollama_capabilities import cached_capability_tokens, chat_capability, ollama_api_root
+            known = (
+                {m: chat_capability(cached_capability_tokens(url, str(m))) for m in models}
+                if ollama_api_root(url, probe=False) else {}
+            )
+        except Exception:
+            known = {}
+        verified = [m for m in models if known.get(m) is True]
+        if verified:
+            return verified[0]
+        models = [m for m in models if known.get(m) is None]
+    for m in models:
         if not any(p in str(m).lower() for p in _NON_CHAT_MODEL):
             return m
     return (models[0] if models else None)
@@ -467,12 +489,12 @@ def single_model_mode_enabled() -> bool:
 def _can_chat(url: str, model: str) -> bool:
     """Chat-capable per Ollama's capability report, else by name."""
     try:
-        from src.ollama_capabilities import capability_tokens, is_embedding_only
-        tokens = capability_tokens(url, model)
+        from src.ollama_capabilities import supports_chat
+        known = supports_chat(url, model)
     except Exception:
-        tokens = None
-    if tokens is not None:
-        return not is_embedding_only(tokens)
+        known = None
+    if known is not None:
+        return known
     return not any(p in str(model).lower() for p in _NON_CHAT_MODEL)
 
 
@@ -630,9 +652,10 @@ def _resolve_configured_endpoint(
         # instead of dispatching to a disabled model that 400s.
         if model and model in _endpoint_hidden_models(ep):
             model = ""
-        # If no (usable) model specified, pick the first enabled chat model.
+        # If no (usable) model specified, pick the first enabled chat model,
+        # never one this server's cached capability report rules out.
         if not model:
-            model = _first_chat_model(_endpoint_enabled_models(ep)) or ""
+            model = _first_chat_model(_endpoint_enabled_models(ep), url=base) or ""
         if not model and not fallback_model:
             logger.warning('[resolve_endpoint] no usable model (all models hidden or list empty)')
 
@@ -692,7 +715,7 @@ def _resolve_endpoint_by_id_with_descriptor(
             if m and m in _endpoint_hidden_models(ep):
                 m = ""
             if not m:
-                m = _first_chat_model(enabled_models) or ""
+                m = _first_chat_model(enabled_models, url=base) or ""
         if not m:
             return None
         return (

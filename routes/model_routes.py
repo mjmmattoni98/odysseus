@@ -679,23 +679,63 @@ def _native_ollama_switch_target(base_url: str, endpoint_kind: str = "auto") -> 
     return f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
 
 
-def _drop_ollama_embedding_models(base_url: str, models: List[str]) -> List[str]:
-    """Remove embedding-only models from a local Ollama model list.
+def _drop_ollama_non_chat_models(base_url: str, models: List[str]) -> List[str]:
+    """Remove models a local Ollama server reports as unable to chat.
 
-    Name filters miss embedding tags such as ``all-minilm``; Ollama's
-    ``/api/show`` reports ``["embedding"]`` for them. The lookup is cached
-    per model (10 min) and only runs for local Ollama servers with a modest
-    catalog, so model-list refreshes stay cheap.
+    Name filters miss embedding tags such as ``all-minilm`` and classifier
+    models such as ``["decision", "vision"]``; Ollama's ``/api/show`` omits
+    ``completion`` for both. Models without a capability report stay listed
+    (unknown, not rejected). The lookup is cached per model (10 min) and only
+    runs for local Ollama servers with a modest catalog, so model-list
+    refreshes stay cheap.
     """
     if not models or len(models) > 64 or _is_ollama_cloud_base(base_url):
         return models
     try:
-        from src.ollama_capabilities import capability_tokens, is_embedding_only, ollama_api_root
+        from src.ollama_capabilities import ollama_api_root, supports_chat
         if not ollama_api_root(base_url):
             return models
-        return [m for m in models if not is_embedding_only(capability_tokens(base_url, m))]
+        return [m for m in models if supports_chat(base_url, m) is not False]
     except Exception:
         return models
+
+
+def _known_non_chat_models(base_url: str) -> Dict[str, str]:
+    """``{model: reason}`` from cached capability reports; never probes."""
+    if _is_ollama_cloud_base(base_url):
+        return {}
+    try:
+        from src.ollama_capabilities import cached_non_chat_models
+        return cached_non_chat_models(base_url)
+    except Exception:
+        return {}
+
+
+def _chat_capability_fields(base_url: str, models: List[str]) -> Dict[str, Any]:
+    """Cache-only chat capability state for an endpoint's listed models.
+
+    ``capability_source`` is ``"ollama"`` when the server reports per-model
+    capabilities; ``capability_unknown_models`` then lists the models kept
+    without a report. With no source every model is listed on name
+    heuristics alone. ``non_chat_models`` explains the models left out.
+    """
+    excluded = _known_non_chat_models(base_url)
+    fields: Dict[str, Any] = {
+        "non_chat_models": [{"model": m, "reason": r} for m, r in sorted(excluded.items())],
+        "capability_source": None,
+        "capability_unknown_models": [],
+    }
+    try:
+        from src.ollama_capabilities import cached_capability_tokens, ollama_api_root
+        if _is_ollama_cloud_base(base_url) or not ollama_api_root(base_url, probe=False):
+            return fields
+        fields["capability_source"] = "ollama"
+        fields["capability_unknown_models"] = [
+            m for m in models if not cached_capability_tokens(base_url, m)
+        ]
+    except Exception:
+        pass
+    return fields
 
 
 # Prefixes/substrings for models that are NOT chat-completions-capable
@@ -811,6 +851,21 @@ def _resolve_probe_key(ep) -> Optional[str]:
 # disk) routinely takes longer than the 8 s probe budget.
 _OLLAMA_COLD_LOAD_TIMEOUT = 120
 
+# Provider rejections meaning "this model cannot chat at all" (retrying will
+# not help): Ollama's '"x" does not support chat', OpenAI's "This is not a
+# chat model", and similar wording from compatible servers.
+_INCOMPATIBLE_MODEL_ERROR_RE = re.compile(
+    r"does not support (?:chat|completions?|generate)"
+    r"|not a chat model"
+    r"|not supported (?:for|in|by|with) (?:the )?(?:chat|v1/chat/completions)",
+    re.IGNORECASE,
+)
+
+
+def _is_incompatible_model_error(status_code: int, text: str) -> bool:
+    """Whether a 4xx probe failure says the model cannot serve chat."""
+    return 400 <= int(status_code or 0) < 500 and bool(_INCOMPATIBLE_MODEL_ERROR_RE.search(text or ""))
+
 
 def _probe_ollama_model_capabilities(base: str, model_id: str, with_tools: bool = False) -> Optional[dict]:
     """Probe a local Ollama model through ``/api/show`` instead of generating.
@@ -824,17 +879,23 @@ def _probe_ollama_model_capabilities(base: str, model_id: str, with_tools: bool 
     if _is_ollama_cloud_base(base):
         return None
     try:
-        from src.ollama_capabilities import capability_tokens, is_embedding_only
+        from src.ollama_capabilities import capability_tokens, chat_capability, non_chat_reason
         t0 = _time.time()
         tokens = capability_tokens(base, model_id, timeout=5.0)
     except Exception:
         return None
-    if tokens is None:
+    if chat_capability(tokens) is None:
         return None
     latency = round((_time.time() - t0) * 1000)
     caps = sorted(tokens)
-    if is_embedding_only(tokens):
-        return {"status": "fail", "latency_ms": latency, "error": "Embedding model (no chat)", "capabilities": caps}
+    if chat_capability(tokens) is False:
+        # Ollama answers chat requests for these with HTTP 400 "does not
+        # support chat"; a manifest that merely lists other capabilities is
+        # not evidence the model is ready.
+        return {
+            "status": "fail", "latency_ms": latency, "error": non_chat_reason(tokens),
+            "incompatible": True, "capabilities": caps,
+        }
     if with_tools and not tokens & {"tools", "tool"}:
         return {"status": "fail", "latency_ms": latency, "error": "Model does not advertise tool calling", "capabilities": caps}
     return {"status": "ok", "latency_ms": latency, "capabilities": caps, "method": "capabilities"}
@@ -912,7 +973,10 @@ def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 1
                         error_msg = err[:120]
             except Exception:
                 pass
-            return {"status": "fail", "latency_ms": latency, "error": error_msg}
+            result = {"status": "fail", "latency_ms": latency, "error": error_msg}
+            if _is_incompatible_model_error(r.status_code, error_msg):
+                result["incompatible"] = True
+            return result
     except httpx.TimeoutException:
         return {"status": "timeout", "latency_ms": timeout * 1000, "error": f"Timed out ({timeout}s)"}
     except Exception as e:
@@ -1206,7 +1270,7 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
                 for _e in _PROVIDER_CURATED.get(_ck, []):
                     if _e not in set(models) and not any(m.startswith(_e) for m in models):
                         models.append(_e)
-            return [m for m in _drop_ollama_embedding_models(base, models) if _is_chat_model(m)]
+            return [m for m in _drop_ollama_non_chat_models(base, models) if _is_chat_model(m)]
     except httpx.HTTPStatusError as e:
         if e.response is not None and _is_loading_model_response(e.response):
             logger.info("Endpoint still loading model at %s", _redact_url_for_log(url))
@@ -1232,7 +1296,7 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
             data = r.json()
             models = _ollama_model_names(data)
             if models:
-                return [m for m in _drop_ollama_embedding_models(base, models) if _is_chat_model(m)]
+                return [m for m in _drop_ollama_non_chat_models(base, models) if _is_chat_model(m)]
     except Exception as e:
         logger.debug(f"Ollama /api/tags probe failed for {base}: {e}")
     # Fall back to curated list if the provider has a URL-based match (e.g. z.ai has no /models endpoint)
@@ -1561,8 +1625,12 @@ def _picker_models_for_endpoint(ep, base_url: str, kind: str):
         if not _has_explicit_pinned_models(ep):
             pinned = _legacy_visible_api_models(ep)
         return pinned, pinned
+    # Lists cached before a model was known to be non-chat still carry it;
+    # drop those from cached capability reports (admin pins always stay).
+    non_chat = _known_non_chat_models(base_url)
+    cached = [m for m in _cached_model_ids(ep) if m not in non_chat]
     return _visible_models(
-        _cached_model_ids(ep),
+        cached,
         getattr(ep, "hidden_models", None),
         pinned,
     ), pinned
@@ -2247,6 +2315,7 @@ def setup_model_routes(model_discovery):
                     "model_refresh_mode": _endpoint_refresh_mode(r, kind),
                     "model_refresh_interval": getattr(r, "model_refresh_interval", None),
                     "model_refresh_timeout": getattr(r, "model_refresh_timeout", None),
+                    **_chat_capability_fields(base, visible),
                     **_provider_account_metadata(r),
                 })
             if upgraded_legacy_pins:
@@ -2463,7 +2532,9 @@ def setup_model_routes(model_discovery):
             # nothing is configured, or the configured default points at an
             # endpoint that is now missing/disabled (#3586). Seed the first CHAT
             # model (not raw model_ids[0]) so we don't pin the global default to
-            # an embedding/tts/etc. entry a provider happens to list first.
+            # an embedding/tts/etc. entry a provider happens to list first;
+            # passing the URL ranks capability-verified chat models first and
+            # never picks one the server reports as unable to chat.
             settings = _load_settings()
             enabled_ids = {
                 e.id
@@ -2485,7 +2556,7 @@ def setup_model_routes(model_discovery):
             ):
                 from src.endpoint_resolver import _first_chat_model
                 settings["default_endpoint_id"] = ep.id
-                settings["default_model"] = _first_chat_model(model_ids) or ""
+                settings["default_model"] = _first_chat_model(model_ids, url=base_url) or ""
                 _save_settings(settings)
             _invalidate_models_cache()
             _local_probe_cache["data"] = None
@@ -2508,6 +2579,7 @@ def setup_model_routes(model_discovery):
             "ping_error": ping.get("error") if ping else None,
             "endpoint_kind": requested_kind,
             "category": _classify_endpoint(base_url, requested_kind),
+            **_chat_capability_fields(base_url, _merge_model_ids(model_ids, _pinned)),
         }
 
     @router.post("/model-endpoints/test")
@@ -2940,9 +3012,12 @@ def setup_model_routes(model_discovery):
             chat_url = build_chat_url(base)
             if not model and (getattr(ep, "cached_models", None) or getattr(ep, "pinned_models", None)):
                 try:
+                    from src.endpoint_resolver import _first_chat_model
                     visible = _visible_models(ep.cached_models, getattr(ep, "hidden_models", None), getattr(ep, "pinned_models", None))
-                    if visible:
-                        model = visible[0]
+                    # Same picker as resolve_endpoint: cached capability
+                    # reports rank verified chat models first and rule out
+                    # models the server says cannot chat.
+                    model = _first_chat_model(visible, url=base) or ""
                 except Exception:
                     pass
             return {"endpoint_id": ep.id, "endpoint_url": chat_url, "model": model}

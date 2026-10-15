@@ -1,0 +1,417 @@
+/* ===== DECISIONS (static/js/decisions.js) =====
+   Built on the shared .modal window, .task-form-* inputs, .memory-* buttons
+   and lists, .close-btn row removers and .rail-notes-badge counts. This file
+   only lays out the list/editor split, the options matrix and the history. */
+
+.decisions-modal-content {
+  width: min(960px, 94vw);
+  max-width: 960px;
+  height: min(80vh, 760px);
+  background: var(--bg);
+  font-size: 12px;
+  overflow: hidden;
+}
+.decisions-modal-content .modal-header h4 {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.decisions-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+.decisions-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ── List ── */
+.decisions-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  padding-right: 10px;
+  border-right: 1px solid var(--border);
+}
+.decisions-list-toolbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.decisions-list-toolbar .memory-search-input {
+  flex: 1;
+  min-width: 0;
+  margin-top: 0;
+}
+.decisions-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.decisions-list-item {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 4px;
+  width: 100%;
+  height: auto;   /* the shared button height would clip the second line */
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.decisions-list-item:hover {
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+}
+.decisions-list-item.active {
+  border-color: color-mix(in srgb, var(--red) 40%, transparent);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+}
+.decisions-list-item:focus-visible {
+  outline: 1px solid var(--red);
+  outline-offset: 1px;
+}
+.decisions-list-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.decisions-list-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  font-size: 11px;
+  color: var(--color-muted);
+}
+.decisions-empty {
+  margin: 8px 0;
+}
+.decisions-archived-toggle {
+  color: var(--color-muted);
+}
+.decisions-due-banner,
+.decisions-revisit-banner {
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--color-warning) 40%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-warning) 10%, transparent);
+  color: var(--fg);
+  font-size: 11px;
+}
+.decisions-due-banner[hidden],
+.decisions-revisit-banner[hidden],
+.decisions-flag[hidden] {
+  display: none;
+}
+
+/* Status pill shared by the list and the editor header. */
+.decisions-status {
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.decisions-status-decided {
+  color: var(--color-success);
+  border-color: color-mix(in srgb, var(--color-success) 40%, transparent);
+}
+.decisions-status-revisit-due {
+  color: var(--color-warning);
+  border-color: color-mix(in srgb, var(--color-warning) 50%, transparent);
+}
+.decisions-status-archived {
+  opacity: 0.6;
+}
+
+/* Due count on the sidebar tool entry; the rail copy keeps the badge's
+   absolute corner placement. */
+#tool-decisions-btn .decisions-due-count {
+  position: static;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* ── Editor ── */
+.decisions-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+}
+.decisions-placeholder {
+  margin: auto;
+  max-width: 360px;
+  text-align: center;
+}
+.decisions-editor-top,
+.decisions-actions,
+.decisions-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.decisions-actions {
+  flex-wrap: wrap;
+}
+.decisions-title-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.decisions-back-btn {
+  display: none;
+}
+.decisions-actions .memory-toolbar-btn,
+.decisions-open-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  text-decoration: none;
+}
+.decisions-save-state {
+  margin-left: auto;
+}
+.decisions-save-error {
+  color: var(--color-error);
+}
+.decisions-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.decisions-section-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--red);
+}
+.decisions-section .memory-desc {
+  margin: 0;
+}
+.decisions-section > .memory-toolbar-btn {
+  align-self: flex-start;
+}
+.decisions-row > .task-form-input {
+  flex: 1;
+}
+.decisions-row > .decisions-num {
+  flex: 0 0 64px;
+}
+.decisions-num {
+  width: 64px;
+}
+.decisions-remove-btn {
+  flex-shrink: 0;
+}
+.decisions-remove-btn:focus-visible,
+.decisions-row:hover .decisions-remove-btn,
+.decisions-matrix tr:hover .decisions-remove-btn {
+  opacity: 1;
+}
+.decisions-share {
+  min-width: 40px;
+  font-size: 10px;
+  color: var(--color-muted);
+}
+.decisions-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.decisions-date {
+  max-width: 180px;
+}
+
+/* ── Options matrix ── */
+.decisions-matrix-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.decisions-matrix {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.decisions-matrix th,
+.decisions-matrix td {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+.decisions-matrix tbody tr:last-child > * {
+  border-bottom: none;
+}
+.decisions-matrix thead th {
+  font-weight: 600;
+  color: var(--color-muted);
+  white-space: nowrap;
+}
+.decisions-matrix thead .decisions-share {
+  display: block;
+}
+.decisions-matrix tbody th {
+  min-width: 140px;
+  font-weight: normal;
+}
+.decisions-matrix .decisions-num {
+  width: 56px;
+}
+.decisions-total,
+.decisions-rank {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.decisions-leader-row {
+  background: color-mix(in srgb, var(--color-success) 8%, transparent);
+}
+.decisions-ineligible .decisions-total,
+.decisions-ineligible .decisions-rank {
+  opacity: 0.6;
+}
+.decisions-flag {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--color-error);
+}
+.decisions-leader {
+  margin: 0;
+  font-size: 11px;
+  color: var(--color-muted);
+}
+
+/* ── Tradeoffs ── */
+.decisions-tradeoff {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.decisions-tradeoff > summary {
+  font-weight: 600;
+  cursor: pointer;
+}
+.decisions-tradeoff > summary .decisions-total {
+  margin-left: 8px;
+  color: var(--color-muted);
+}
+.decisions-tradeoff .decisions-row {
+  margin-top: 4px;
+}
+.decisions-tradeoff > .memory-toolbar-btn {
+  margin-top: 6px;
+}
+.decisions-two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 0;   /* not a collapsible body: drop the shared details > div inset */
+}
+.decisions-fails {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 6px 0 0;
+  padding: 0;
+  border: none;
+}
+.decisions-fails legend {
+  padding: 0;
+}
+
+/* ── History ── */
+.decisions-since {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.decisions-since-flipped {
+  border-color: color-mix(in srgb, var(--color-warning) 50%, transparent);
+}
+.decisions-since p,
+.decisions-snapshot p,
+.decisions-snapshot ol {
+  margin: 4px 0;
+}
+.decisions-since ul {
+  margin: 4px 0 0;
+  padding-left: 16px;
+}
+.decisions-snapshot {
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+}
+.decisions-snapshot > summary {
+  cursor: pointer;
+}
+
+/* ── Mobile: one pane at a time inside the shared bottom sheet ── */
+@media (max-width: 768px) {
+  /* Same ceiling as the other tall tool drawers (02-compare.css). */
+  #decisions-modal .decisions-modal-content {
+    max-height: 90vh !important;
+    max-height: 90dvh !important;
+    padding-bottom: env(safe-area-inset-bottom, 0px) !important;
+  }
+  .decisions-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .decisions-sidebar {
+    padding-right: 0;
+    border-right: none;
+  }
+  .decisions-layout-editing .decisions-sidebar,
+  .decisions-layout:not(.decisions-layout-editing) .decisions-editor {
+    display: none;
+  }
+  .decisions-back-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+  }
+  .decisions-row {
+    flex-wrap: wrap;
+  }
+  .decisions-two-col {
+    grid-template-columns: 1fr;
+  }
+  .decisions-matrix tbody th {
+    min-width: 96px;
+  }
+  .decisions-matrix th,
+  .decisions-matrix td {
+    padding: 4px;
+  }
+  .decisions-matrix .decisions-num {
+    width: 44px;
+  }
+}

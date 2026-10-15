@@ -1,7 +1,7 @@
 /**
  * Deep Research side panel — open/close, form, job rendering, library.
  */
-import * as jobs from './jobs.js?v=20260910researcherrorpersist1';
+import * as jobs from './jobs.js?v=20261012researchversions1';
 import themeModule from '../theme.js?v=20260911organsrain1';
 import createResearchSynapse from '../researchSynapse.js?v=20260910roundlabels2';
 import spinnerModule from '../spinner.js';
@@ -418,6 +418,15 @@ function _buildPanelHTML() {
             </select>
           </label>
           <label class="research-setting">
+            <span class="research-setting-label">Length <span class="hwfit-help-chip hwfit-help-chip-inline" title="Brief is faster and shorter. Auto follows wording in your question such as &quot;briefly&quot; or &quot;in 200 words&quot;.">?</span></span>
+            <select id="research-length">
+              <option value="auto" selected>Auto</option>
+              <option value="brief">Brief</option>
+              <option value="standard">Standard</option>
+              <option value="detailed">Detailed</option>
+            </select>
+          </label>
+          <label class="research-setting">
             <span class="research-setting-label">Search engine</span>
             <select id="research-search-provider">${providerOpts}</select>
           </label>
@@ -429,6 +438,17 @@ function _buildPanelHTML() {
             <span class="research-setting-label">Model</span>
             <select id="research-model"><option value="">Default</option></select>
           </label>
+          <div class="research-source-rules">
+            <span class="research-setting-label">Source rules <span class="hwfit-help-chip hwfit-help-chip-inline" title="Domains separated by commas. Pages outside these rules are never read or listed as sources. Restrictions in your question, such as site:nasa.gov or &quot;only official sources&quot;, are applied too.">?</span></span>
+            <div class="research-source-rules-fields">
+              <input type="text" id="research-allowed-domains" class="memory-search-input" placeholder="Only these domains, e.g. nasa.gov" aria-label="Only use these domains" autocomplete="off" spellcheck="false">
+              <input type="text" id="research-excluded-domains" class="memory-search-input" placeholder="Exclude domains, e.g. wikipedia.org" aria-label="Never use these domains" autocomplete="off" spellcheck="false">
+            </div>
+            <label class="research-official-toggle" title="Keep government, military, academic and intergovernmental sites (.gov, .mil, .edu, .int, gov.uk, europa.eu), plus any domain listed above">
+              <span class="toggle-switch"><input type="checkbox" id="research-official-only"><span class="toggle-slider"></span></span>
+              <span>Official sources only</span>
+            </label>
+          </div>
         </div>
         <div class="research-controls-row">
           <button id="research-add-btn" class="memory-toolbar-btn research-add-btn"><span class="research-add-plus">+</span> Queue</button>
@@ -505,6 +525,32 @@ function _resetCategoryToAuto() {
     sel.value = '';
     _refreshResearchPicker(sel.id);
   }
+  // Length and source rules describe one question, so they do not carry
+  // over to the next launch either.
+  const length = document.getElementById('research-length');
+  if (length) {
+    length.value = 'auto';
+    _refreshResearchPicker(length.id);
+  }
+  ['research-allowed-domains', 'research-excluded-domains'].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) input.value = '';
+  });
+  const official = document.getElementById('research-official-only');
+  if (official) official.checked = false;
+}
+
+function _splitDomains(text) {
+  return String(text || '').split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
+}
+
+function _rulesSummary(rules) {
+  if (!rules) return '';
+  const parts = [];
+  if (rules.allowed_domains?.length) parts.push(`only ${rules.allowed_domains.join(', ')}`);
+  if (rules.official_only) parts.push('official only');
+  if (rules.excluded_domains?.length) parts.push(`excluding ${rules.excluded_domains.join(', ')}`);
+  return parts.join('; ');
 }
 
 function _wireEvents(pane) {
@@ -628,7 +674,14 @@ function _readSettings() {
     endpoint_id: document.getElementById('research-endpoint')?.value || undefined,
     model: document.getElementById('research-model')?.value || undefined,
     category: category || undefined,
+    report_length: document.getElementById('research-length')?.value || undefined,
+    allowed_domains: _splitDomains(document.getElementById('research-allowed-domains')?.value),
+    excluded_domains: _splitDomains(document.getElementById('research-excluded-domains')?.value),
+    official_only: !!document.getElementById('research-official-only')?.checked,
   };
+  if (settings.report_length === 'auto') delete settings.report_length;
+  if (!settings.allowed_domains.length) delete settings.allowed_domains;
+  if (!settings.excluded_domains.length) delete settings.excluded_domains;
   const epSel = document.getElementById('research-endpoint');
   if (epSel && epSel.value) {
     const opt = epSel.options[epSel.selectedIndex];
@@ -676,6 +729,14 @@ function _editJob(job) {
   }
   const mEl = document.getElementById('research-model');
   if (mEl && s.model) mEl.value = s.model;
+  const lengthEl = document.getElementById('research-length');
+  if (lengthEl) lengthEl.value = s.report_length || 'auto';
+  const allowedEl = document.getElementById('research-allowed-domains');
+  if (allowedEl) allowedEl.value = (s.allowed_domains || []).join(', ');
+  const excludedEl = document.getElementById('research-excluded-domains');
+  if (excludedEl) excludedEl.value = (s.excluded_domains || []).join(', ');
+  const officialEl = document.getElementById('research-official-only');
+  if (officialEl) officialEl.checked = !!s.official_only;
   _syncAllResearchPickers();
   // Remove the old job so clicking Start/Queue makes a fresh one
   jobs.removeJob(job.id);
@@ -1122,7 +1183,10 @@ function _buildJobCard(job) {
     const roundsLabel = rounds === -1 ? 'Explain only' : (!rounds ? 'Auto rounds' : `${rounds} rounds`);
     const epName = job.settings?._endpointName || '';
     const mName = job.settings?._modelName || '';
-    const meta = [mName, epName, roundsLabel].filter(Boolean).join(' -- ');
+    const lengthLabel = job.settings?.report_length
+      ? `${job.settings.report_length[0].toUpperCase()}${job.settings.report_length.slice(1)} report` : '';
+    const rulesLabel = _rulesSummary(job.settings);
+    const meta = [mName, epName, roundsLabel, lengthLabel, rulesLabel].filter(Boolean).join(' -- ');
     card.innerHTML = `
       <div class="research-job-header">
         <span class="research-job-query">${_esc(job.query)}</span>
@@ -1253,11 +1317,12 @@ function _buildJobCard(job) {
         <button type="button" class="task-status-badge task-state-badge research-job-discuss-badge" data-action="chat" title="Open follow-up chat with this research as context">${_chatIcon}<span class="task-state-label">Chat</span></button>
         ${_jobOverflowHTML([
           { action: 'copy', icon: _copyIcon, label: 'Copy report' },
+          { action: 'refresh', icon: _retryIcon, label: 'Refresh as new version' },
           { action: 'dismiss', icon: _cancelIcon, label: 'Hide from list' },
           { action: 'delete', icon: _trashIcon, label: 'Delete from disk', danger: true },
         ])}
       </div>
-      <div class="research-job-summary">${thumbnail}<div class="research-job-summary-copy"><span class="research-job-meta">${elapsed} · ${explainOnly ? 'model only' : `${srcCount} sources`}</span>${failNote}</div></div>
+      <div class="research-job-summary">${thumbnail}<div class="research-job-summary-copy"><span class="research-job-meta">${elapsed} · ${explainOnly ? 'model only' : `${srcCount} sources`}${_versionMeta(job)}</span>${_citationNote(job)}${failNote}</div></div>
     `;
     const thumbFrame = card.querySelector('.research-job-thumb-frame');
     if (thumbFrame && thumbUrl) {
@@ -1285,6 +1350,15 @@ function _buildJobCard(job) {
     card.querySelector('[data-action="report"]').addEventListener('click', (e) => {
       e.stopPropagation();
       window.open(`${_apiBase}/api/research/report/${job.id}`, '_blank');
+    });
+    card.querySelector('[data-menu-action="refresh"]').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      overflow.close();
+      const refreshed = await jobs.refreshJob(job.id);
+      if (refreshed?.status === 'running') _setResearchTab('active');
+      else if (typeof uiModule !== 'undefined' && uiModule?.showError) {
+        uiModule.showError(`Research did not refresh: ${refreshed?.errorMsg || 'Unable to start.'}`);
+      }
     });
     card.querySelector('[data-action="chat"]').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -1449,6 +1523,7 @@ function _setupResearchPickers(pane) {
   const ids = [
     'research-rounds',
     'research-category',
+    'research-length',
     'research-search-provider',
     'research-endpoint',
     'research-model',
@@ -1551,6 +1626,22 @@ function _setupResearchPickers(pane) {
     _researchPickers.set(id, controller);
     refresh();
   });
+}
+
+function _versionMeta(job) {
+  const version = Number(job.version) || 1;
+  if (version <= 1) return '';
+  const counts = job.changeCounts || {};
+  const changed = ['added', 'removed', 'changed']
+    .map(key => Number(counts[key]) || 0)
+    .reduce((a, b) => a + b, 0);
+  return ` · v${version}${changed ? ` · ${changed} evidence change${changed === 1 ? '' : 's'}` : ''}`;
+}
+
+function _citationNote(job) {
+  const n = Number(job.citationWarningCount) || 0;
+  if (!n) return '';
+  return `<div class="research-job-citation-note" title="Open the visual report to see which cited links were not read">${n} cited link${n === 1 ? '' : 's'} not read</div>`;
 }
 
 function _researchVisualVariant(job) {

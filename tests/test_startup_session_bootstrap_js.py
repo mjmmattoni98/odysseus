@@ -19,7 +19,13 @@ _SESSIONS = _REPO / "static" / "js" / "sessions.js"
 _SHELL_URL = (_REPO / "static" / "js" / "startupShell.js").as_uri()
 _HAS_NODE = shutil.which("node") is not None
 
-_IMPORT_REWRITES = {}
+_IMPORT_REWRITES = {
+    # Pure helper with no imports or DOM side effects, so the real module is used.
+    "import { setActionLabel } from './a11yLabel.js';": (
+        "import { setActionLabel } from "
+        f"'{(_REPO / 'static' / 'js' / 'a11yLabel.js').as_uri()}';"
+    ),
+}
 
 _STUBS = {
     "assistantControls.mjs": "export default { loadSession() {} };",

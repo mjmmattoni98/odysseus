@@ -58,6 +58,7 @@ EXPECTED_RAIL_PAIRS = {
     "tool-calendar": "#rail-calendar",
     "tool-compare": "#rail-compare",
     "tool-cookbook": "#rail-cookbook",
+    "tool-decisions": "#rail-decisions",
     "tool-research": "#rail-research",
     "tool-gallery": "#rail-gallery",
     "tool-library": "#rail-archive",

@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from core.database import EditorDraft, SessionLocal
 from src.auth_helpers import get_current_user
 from src.upload_limits import EDITOR_DRAFT_MAX_BYTES
+from src.user_time import utc_isoformat
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +65,8 @@ def _summary(d: EditorDraft) -> Dict[str, Any]:
         "width": d.width,
         "height": d.height,
         "thumbnail": d.thumbnail,
-        "created_at": d.created_at.isoformat() if d.created_at else None,
-        "updated_at": d.updated_at.isoformat() if d.updated_at else None,
+        "created_at": utc_isoformat(d.created_at),
+        "updated_at": utc_isoformat(d.updated_at),
     }
 
 

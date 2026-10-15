@@ -21,6 +21,7 @@ export const UI_VIS_MAP = {
   'tool-calendar':       '#tool-calendar-btn, #rail-calendar',
   'tool-compare':        '#tool-compare-btn, #rail-compare',
   'tool-cookbook':       '#tool-cookbook-btn, #rail-cookbook',
+  'tool-decisions':      '#tool-decisions-btn, #rail-decisions',
   'tool-research':       '#tool-research-btn, #rail-research',
   'tool-gallery':        '#tool-gallery-btn, #rail-gallery',
   'tool-library':        '#tool-library-btn, #rail-archive',

@@ -1256,6 +1256,15 @@ export function openPanel() {
     pane.style.borderRadius = '14px 14px 0 0';
     pane.style.animation = 'sheet-enter 0.25s cubic-bezier(0.2, 0.8, 0.2, 1) both';
     pane.style.transformOrigin = 'bottom center';
+    // The header dismiss control is the sheet's visible Close on mobile (the
+    // shared mobile sheet CSS shows it). It dismisses exactly like the
+    // swipe-down gesture, so present it as Close rather than a "_" glyph.
+    const dismissBtn = pane.querySelector('#notes-minimize-btn');
+    if (dismissBtn) {
+      dismissBtn.title = 'Close';
+      dismissBtn.setAttribute('aria-label', 'Close notes');
+      dismissBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>';
+    }
   }
 
   // Mount on body so Notes can behave like the other draggable windows. On

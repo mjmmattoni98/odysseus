@@ -23,9 +23,10 @@ from src.upload_limits import (
 from src.constants import GENERATED_IMAGES_DIR
 from src.path_confinement import confine
 from src.optional_deps import patch_realesrgan_torchvision_compat
+from src.user_time import utc_isoformat
 
 from routes.gallery.gallery_helpers import (
-    GalleryPatch, _extract_exif, _image_to_dict, _owner_filter, _human_size,
+    GalleryPatch, _extract_exif, _image_to_dict, _image_url, _owner_filter, _human_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -468,8 +469,11 @@ def setup_gallery_routes() -> APIRouter:
             img_path = _gallery_image_path(img.filename)
             img_path.write_bytes(content)
 
-            # Refresh dimensions in case the editor resized the canvas.
+            # Refresh dimensions in case the editor resized the canvas, and
+            # size/hash so the inspector and dedupe match the new bytes.
             # updated_at auto-bumps via TimestampMixin's onupdate hook.
+            img.file_size = len(content)
+            img.file_hash = hashlib.sha256(content).hexdigest()
             try:
                 from PIL import Image
                 from io import BytesIO
@@ -480,11 +484,13 @@ def setup_gallery_routes() -> APIRouter:
                 pass
             try:
                 db.commit()
+                db.refresh(img)
             except Exception:
                 db.rollback()
                 logger.exception("gallery_replace: DB commit failed")
                 raise HTTPException(500, "Image update failed")
-            return {"ok": True, "width": img.width, "height": img.height}
+            return {"ok": True, "width": img.width, "height": img.height,
+                    "image": _image_to_dict(img)}
         finally:
             db.close()
 
@@ -567,7 +573,11 @@ def setup_gallery_routes() -> APIRouter:
                 img.file_size = len(content)
                 img.width, img.height = rotated.size
             db.commit()
-            return {"ok": True, "width": img.width, "height": img.height}
+            db.refresh(img)
+            # Full record so the client can reconcile the open inspector
+            # (dimensions, file size, updated_at) without a second request.
+            return {"ok": True, "width": img.width, "height": img.height,
+                    "image": _image_to_dict(img)}
         finally:
             db.close()
 
@@ -844,7 +854,7 @@ def setup_gallery_routes() -> APIRouter:
                     cover_q = db.query(GalleryImage).filter(GalleryImage.id == a.cover_id)
                     cover = _owner_filter(cover_q, user).first()
                     if cover:
-                        cover_url = f"/api/generated-image/{cover.filename}"
+                        cover_url = _image_url(cover.filename, cover.file_hash)
                 elif count > 0:
                     _cover_q = db.query(GalleryImage).filter(
                         GalleryImage.album_id == a.id, GalleryImage.is_active == True
@@ -852,11 +862,11 @@ def setup_gallery_routes() -> APIRouter:
                     _cover_q = _owner_filter(_cover_q, user)
                     first = _cover_q.order_by(GalleryImage.created_at.desc()).first()
                     if first:
-                        cover_url = f"/api/generated-image/{first.filename}"
+                        cover_url = _image_url(first.filename, first.file_hash)
                 result.append({
                     "id": a.id, "name": a.name, "description": a.description or "",
                     "cover_url": cover_url, "count": count,
-                    "created_at": a.created_at.isoformat() if a.created_at else None,
+                    "created_at": utc_isoformat(a.created_at),
                 })
             return {"albums": result}
         finally:

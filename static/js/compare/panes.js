@@ -1,7 +1,8 @@
 // compare/panes.js — pane lifecycle, actions, layout
 import state from './state.js';
 import { _persistSelections } from './models.js';
-import { buildVoteBar } from './vote.js?v=20260828resendcaldrag1';
+import { buildVoteBar, syncVoteControls } from './vote.js?v=20260828resendcaldrag1';
+import { PANE_FAILED, PANE_PENDING, searchResponseState } from './streamOutcome.js';
 import {
   ICON_REROLL, ICON_COPY, ICON_EXPAND, ICON_COLLAPSE, ICON_CLOSE,
   ICON_PLAY, ICON_CODE, SEND_SVG, ICON_DICE,
@@ -447,6 +448,8 @@ async function rerollPane(paneIdx, overrideTimeout) {
     const aiMsg = document.createElement('div');
     aiMsg.className = 'msg msg-ai';
     aiMsg.innerHTML = '<div class="role">Search</div><div class="body"></div>';
+    // Vote eligibility reads this per-message state (see vote.js).
+    aiMsg.dataset.responseState = PANE_PENDING;
     const aiBody = aiMsg.querySelector('.body');
     if (spinnerModule) {
       const spinner = spinnerModule.create('Searching...', 'right');
@@ -455,6 +458,7 @@ async function rerollPane(paneIdx, overrideTimeout) {
     }
     hist.appendChild(aiMsg);
     hist.scrollTop = hist.scrollHeight;
+    syncVoteControls();
 
     const m = state._selectedModels[paneIdx];
     const fd = new FormData();
@@ -468,6 +472,7 @@ async function rerollPane(paneIdx, overrideTimeout) {
       const res = await fetch(`${state.API_BASE}/api/search/query`, { method: 'POST', body: fd, signal: ac.signal });
       const data = await res.json();
       const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+      aiMsg.dataset.responseState = searchResponseState(data);
       aiBody.innerHTML = '';
       if (data.error) {
         aiBody.innerHTML = '<div style="color:var(--color-error);font-size:0.85em;">Error: ' + escapeHtml(data.error) + '</div>';
@@ -487,10 +492,12 @@ async function rerollPane(paneIdx, overrideTimeout) {
       footer.appendChild(span);
       aiMsg.appendChild(footer);
     } catch (err) {
+      aiMsg.dataset.responseState = searchResponseState(null);
       aiBody.innerHTML = '<div style="color:var(--color-error);font-size:0.85em;">Error: ' + escapeHtml(err.message) + '</div>';
     }
     state._abortControllers[paneIdx] = null;
     hist.scrollTop = hist.scrollHeight;
+    syncVoteControls();
     return;
   }
 
@@ -965,8 +972,16 @@ function _showModelSwapDropdown(paneIdx, titleBtn) {
         titleEl.innerHTML = escapeHtml(displayName) + ' <span class="pane-title-caret">&#x25BE;</span>';
       }
 
-      // Clear pane history for fresh start
+      // Clear pane history for fresh start. A failed pane switched from its
+      // error notice ("Switch model") re-asks the round's prompt afterwards.
       const hist = document.getElementById('cmp-history-' + paneIdx);
+      const swappedPane = document.querySelector(`.compare-pane[data-pane="${paneIdx}"]`);
+      const replies = hist ? hist.querySelectorAll('.msg-ai') : [];
+      const lastFailed = replies.length > 0 && replies[replies.length - 1].dataset.responseState === PANE_FAILED;
+      const rerunPrompt = (swappedPane?.dataset.rerunOnSwap === '1' && lastFailed)
+        ? (hist.querySelector('.msg-user .body')?.textContent || '')
+        : '';
+      if (swappedPane) delete swappedPane.dataset.rerunOnSwap;
       if (hist) { hist.innerHTML = ''; hist.style.display = ''; }
       const iframe = document.getElementById('cmp-iframe-' + paneIdx);
       if (iframe) { iframe.srcdoc = ''; iframe.style.display = 'none'; iframe._htmlCode = null; }
@@ -977,6 +992,17 @@ function _showModelSwapDropdown(paneIdx, titleBtn) {
       const summary = document.getElementById('cmp-summary-' + paneIdx);
       if (summary) { summary.textContent = ''; summary.title = ''; }
       refreshMobilePaneTabs(paneIdx);
+      // The cleared pane has no answer to vote for any more.
+      syncVoteControls();
+      if (rerunPrompt && hist) {
+        // rerollPane replays the pane's first user message.
+        const userMsg = document.createElement('div');
+        userMsg.className = 'msg msg-user';
+        userMsg.innerHTML = '<div class="role">You</div><div class="body"></div>';
+        userMsg.querySelector('.body').textContent = rerunPrompt;
+        hist.appendChild(userMsg);
+        rerollPane(paneIdx);
+      }
     });
     dropdown.appendChild(item);
   });

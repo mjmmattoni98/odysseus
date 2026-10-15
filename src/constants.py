@@ -100,6 +100,20 @@ SKILLS_DIR = os.path.join(DATA_DIR, "skills")
 GALLERY_DIR = os.path.join(DATA_DIR, "gallery")
 GALLERY_UPLOADS_DIR = os.path.join(DATA_DIR, "gallery_uploads")
 MEMORY_VECTORS_DIR = os.path.join(DATA_DIR, "memory_vectors")
+LOGS_DIR = os.path.join(DATA_DIR, "logs")
+WEB_CACHE_DIR = os.path.join(DATA_DIR, "cache")  # search results and fetched pages
+
+# Server-side backup archives (Settings > System > Backups) and their state.
+# Under DATA_DIR so the agent's file tools already treat them as app state; the
+# backup walker skips this directory. Mount a separate volume here to keep the
+# archives off the data disk.
+BACKUPS_DIR = os.path.join(DATA_DIR, "backups")
+BACKUP_STATE_FILE = os.path.join(BACKUPS_DIR, "backup-state.json")
+# A confirmed restore waits in RESTORE_STAGING_DIR until the next startup
+# applies it; the files it replaced are parked in RESTORE_PREVIOUS_DIR. Both sit
+# on the data filesystem so applying a restore is a series of renames.
+RESTORE_STAGING_DIR = os.path.join(DATA_DIR, ".restore-staging")
+RESTORE_PREVIOUS_DIR = os.path.join(DATA_DIR, ".restore-previous")
 
 # The only part of DATA_DIR the agent's file tools and subprocesses may touch.
 # Everything else under DATA_DIR is application state (session store, auth
