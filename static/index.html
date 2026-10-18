@@ -247,34 +247,34 @@
        real request is discarded and the font fetched a second time. -->
   <link rel="preload" as="font" type="font/woff2" crossorigin href="/static/fonts/FiraCode-Regular.woff2">
   <link rel="preload" as="font" type="font/woff2" crossorigin href="/static/fonts/FiraCode-SemiBold.woff2">
-  <link rel="stylesheet" href="/static/css/00-tokens.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/01-agent-chat.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/02-compare.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/03-agent-chat.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/04-memory.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/05-documents.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/06-admin-settings.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/07-documents.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/08-skills.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/09-gallery.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/10-cookbook.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/11-tasks.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/12-gallery.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/13-image-editor.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/14-email.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/15-notes.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/16-calendar.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/17-research.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/18-decisions.css?v=20261014audit1">
+  <link rel="stylesheet" href="/static/css/00-tokens.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/01-agent-chat.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/02-compare.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/03-agent-chat.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/04-memory.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/05-documents.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/06-admin-settings.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/07-documents.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/08-skills.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/09-gallery.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/10-cookbook.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/11-tasks.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/12-gallery.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/13-image-editor.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/14-email.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/15-notes.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/16-calendar.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/17-research.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/18-decisions.css?v=20261015noprofiles1">
   <!-- Panel stylesheets split out of style.css for maintainability. They are
        eager and their order is load-bearing: the cascade is the concatenation of
        these files in this order, so they must stay in this order here and in the
        PRECACHE list in sw.js. None of them is lazy-loaded. -->
-  <link rel="stylesheet" href="/static/css/documents-gallery-editor.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/email-calendar-notes-tasks.css?v=20261014audit1">
-  <link rel="stylesheet" href="/static/css/cookbook-research-memory-settings.css?v=20261014audit1">
-  <link rel="modulepreload" href="/static/app.js?v=20261014audit1">
-<link rel="modulepreload" href="/static/js/chat.js?v=20261014audit1">
+  <link rel="stylesheet" href="/static/css/documents-gallery-editor.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/email-calendar-notes-tasks.css?v=20261015noprofiles1">
+  <link rel="stylesheet" href="/static/css/cookbook-research-memory-settings.css?v=20261015noprofiles1">
+  <link rel="modulepreload" href="/static/app.js?v=20261015noprofiles1">
+<link rel="modulepreload" href="/static/js/chat.js?v=20261015noprofiles1">
   <link rel="modulepreload" href="/static/js/ui.js?v=20260916largetoolscroll1">
   <link rel="modulepreload" href="/static/js/sessions.js">
   <link rel="modulepreload" href="/static/js/markdown.js">
@@ -1180,8 +1180,13 @@
               </button>
             </div>
           </div>
+          <!-- Conversation settings (sliders) -->
+          <button type="button" class="input-icon-btn" title="Conversation settings" id="assistant-settings-btn" aria-label="Conversation settings">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>
+            </svg>
+          </button>
           <!-- Web search (magnifying glass) -->
-          <button type="button" class="input-icon-btn" id="assistant-settings-btn" aria-label="Conversation settings">Everyday</button>
           <button type="button" class="input-icon-btn" title="Web search" id="web-toggle-btn" data-mode-tool="true" aria-label="Web search" aria-pressed="false">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -1273,19 +1278,9 @@
           <button type="button" class="close-btn" id="assistant-close" aria-label="Close conversation settings">Close</button>
         </div>
         <div class="modal-body preset-modal-body">
-          <label for="assistant-profile">Profile</label>
-          <select id="assistant-profile">
-            <option value="everyday">Everyday assistant</option>
-            <option value="research">Research and decisions</option>
-            <option value="actions">Actions and tools</option>
-            <option value="legacy">Existing settings</option>
-          </select>
-          <p>Everyday and Research can look things up and read reference material. Choose Actions when you want to change files or use other tools.</p>
-          <label for="assistant-web">Web access</label>
-          <select id="assistant-web"><option value="off">Off</option><option value="auto">Auto: search when needed</option><option value="on">On: search before answering</option></select>
           <div id="assistant-thinking-row">
             <label for="assistant-thinking">Thinking for this conversation</label>
-            <select id="assistant-thinking"><option value="auto">Model default</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select>
+            <select id="assistant-thinking"><option value="auto">Default (from Settings)</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select>
           </div>
           <div id="assistant-context-row" hidden>
             <label for="assistant-context">Context limit for this model</label>
@@ -2803,20 +2798,20 @@
 <script type="module" src="/static/js/voiceConversation.js"></script>
 <script type="module" src="/static/js/document.js?v=20260916docctx2"></script>
 <script type="module" src="/static/js/gallery.js?v=20260910promptcopy1"></script>
-<script type="module" src="/static/js/chatRenderer.js?v=20261014audit1"></script>
+<script type="module" src="/static/js/chatRenderer.js?v=20261015noprofiles1"></script>
 <script type="module" src="/static/js/codeRunner.js?v=20260831richtexttools91"></script>
 <script type="module" src="/static/js/chatStream.js?v=20260914pdfstrip1"></script>
-<script type="module" src="/static/js/chat.js?v=20261014audit1"></script>
+<script type="module" src="/static/js/chat.js?v=20261015noprofiles1"></script>
 <script type="module" src="/static/js/cookbook.js"></script>
 <script src="/static/js/cookbookSchedule.js"></script>
 <script type="module" src="/static/js/search-chat.js"></script>
 <script type="module" src="/static/js/theme.js?v=20260911organsrain1"></script>
 <script type="module" src="/static/js/censor.js"></script>
-<script type="module" src="/static/js/settings.js?v=20261014audit1"></script>
+<script type="module" src="/static/js/settings.js?v=20261015noprofiles1"></script>
 <script type="module" src="/static/js/modelPerformance.js"></script>
 <script type="module" src="/static/js/assistant.js?v=20260912firefoxjscleanup1"></script>
-<script type="module" src="/static/js/decisions.js?v=20261014audit1"></script>
-<script type="module" src="/static/app.js?v=20261014audit1"></script>  <!-- app.js must be LAST -->
+<script type="module" src="/static/js/decisions.js?v=20261015noprofiles1"></script>
+<script type="module" src="/static/app.js?v=20261015noprofiles1"></script>  <!-- app.js must be LAST -->
   <script type="module" src="/static/js/init.js?v=20260829chatstyle12"></script>
 <script type="module" src="/static/js/a11y.js"></script>
 <script nonce="{{CSP_NONCE}}">if('serviceWorker' in navigator){navigator.serviceWorker.register('/static/sw.js?v=20260916autoscroll1').catch(()=>{});}</script>

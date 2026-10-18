@@ -7769,9 +7769,9 @@ _RULE_TOOL_NAME_RE = re.compile(r"`([a-z_][a-z0-9_]*)")
 def _drop_rules_for_disabled_tools(text: str, disabled_tools: Optional[Set[str]] = None) -> str:
     """Remove rule bullets that point the model at a tool it cannot call.
 
-    Profiles such as Everyday disable write tools and memory; a rule saying
-    "use `manage_memory`" then only produces refused calls. A section left
-    with no bullets is dropped entirely.
+    When tool toggles or policy disable a tool such as memory, a rule saying
+    "use `manage_memory`" only produces refused calls. A section left with no
+    bullets is dropped entirely.
     """
     disabled = set(disabled_tools or ())
     if not disabled or not text:
@@ -17259,7 +17259,7 @@ class _StickyToolSets:
 _sticky_tool_sets = _StickyToolSets()
 
 
-def _sticky_tool_key(owner, session_id, endpoint_url, model, profile, plan_mode) -> Optional[tuple]:
+def _sticky_tool_key(owner, session_id, endpoint_url, model, plan_mode) -> Optional[tuple]:
     """Key for the per-conversation tool list; None without a session id."""
     if not session_id:
         return None
@@ -17268,7 +17268,6 @@ def _sticky_tool_key(owner, session_id, endpoint_url, model, profile, plan_mode)
         str(session_id),
         str(endpoint_url or "").rstrip("/"),
         str(model or ""),
-        str(profile or ""),
         bool(plan_mode),
     )
 
@@ -21607,13 +21606,6 @@ async def stream_agent_loop(
     if tool_policy:
         _caller_disabled_tools.update(tool_policy.all_disabled_names())
     disabled_tools = set(disabled_tools or [])
-    from src.assistant_preferences import current_preferences, READ_ONLY_TOOLS
-    assistant_read_only = current_preferences().read_only
-    if assistant_read_only:
-        from src.agent_tools import TOOL_TAGS
-        disabled_tools.update(TOOL_TAGS - READ_ONLY_TOOLS)
-        _caller_disabled_tools.update(TOOL_TAGS - READ_ONLY_TOOLS)
-        mcp_mgr = None
     if _unattended_native_runtime:
         # No client is available to answer a clarification card in a native
         # unattended run. Make this a hard request-scoped denial so prompt
@@ -22810,16 +22802,11 @@ async def stream_agent_loop(
     if _small_context_tier:
         _needs_admin = False
         logger.info("[tool-rag] small-context tier (window=%s)", _primary_context_window)
-    try:
-        _assistant_profile = current_preferences().profile
-    except Exception:
-        _assistant_profile = ""
-
     def _route_sticky_key(candidate_url, candidate_model):
         if not _route_is_local(candidate_url):
             return None
         return _sticky_tool_key(
-            owner, session_id, candidate_url, candidate_model, _assistant_profile, plan_mode,
+            owner, session_id, candidate_url, candidate_model, plan_mode,
         )
 
     _primary_sticky_prev = _sticky_tool_sets.get(_route_sticky_key(endpoint_url, model))
@@ -23990,7 +23977,7 @@ async def stream_agent_loop(
             )
     if _ody_doc_finetune_mode and _relevant_tools is not None:
         logger.info("[agent-intent] odysseus doc finetune tool clamp=%s", sorted(_relevant_tools))
-    elif _ody_notes_finetune_mode and _relevant_tools is not None and not assistant_read_only:
+    elif _ody_notes_finetune_mode and _relevant_tools is not None:
         disabled_tools.difference_update({
             "manage_notes", "manage_calendar", "manage_tasks",
         })
@@ -28074,7 +28061,7 @@ async def stream_agent_loop(
                             _ody_doc_finetune_mode = answering_state["ody_doc_finetune_mode"]
                             _ody_notes_finetune_mode = answering_state["ody_notes_finetune_mode"]
                             _ody_doc_stream_create_mode = answering_state["ody_doc_stream_create_mode"]
-                            if _ody_notes_finetune_mode and not assistant_read_only:
+                            if _ody_notes_finetune_mode:
                                 # Mirror the primary-route clamp: the answering
                                 # candidate's notes mode must re-enable the
                                 # personal managers in the shared execution
@@ -33918,7 +33905,6 @@ async def stream_agent_loop(
             )
             _ody_clamped_tool_allowed = (
                 _ody_notes_finetune_mode
-                and not assistant_read_only
                 and block.tool_type in {"manage_notes", "manage_calendar", "manage_tasks"}
             )
             policy_names = email_tool_policy_names(block.tool_type)
@@ -34151,8 +34137,7 @@ async def stream_agent_loop(
                     _workspace_mutation_epoch,
                 )
             elif (
-                (blocked_by_tool_policy or blocked_by_disabled_tools or broad_host_read_reason
-                 or (assistant_read_only and block.tool_type not in READ_ONLY_TOOLS))
+                (blocked_by_tool_policy or blocked_by_disabled_tools or broad_host_read_reason)
                 and (not _ody_clamped_tool_allowed or not policy_names.isdisjoint(_caller_hard_denials))
             ):
                 if blocked_by_tool_policy:

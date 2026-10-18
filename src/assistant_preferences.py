@@ -3,7 +3,6 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Literal
-import re
 import threading
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,25 +10,22 @@ from pydantic import BaseModel, ConfigDict, Field
 DEFAULT_LOCAL_CONTEXT_LIMIT = 32768
 MIN_CONTEXT_LIMIT = 1024
 MAX_CONTEXT_LIMIT = 262144
-READ_ONLY_TOOLS = frozenset({"web_search", "web_fetch", "search_chats", "read_file", "grep", "glob", "ls", "ask_user"})
+# Saved by the retired assistant profiles. Conversations stored before their
+# removal still carry these keys; they are dropped on load and ignored on save.
+RETIRED_PREFERENCE_FIELDS = frozenset({"profile", "web_mode"})
 
 
 class AssistantPreferences(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    profile: Literal["legacy", "everyday", "research", "actions"] = "everyday"
-    web_mode: Literal["off", "auto", "on"] = "auto"
-    thinking: Literal["auto", "off", "low", "medium", "high"] = "off"
+    # "auto" uses the Settings default (local_thinking_effort).
+    thinking: Literal["auto", "off", "low", "medium", "high"] = "auto"
     instructions: str = Field("", max_length=10000)
     # Model IDs are exact: a limit for one model must not affect a fallback.
     context_limits: dict[str, int] = Field(default_factory=dict, max_length=100)
 
-    @property
-    def read_only(self) -> bool:
-        return self.profile in {"everyday", "research"}
 
-
-LEGACY_PREFERENCES = AssistantPreferences(profile="legacy", thinking="auto")
+DEFAULT_PREFERENCES = AssistantPreferences()
 _turn = ContextVar("assistant_turn", default=None)
 _search_reports = ContextVar("assistant_search_reports", default=None)
 _sources = ContextVar("assistant_sources", default=None)
@@ -76,7 +72,7 @@ def record_search_report(report):
 
 def current_preferences():
     value = _turn.get()
-    return value[0] if value else LEGACY_PREFERENCES
+    return value[0] if value else DEFAULT_PREFERENCES
 
 
 def default_context_limit():
@@ -110,6 +106,8 @@ def context_limit(url, model):
 
 
 def parse_preferences(data):
+    if isinstance(data, dict):
+        data = {key: value for key, value in data.items() if key not in RETIRED_PREFERENCE_FIELDS}
     preferences = AssistantPreferences.model_validate(data)
     for model, limit in preferences.context_limits.items():
         if not model.strip() or len(model) > 256 or isinstance(limit, bool) or not MIN_CONTEXT_LIMIT <= limit <= MAX_CONTEXT_LIMIT:
@@ -122,47 +120,12 @@ def load_preferences(session_id):
 
     with SessionLocal() as db:
         row = db.query(Session.assistant_preferences).filter(Session.id == session_id).first()
-        return parse_preferences(row[0]) if row and row[0] else LEGACY_PREFERENCES
-
-
-def web_enabled(preferences, message, *, explicitly_denied=False):
-    if explicitly_denied or preferences.web_mode == "off":
-        return False
-    if preferences.web_mode == "on":
-        return True
-    # Auto is intentionally cheap: no extra model invocation for each message.
-    # Web tools remain available for follow-up lookups on an Auto turn.
-    return bool(re.search(
-        r"https?://|\b(search|look\s*up|verify|fact.check|sources?|citations?|"
-        r"latest|current|today|news|weather|forecast|prices?|buy|purchase|recommend|"
-        r"recommendations?|available|availability|compare|comparison|reviews?|"
-        r"buscar?|busca|verifica|fuentes?|actual|últim[oa]s?|hoy|noticias|"
-        r"precios?|comprar|recomienda|compar[ae]|disponibilidad)\b",
-        message or "", re.IGNORECASE,
-    ))
+        return parse_preferences(row[0]) if row and row[0] else DEFAULT_PREFERENCES
 
 
 def assistant_prompt(preferences):
-    if preferences.profile == "legacy":
-        return ""
-    prompt = (
-        "Help the user understand things and make well-supported decisions. "
-        "Answer directly and explain the important reasons. Separate facts, assumptions, "
-        "and preferences. For decisions, compare realistic options, recommend one, "
-        "and explain its strongest drawback and what would change the recommendation. "
-        "Ask for missing constraints only when necessary. Cite only sources supplied "
-        "by tools or the user. Distinguish a page you read from a search snippet. "
-        "If searching or fetching fails, say so; do not imply verification succeeded."
-    )
-    if preferences.read_only:
-        prompt += " This conversation is for discussion and research. Do not execute commands or change data."
-    if preferences.web_mode == "off":
-        prompt += " Web access is off. Explain when an answer needs current verification."
-    elif preferences.web_mode == "auto":
-        prompt += " Use web tools when current facts, recommendations, or verification are needed."
-    if preferences.profile == "research":
-        prompt += " Read primary sources where possible, compare conflicting evidence, and identify unresolved questions."
-    return prompt + ("\n\n" + preferences.instructions if preferences.instructions else "")
+    """The conversation's custom instructions, appended to the system prompt."""
+    return preferences.instructions
 
 
 def merge_sources(existing, incoming):

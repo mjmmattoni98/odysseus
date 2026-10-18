@@ -4,7 +4,7 @@
 import Storage from './storage.js';
 import assistantControls from './assistantControls.js';
 import uiModule, { autoResize, styledPrompt } from './ui.js?v=20260916largetoolscroll1';
-import chatRenderer from './chatRenderer.js?v=20261014audit1';
+import chatRenderer from './chatRenderer.js?v=20261015noprofiles1';
 import { providerLogo } from './providers.js';
 import { initModelPicker, updateModelPicker } from './modelPicker.js?v=20260909routeidentity1';
 import themeModule from './theme.js?v=20260911organsrain1';

@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 
 from src.constants import SEARXNG_INSTANCE, REQUEST_TIMEOUT, WEB_FETCH_USER_AGENT
 from .analytics import RateLimitError, error_logger
-from .query import build_enhanced_query
 
 logger = logging.getLogger(__name__)
 
@@ -359,7 +358,10 @@ def brave_search(query: str, count: Optional[int] = None, time_filter: Optional[
 
 def _brave_search_impl(query: str, count: int, time_filter: Optional[str] = None, search_config: dict = None) -> List[dict]:
     """Core Brave API call. Returns a list of result dicts or an empty list on failure."""
-    enhanced_query = build_enhanced_query(query, time_filter)
+    # Send the query as given, like every other provider. The former
+    # build_enhanced_query rewrite AND-joined natural-language fragments and
+    # quoted capitalized words, so ordinary questions matched almost nothing.
+    # Recency goes through the freshness parameter below.
     config = search_config or {}
 
     brave_api_key = config.get("brave_api_key")
@@ -372,7 +374,7 @@ def _brave_search_impl(query: str, count: int, time_filter: Optional[str] = None
 
     headers = {"X-Subscription-Token": brave_api_key, "Accept": "application/json"}
     params = {
-        "q": enhanced_query,
+        "q": query,
         "count": count,
         "safesearch": _safesearch_for("brave"),
     }
@@ -381,7 +383,7 @@ def _brave_search_impl(query: str, count: int, time_filter: Optional[str] = None
         if time_filter in time_map:
             params["freshness"] = time_map[time_filter]
 
-    logger.info(f"Executing Brave search with query: {enhanced_query}")
+    logger.info(f"Executing Brave search with query: {query}")
     try:
         response = httpx.get(
             "https://api.search.brave.com/res/v1/web/search",

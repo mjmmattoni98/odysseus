@@ -1161,6 +1161,9 @@ def comprehensive_web_search(
         return True
 
     filtered_urls = [r["url"] for r in search_results[:max_pages] if url_passes_filters(r["url"])]
+    # Lower-ranked results stand in for top pages that cannot be read
+    # (bot walls, logins, timeouts) so the model still gets page text.
+    backfill_urls = [r["url"] for r in search_results[max_pages:] if url_passes_filters(r["url"])]
     if not filtered_urls:
         logger.warning("All URLs filtered out by advanced criteria")
         msg = "No suitable results after applying filters."
@@ -1184,10 +1187,10 @@ def comprehensive_web_search(
     # Fetch content in parallel
     fetched_content = []
     source_by_url = {s["url"]: s for s in _source_list}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    def fetch_pages(executor, urls):
         future_to_url = {
             executor.submit(fetch_webpage_content, url, 8, retry_attempt=0): url
-            for url in filtered_urls
+            for url in urls
         }
         for future in as_completed(future_to_url):
             url = future_to_url[future]
@@ -1204,6 +1207,13 @@ def comprehensive_web_search(
                     source_by_url[url]["partial"] = bool(result.get("truncated") or len(result["content"]) > 3000)
             except Exception as e:
                 logger.error(f"Exception while fetching {url}: {str(e)}")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        fetch_pages(executor, filtered_urls)
+        # One backfill round bounds the added latency to a single fetch timeout.
+        missing = len(filtered_urls) - len(fetched_content)
+        if missing > 0 and backfill_urls:
+            fetch_pages(executor, backfill_urls[:missing])
 
     logger.info(f"Successfully fetched content from {len(fetched_content)} pages")
 

@@ -274,8 +274,7 @@ def _get_cache_key(url: str, model: str, messages: List[Dict],
                    reasoning_effort: Optional[str] = None) -> str:
 
     """Generate a cache key partitioned by endpoint and credential identity."""
-    from src.assistant_preferences import current_preferences, context_limit
-    preferences = current_preferences()
+    from src.assistant_preferences import context_limit
     hashable_messages = []
     for msg in messages:
         sorted_items = tuple(sorted(msg.items()))
@@ -287,7 +286,7 @@ def _get_cache_key(url: str, model: str, messages: List[Dict],
         'messages': hashable_messages,
         'temp': temperature,
         'max_tokens': max_tokens,
-        'thinking': preferences.thinking if preferences.profile != "legacy" else _ollama_thinking_effort(),
+        'thinking': _ollama_thinking_effort(),
         'context_limit': context_limit(url, model),
         'think_override': _normalize_think_override(think),
         'response_schema': response_schema if isinstance(response_schema, dict) else None,
@@ -1127,14 +1126,15 @@ _OLLAMA_THINK_EFFORT_CHOICES = ("auto", "off", "low", "medium", "high")
 
 
 def _ollama_thinking_effort() -> str:
-    """Selected thinking effort for local Ollama models (Settings-backed).
+    """Selected thinking effort for local Ollama models.
 
-    ``auto`` means "leave the payload alone" so the existing per-family
-    suppression keeps working; anything else is an explicit operator choice.
+    A conversation's explicit choice wins; its ``auto`` defers to the Settings
+    value. ``auto`` there means "leave the payload alone" so the existing
+    per-family suppression keeps working.
     """
     from src.assistant_preferences import current_preferences
     preferences = current_preferences()
-    if preferences.profile != "legacy":
+    if preferences.thinking != "auto":
         return preferences.thinking
     try:
         from src.settings import load_settings

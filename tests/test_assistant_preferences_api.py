@@ -33,21 +33,32 @@ def client(monkeypatch):
     engine.dispose()
 
 
-def test_existing_conversation_keeps_legacy_and_new_preferences_round_trip(client):
-    assert client.get("/api/session/alice/assistant").json()["preferences"]["profile"] == "legacy"
-    options = {"profile": "research", "web_mode": "on", "thinking": "high", "instructions": "Compare costs", "context_limits": {"local-model": 16384}}
+DEFAULTS = {"thinking": "auto", "instructions": "", "context_limits": {}}
+
+
+def test_existing_conversation_uses_defaults_and_preferences_round_trip(client):
+    assert client.get("/api/session/alice/assistant").json()["preferences"] == DEFAULTS
+    options = {"thinking": "high", "instructions": "Compare costs", "context_limits": {"local-model": 16384}}
     saved = client.put("/api/session/alice/assistant", json=options)
     assert saved.status_code == 200
     assert client.get("/api/session/alice/assistant").json()["preferences"] == options
 
 
+def test_conversation_saved_with_a_retired_profile_loads_without_it(client):
+    with database.SessionLocal() as db:
+        row = db.query(database.Session).filter(database.Session.id == "alice").one()
+        row.assistant_preferences = {"profile": "everyday", "web_mode": "auto", "thinking": "off", "instructions": "", "context_limits": {}}
+        db.commit()
+    assert client.get("/api/session/alice/assistant").json()["preferences"] == {**DEFAULTS, "thinking": "off"}
+
+
 def test_preferences_are_owner_scoped_and_invalid_updates_do_not_change_them(client):
     assert client.get("/api/session/bob/assistant").status_code == 404
-    assert client.put("/api/session/bob/assistant", json={"profile": "actions"}).status_code == 404
+    assert client.put("/api/session/bob/assistant", json={"thinking": "high"}).status_code == 404
     assert client.get("/api/session/missing/assistant").status_code == 404
     assert client.put("/api/session/alice/assistant", json={"context_limits": {"test": -1}}).status_code == 422
     assert client.put("/api/session/alice/assistant", content="{").status_code == 422
-    assert client.get("/api/session/alice/assistant").json()["preferences"]["profile"] == "legacy"
+    assert client.get("/api/session/alice/assistant").json()["preferences"] == DEFAULTS
 
 
 def test_upgrade_preserves_existing_sessions_and_is_idempotent(monkeypatch):

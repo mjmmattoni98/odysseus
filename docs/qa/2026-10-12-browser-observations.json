@@ -1,0 +1,56 @@
+{
+  "compare": {
+    "successful_model": "gemma4:12b",
+    "successful_response": "42",
+    "failed_model": "clef-flash:latest",
+    "failed_response": "",
+    "visible_error": false,
+    "vote_enabled": true,
+    "tie_click_revealed_both": true,
+    "provider_http_status": 400,
+    "provider_error": "does not support chat"
+  },
+  "gallery": {
+    "uploaded_size": [
+      320,
+      180
+    ],
+    "rotated_api_size": [
+      180,
+      320
+    ],
+    "inspector_size_after_rotation": "320 x 180",
+    "created_at": "2026-10-11T23:59:55.397856",
+    "browser_now": "Mon Oct 12 2026 02:00:28 GMT+0200",
+    "displayed_age": "2 hours ago"
+  },
+  "composer": {
+    "during_generation": {
+      "title": "Stop generation",
+      "aria_label": "New chat"
+    },
+    "cancel_succeeded": true,
+    "following_reply": "17"
+  },
+  "mobile": {
+    "viewport": [
+      375,
+      667
+    ],
+    "document_scroll_width": 375,
+    "chat_width": 355
+  },
+  "research": {
+    "duration_seconds": 133.1,
+    "report_words": 1810,
+    "official_sources": 3,
+    "report_primary_count": 0
+  },
+  "smoke": {
+    "passed": 16,
+    "failed": 0,
+    "skipped": 0,
+    "areas": 12,
+    "provider": "deterministic stub"
+  }
+}

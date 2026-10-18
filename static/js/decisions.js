@@ -16,7 +16,7 @@ import * as Modals from './modalManager.js';
 import { makeWindowDraggable } from './windowDrag.js';
 import {
   scoreOptions, compareToSnapshot, localToday, isRevisitDue, formatShare, newRowId, idDict,
-} from './decisionScoring.js?v=20261014audit1';
+} from './decisionScoring.js?v=20261015noprofiles1';
 
 const API = '/api/decisions';
 const MODAL_ID = 'decisions-modal';

@@ -75,11 +75,11 @@ test('settings warns about roles that swap models on the chat server', async () 
 test('conversation context note explains reloads for non-default caps', async () => {
   globalThis.document = { readyState: 'loading', addEventListener() {}, getElementById: () => null };
   const source = (await readFile(new URL('../static/js/assistantControls.js', import.meta.url), 'utf8'))
-    .replace("import ui from './ui.js';", 'const ui = { showError() {} };');
+    .replace(/import ui from '\.\/ui\.js(?:\?[^']*)?';/, 'const ui = { showError() {} };');
   const controls = await import(`data:text/javascript,${encodeURIComponent(source)}#${Math.random()}`);
   globalThis.fetch = async () => ({
     ok: true,
-    json: async () => ({ preferences: { profile: 'everyday', context_limits: {} }, runtime: { native: true, model: 'm', default_context_limit: 32768 } }),
+    json: async () => ({ preferences: { thinking: 'auto', instructions: '', context_limits: {} }, runtime: { native: true, model: 'm', default_context_limit: 32768 } }),
   });
   await controls.loadSession('s');
   assert.equal(controls.contextReloadNote(32768), '');

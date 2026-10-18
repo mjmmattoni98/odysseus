@@ -3,32 +3,38 @@ import asyncio
 import pytest
 
 from src.assistant_preferences import (
-    AssistantPreferences, assistant_turn, current_preferences, parse_preferences,
-    web_enabled, context_limit, merge_sources, record_search_report, search_reports,
+    DEFAULT_PREFERENCES, AssistantPreferences, assistant_turn, current_preferences, parse_preferences,
+    context_limit, merge_sources, record_search_report, search_reports,
 )
 from src import llm_core
 
 
-@pytest.mark.parametrize("message", ["latest local models", "compare monitors", "Busca precios en España", "verify this claim"])
-def test_auto_web_recognizes_research(message):
-    assert web_enabled(AssistantPreferences(), message)
-
-
-def test_web_off_and_explicit_denial_win():
-    assert not web_enabled(AssistantPreferences(web_mode="off"), "search today")
-    assert not web_enabled(AssistantPreferences(web_mode="on"), "search", explicitly_denied=True)
-    assert not web_enabled(AssistantPreferences(), "Explain recursion")
-    assert web_enabled(AssistantPreferences(web_mode="on"), "Explain recursion")
-
-
 @pytest.mark.parametrize("data", [
-    {"profile": "unknown"}, {"web_mode": "maybe"}, {"thinking": "yes"},
-    {"instructions": "x" * 10001}, {"context_limits": {"model": 0}},
+    {"thinking": "yes"}, {"instructions": "x" * 10001}, {"context_limits": {"model": 0}},
     {"context_limits": {"model": 999999}}, {"unexpected": True},
 ])
 def test_invalid_preferences_are_rejected(data):
     with pytest.raises(ValueError):
         parse_preferences(data)
+
+
+def test_settings_saved_by_retired_profiles_still_load():
+    stored = {
+        "profile": "everyday", "web_mode": "auto", "thinking": "off",
+        "instructions": "Be brief", "context_limits": {"m": 16384},
+    }
+    assert parse_preferences(stored) == AssistantPreferences(
+        thinking="off", instructions="Be brief", context_limits={"m": 16384},
+    )
+
+
+def test_auto_thinking_defers_to_the_settings_default(monkeypatch):
+    import src.settings
+    monkeypatch.setattr(src.settings, "load_settings", lambda: {"local_thinking_effort": "low"})
+    with assistant_turn(AssistantPreferences()):
+        assert llm_core._ollama_thinking_effort() == "low"
+    with assistant_turn(AssistantPreferences(thinking="high")):
+        assert llm_core._ollama_thinking_effort() == "high"
 
 
 def test_concurrent_conversations_keep_thinking_and_search_reports_separate(monkeypatch):
@@ -48,7 +54,7 @@ def test_concurrent_conversations_keep_thinking_and_search_reports_separate(monk
                 return llm_core._ollama_think_value("http://localhost:11434/api/chat", "qwen"), search_reports()
         results = await asyncio.gather(turn("off"), turn("high"))
         assert results == [(False, [{"state": "off"}]), ("high", [{"state": "high"}])]
-        assert current_preferences().profile == "legacy"
+        assert current_preferences() == DEFAULT_PREFERENCES
         assert search_reports() == []
     asyncio.run(run())
 

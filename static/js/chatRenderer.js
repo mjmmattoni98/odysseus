@@ -8,7 +8,7 @@ import { generatedImageResult } from './generatedImageResult.js';
 import { svgifyEmoji } from './markdown.js';
 import { addAITTSButton } from './tts-ai.js';
 import { providerLogo, providerLabel } from './providers.js';
-import settingsModule from './settings.js?v=20261014audit1';
+import settingsModule from './settings.js?v=20261015noprofiles1';
 import spinnerModule from './spinner.js';
 import { bindMenuDismiss } from './escMenuStack.js';
 import { loadPanel } from './panels.js?v=20260909movepicklayer1';

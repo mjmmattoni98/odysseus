@@ -97,6 +97,26 @@ def test_page_references_are_not_mistaken_for_named_computers():
     assert intent.needs_tools and intent.category == "workspace"
 
 
+def test_ordinary_on_from_phrases_are_not_named_computers():
+    # "from where"/"from which" are question grammar, not a host named
+    # "where". Routing these to the workspace toolset withheld web tools
+    # from plain web questions.
+    for prompt in (
+        "Tell me from where can I download the shadps4 emulator",
+        "tell me from which websites can I download that safely",
+        "What's the best pizza place from here?",
+        "Any news on Monday about the elections?",
+        "I want to build it from scratch",
+        "who is on top of the league right now",
+    ):
+        intent = classify_tool_intent(prompt)
+        assert intent.reason != "named computer task request", prompt
+
+    for prompt in ("copy the logs from prodbox", "check the service on gpu-box"):
+        intent = classify_tool_intent(prompt)
+        assert intent.needs_tools and intent.category == "workspace", prompt
+
+
 def test_direct_code_requests_promote_to_workspace_agent():
     prompts = [
         "write a Python function that parses CSV",

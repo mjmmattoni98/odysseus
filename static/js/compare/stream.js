@@ -3,7 +3,7 @@ import state from './state.js';
 import { addFinishBadge, syncVoteControls } from './vote.js?v=20260828resendcaldrag1';
 import { consumePaneStream, createPaneStreamReader, paneResponseState, PANE_PENDING } from './streamOutcome.js';
 import { createTerminalStreamError } from '../chatStreamErrors.js';
-import { getModelCost, renderAskUserCard, safeDisplayImageSrc } from '../chatRenderer.js?v=20261014audit1';
+import { getModelCost, renderAskUserCard, safeDisplayImageSrc } from '../chatRenderer.js?v=20261015noprofiles1';
 import markdownModule from '../markdown.js';
 import spinnerModule from '../spinner.js';
 import uiModule from '../ui.js?v=20260916largetoolscroll1';

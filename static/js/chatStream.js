@@ -229,7 +229,7 @@ export function handleUIControl(uiData) {
         var ids = { memories: 'tool-memory-btn', skills: 'tool-skills-btn', settings: 'open-settings-btn' };
         var btn = document.getElementById(ids[panel]);
         if (panel === 'settings') {
-          import('./settings.js?v=20261014audit1').then(function(mod) {
+          import('./settings.js?v=20261015noprofiles1').then(function(mod) {
             var fn = mod.open || (mod.default && mod.default.open);
             if (fn) fn();
             else if (btn) btn.click();

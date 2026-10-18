@@ -471,39 +471,35 @@ class ChatProcessor:
                 fallback_query = next((line.strip() for line in message.split("\n") if line.strip()), "")
                 search_query = fallback_query
 
-                from src.assistant_preferences import current_preferences
-                # Everyday/research avoid an extra blocking local inference just
-                # to rewrite a query; tool follow-ups can refine it if needed.
-                if current_preferences().profile == "legacy":
-                    try:
-                        generated_query = llm_call(
-                            t_url,
-                            t_model,
-                            [
-                                {
-                                    "role": "system",
-                                    "content": (
-                                        "Extract a concise search query from the user's message. "
-                                        "Reply ONLY with the query."
-                                    ),
-                                },
-                                {"role": "user", "content": message},
-                            ],
-                            headers=t_headers,
-                            temperature=0.1,
-                            max_tokens=50,
-                            timeout=15,
-                        ).strip()
+                try:
+                    generated_query = llm_call(
+                        t_url,
+                        t_model,
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Extract a concise search query from the user's message. "
+                                    "Reply ONLY with the query."
+                                ),
+                            },
+                            {"role": "user", "content": message},
+                        ],
+                        headers=t_headers,
+                        temperature=0.1,
+                        max_tokens=50,
+                        timeout=15,
+                    ).strip()
 
-                        if generated_query:
-                            # LLM successfully generated a non-empty query -> use the generated query
-                            search_query = generated_query
-                        else:
-                            # LLM returned an empty or whitespace-only query -> fall back to original query
-                            logger.warning("LLM generated an empty search query, using fallback.")
-                    except Exception as e:
-                        # LLM failed (exception/error) -> fall back to original user query
-                        logger.warning(f"Failed to generate search query via LLM, using fallback: {e}")
+                    if generated_query:
+                        # LLM successfully generated a non-empty query -> use the generated query
+                        search_query = generated_query
+                    else:
+                        # LLM returned an empty or whitespace-only query -> fall back to original query
+                        logger.warning("LLM generated an empty search query, using fallback.")
+                except Exception as e:
+                    # LLM failed (exception/error) -> fall back to original user query
+                    logger.warning(f"Failed to generate search query via LLM, using fallback: {e}")
 
                 search_query = " ".join(search_query.split())
                 if len(search_query) > 150:
@@ -540,9 +536,7 @@ class ChatProcessor:
         # hundreds of KB of duplicate page HTML and confuses the model) or for
         # link-heavy pastes (>3 URLs typically means it's a boilerplate-laden
         # blog post, not a "summarize this URL" request).
-        from src.assistant_preferences import current_preferences
-        preferences = current_preferences()
-        urls = [] if preferences.profile != "legacy" and preferences.web_mode == "off" else extract_urls(message)
+        urls = extract_urls(message)
         non_yt_urls = [u for u in urls if not is_youtube_url(u)]
         skip_url_fetch = len(message) > 2000 or len(non_yt_urls) > 3
         if not skip_url_fetch:

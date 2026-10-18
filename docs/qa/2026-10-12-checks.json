@@ -1,0 +1,178 @@
+[
+  {
+    "name": "Public login policy is available before login",
+    "result": "ISSUE",
+    "kind": "finding",
+    "evidence": {
+      "http_status": 401
+    }
+  },
+  {
+    "name": "Current checkout is ready",
+    "result": "PASS",
+    "kind": "check",
+    "evidence": {
+      "http_status": 200,
+      "ready": true
+    }
+  },
+  {
+    "name": "Chat list excludes known non-chat model",
+    "result": "ISSUE",
+    "kind": "finding",
+    "evidence": {
+      "models": [
+        "clef-flash:latest",
+        "muse-glimmer:30b",
+        "ornith-1.5:9b",
+        "qwen3.8:27b",
+        "gemma4:26b",
+        "gemma4:12b"
+      ],
+      "non_chat_model": "clef-flash:latest"
+    }
+  },
+  {
+    "name": "Probe rejects a model without chat capability",
+    "result": "ISSUE",
+    "kind": "finding",
+    "evidence": {
+      "http_status": 200,
+      "probe": {
+        "results": [
+          {
+            "status": "ok",
+            "latency_ms": 5,
+            "capabilities": [
+              "decision",
+              "vision"
+            ],
+            "method": "capabilities",
+            "model": "clef-flash:latest",
+            "endpoint_id": "d10f2253"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "Model accepted by app probe can actually chat",
+    "result": "ISSUE",
+    "kind": "finding",
+    "evidence": {
+      "ollama_http_status": 400,
+      "response": "{\"error\":\"\\\"clef-flash:latest\\\" does not support chat\"}"
+    }
+  },
+  {
+    "name": "Gallery timestamp contains its UTC offset",
+    "result": "ISSUE",
+    "kind": "finding",
+    "evidence": {
+      "created_at": "2026-10-11T23:59:55.397856",
+      "browser_timezone": "Europe/Madrid",
+      "observed_ui": "2 hours ago for a newly uploaded image"
+    }
+  },
+  {
+    "name": "Image rotation persisted dimensions",
+    "result": "PASS",
+    "kind": "check",
+    "evidence": {
+      "dimensions": [
+        180,
+        320
+      ]
+    }
+  },
+  {
+    "name": "Document saved browser edits",
+    "result": "PASS",
+    "kind": "check",
+    "evidence": {
+      "http_status": 200,
+      "versions": 2
+    }
+  },
+  {
+    "name": "Downloaded DOCX is valid and contains the edited text",
+    "result": "PASS",
+    "kind": "check",
+    "evidence": {
+      "bytes": 7500
+    }
+  },
+  {
+    "name": "Live research completed and saved a report",
+    "result": "PASS",
+    "kind": "check",
+    "evidence": {
+      "stats": {
+        "Duration": "133.1s",
+        "Rounds": 1,
+        "Queries": 2,
+        "URLs": 5,
+        "Model": "qwen3.8:27b",
+        "Search": "searxng_yep",
+        "Preset": "Medium (auto)"
+      },
+      "words": 1810,
+      "sources": 4
+    }
+  },
+  {
+    "name": "Research report preserves official-source counts",
+    "result": "ISSUE",
+    "kind": "finding",
+    "evidence": {
+      "primary_or_official": 3,
+      "sources": [
+        {
+          "url": "https://www.nasa.gov/mars/",
+          "source_kind": "official"
+        },
+        {
+          "url": "https://www.nasa.gov/missions/mars-science-laboratory/curiosity-rover/nasas-curiosity-rover-catches-stunning-martian-dawn/",
+          "source_kind": "official"
+        },
+        {
+          "url": "https://science.nasa.gov/planetary-science/programs/mars-exploration/",
+          "source_kind": "official"
+        },
+        {
+          "url": "https://en.wikipedia.org/wiki/Mars_Exploration_Program",
+          "source_kind": "secondary"
+        }
+      ],
+      "rendered_primary_count": 0
+    }
+  },
+  {
+    "name": "Brief research request produces a brief report",
+    "result": "ISSUE",
+    "kind": "improvement",
+    "evidence": {
+      "prompt": "Find NASA's official Mars Exploration Program page and summarize its purpose briefly using only official NASA sources.",
+      "words": 1810
+    }
+  },
+  {
+    "name": "Memory added in the browser persisted",
+    "result": "PASS",
+    "kind": "check",
+    "evidence": {
+      "http_status": 200,
+      "matching_records": 1
+    }
+  },
+  {
+    "name": "Cancelled turn is saved and a subsequent turn succeeds",
+    "result": "PASS",
+    "kind": "check",
+    "evidence": {
+      "http_status": 200,
+      "cancelled_turns": 1,
+      "recovery_reply": "17"
+    }
+  }
+]

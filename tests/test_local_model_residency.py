@@ -534,7 +534,7 @@ def test_session_runtime_reports_default_cap(monkeypatch):
 
     monkeypatch.setattr(session_routes, "router", APIRouter(prefix="/api"))
     monkeypatch.setattr(session_routes, "_verify_session_owner", lambda request, sid: None, raising=False)
-    monkeypatch.setattr(ap, "load_preferences", lambda sid: ap.LEGACY_PREFERENCES)
+    monkeypatch.setattr(ap, "load_preferences", lambda sid: ap.DEFAULT_PREFERENCES)
     monkeypatch.setattr(ap, "default_context_limit", lambda: 49152)
     monkeypatch.setattr(oc, "supports_thinking", lambda url, model: True)
     monkeypatch.setattr(oc, "model_context_window", lambda url, model: 262144)

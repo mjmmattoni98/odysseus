@@ -33,7 +33,7 @@ from src.agent_loop import (
 from src.agent_loop import _normalize_ody_qwen_text_artifacts
 from src import agent_runs
 from src.assistant_preferences import (
-    load_preferences, assistant_turn, web_enabled, merge_sources, SourceRegistry,
+    load_preferences, assistant_turn, merge_sources, SourceRegistry,
 )
 from src.model_context import estimate_tokens
 from src.context_compactor import (
@@ -2319,12 +2319,10 @@ def setup_chat_routes(
         assistant_options = load_preferences(session)
         turn_reports = []
         turn_sources = SourceRegistry()
-        if assistant_options.profile != "legacy":
-            use_web = web_enabled(assistant_options, message)
 
         # Inline memory command
         memory_response = None
-        if not assistant_options.read_only and not tool_policy.blocks("manage_memory"):
+        if not tool_policy.blocks("manage_memory"):
             memory_response = await chat_handler.handle_memory_command(sess, message)
         if memory_response:
             return {"response": memory_response}
@@ -2357,7 +2355,7 @@ def setup_chat_routes(
             tool_policy.blocks("trigger_research")
             or tool_policy.blocks("manage_research")
         )
-        if use_research and not research_blocked_by_policy and assistant_options.web_mode != "off":
+        if use_research and not research_blocked_by_policy:
             try:
                 _r_ep, _r_model, _r_headers = _resolve_research_endpoint(sess)
                 research_ctx = await research_handler.call_research_service(
@@ -2991,23 +2989,6 @@ def setup_chat_routes(
         assistant_options = load_preferences(session)
         turn_reports = []
         turn_sources = SourceRegistry()
-        if assistant_options.profile != "legacy":
-            # Read the original explicit toggle, before legacy auto-escalation altered it.
-            original_web = form_data.get("allow_web_search", (body or {}).get("allow_web_search"))
-            denied = is_web_search_explicitly_denied(original_web)
-            if denied:
-                assistant_options = assistant_options.model_copy(update={"web_mode": "off"})
-            should_search = web_enabled(assistant_options, message, explicitly_denied=denied)
-            _search_enabled = assistant_options.web_mode != "off" and not denied
-            allow_web_search = "true" if _search_enabled else "false"
-            use_web = "true" if should_search else None
-            if assistant_options.read_only:
-                allow_bash = "false"
-                workspace = None
-                _workspace_agent_intent = False
-                chat_mode = "agent" if _search_enabled else "chat"
-            elif assistant_options.profile == "actions":
-                chat_mode = "agent"
 
         # ------------------------------------------------------------------ #
         # Privilege gates that must fire BEFORE any LLM work / token spend.
@@ -3034,9 +3015,6 @@ def setup_chat_routes(
             if get_session_mode(session) == 'research_pending':
                 do_research = True
                 logger.info(f"Session {session} in research_pending — auto-triggering research")
-        if assistant_options.profile != "legacy" and assistant_options.web_mode == "off":
-            do_research = False
-
         att_ids = []
         if tool_approval_continuation:
             # Browser composer state is unrelated to the action that was

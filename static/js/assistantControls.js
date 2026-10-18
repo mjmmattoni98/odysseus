@@ -1,6 +1,6 @@
 import ui from './ui.js?v=20260916largetoolscroll1';
 
-const defaults = () => ({ profile: 'everyday', web_mode: 'auto', thinking: 'off', instructions: '', context_limits: {} });
+const defaults = () => ({ thinking: 'auto', instructions: '', context_limits: {} });
 let preferences = defaults();
 let runtime = {};
 let sessionId = null;
@@ -27,32 +27,13 @@ function runtimeText(contextValue) {
 }
 
 function render() {
-  const legacy = preferences.profile === 'legacy';
-  const button = el('assistant-settings-btn');
-  if (!button) return;
-  button.textContent = legacy ? 'Assistant' : ({ everyday: 'Everyday', research: 'Research', actions: 'Actions' }[preferences.profile]);
-  button.title = 'Conversation settings';
-  el('assistant-profile').value = preferences.profile;
-  el('assistant-web').value = preferences.web_mode;
+  if (!el('assistant-settings-btn')) return;
   el('assistant-thinking').value = preferences.thinking;
   el('assistant-instructions').value = preferences.instructions;
   el('assistant-thinking-row').hidden = runtime.supports_thinking !== true;
   el('assistant-context-row').hidden = !runtime.native;
   el('assistant-context').value = preferences.context_limits[runtime.model] || runtime.context_limit || runtime.default_context_limit || 32768;
   el('assistant-runtime').textContent = runtimeText(el('assistant-context').value);
-  const webButton = el('web-toggle-btn');
-  if (!legacy && webButton) {
-    webButton.title = `Web: ${preferences.web_mode}. Click to change.`;
-    webButton.setAttribute('aria-label', `Web: ${preferences.web_mode}`);
-    webButton.setAttribute('aria-pressed', String(preferences.web_mode !== 'off'));
-    webButton.classList.toggle('active', preferences.web_mode !== 'off');
-    el('web-toggle').checked = preferences.web_mode !== 'off';
-  }
-  el('mode-agent-btn')?.closest('.mode-toggle')?.classList.toggle('hidden', !legacy);
-  if (!legacy && preferences.profile !== 'actions') {
-    el('bash-toggle').checked = false;
-    el('bash-toggle-btn')?.classList.remove('active');
-  }
 }
 
 export function loadSession(id) {
@@ -107,24 +88,17 @@ function init() {
     if (loadError) return;
     render();
     el('assistant-settings-modal').classList.remove('hidden');
-    el('assistant-profile').focus();
+    el('assistant-instructions').focus();
   });
   el('assistant-context')?.addEventListener('input', event => {
     el('assistant-runtime').textContent = runtimeText(event.target.value);
   });
   el('assistant-close')?.addEventListener('click', () => el('assistant-settings-modal').classList.add('hidden'));
-  el('assistant-profile')?.addEventListener('change', event => {
-    const profile = event.target.value;
-    el('assistant-web').value = profile === 'research' ? 'on' : 'auto';
-    el('assistant-thinking').value = profile === 'everyday' ? 'off' : 'auto';
-  });
   el('assistant-save')?.addEventListener('click', async () => {
     const context = el('assistant-context');
     if (runtime.native && !context.reportValidity()) return;
     preferences = {
       ...preferences,
-      profile: el('assistant-profile').value,
-      web_mode: el('assistant-web').value,
       thinking: el('assistant-thinking').value,
       instructions: el('assistant-instructions').value,
       context_limits: { ...preferences.context_limits },
@@ -138,17 +112,6 @@ function init() {
       el('assistant-settings-modal').classList.add('hidden');
     } catch (error) { ui.showError(error.message); }
   });
-  // Capture before the legacy binary toggle handler; legacy conversations keep it.
-  el('web-toggle-btn')?.addEventListener('click', event => {
-    if (preferences.profile === 'legacy') return;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    preferences = { ...preferences, web_mode: { off: 'auto', auto: 'on', on: 'off' }[preferences.web_mode] };
-    dirty = true;
-    revision++;
-    render();
-    if (sessionId) prepareTurn(sessionId).catch(error => ui.showError(error.message));
-  }, true);
   render();
 }
 

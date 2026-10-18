@@ -160,7 +160,7 @@ async def test_worker_thread_preface_records_turn_search_reports_and_memories(mo
     stages = []
     loop_thread = threading.get_ident()
 
-    with assistant_turn(AssistantPreferences(profile="everyday", web_mode="on"), "", reports):
+    with assistant_turn(AssistantPreferences(), "", reports):
         ctx = await _build(
             _session(), processor, "who am i? search the web",
             use_web=True, progress=stages.append,
@@ -227,7 +227,7 @@ async def test_turn_context_follows_history_as_one_untrusted_block(monkeypatch):
     ])
     processor = _processor()
 
-    with assistant_turn(AssistantPreferences(profile="everyday", web_mode="on"), ""):
+    with assistant_turn(AssistantPreferences(), ""):
         ctx1 = await _build(sess, processor, "what is my name, search it", use_web=True)
     roles = [m["role"] for m in ctx1.messages]
     assert roles == ["system", "system", "user", "assistant", "user", "user", "user"]
@@ -245,7 +245,7 @@ async def test_turn_context_follows_history_as_one_untrusted_block(monkeypatch):
     assert all("UNTRUSTED" not in str(m["content"]) for m in sess.messages)
 
     sess.messages.append({"role": "assistant", "content": "You are Felix."})
-    with assistant_turn(AssistantPreferences(profile="everyday", web_mode="on"), ""):
+    with assistant_turn(AssistantPreferences(), ""):
         ctx2 = await _build(sess, processor, "thanks, anything else?", use_web=True)
 
     # Turn 2 starts with turn 1's system prompt + history, byte for byte: the

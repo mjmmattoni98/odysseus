@@ -9,7 +9,7 @@ import Storage from './storage.js';
 import assistantControls from './assistantControls.js';
 import uiModule from './ui.js?v=20260916largetoolscroll1';
 import sessionModule from './sessions.js';
-import chatRenderer, { renderToolIcon } from './chatRenderer.js?v=20261014audit1';
+import chatRenderer, { renderToolIcon } from './chatRenderer.js?v=20261015noprofiles1';
 import chatStream from './chatStream.js?v=20260914pdfstrip1';
 import { addAITTSButton } from './tts-ai.js';
 import markdownModule from './markdown.js';
@@ -2595,15 +2595,8 @@ import { setActionLabel } from './a11yLabel.js';
 	      }
       fd.append('allow_bash', el('bash-toggle').checked ? 'true' : 'false');
       if (workspaceAgentIntent) fd.set('allow_bash', 'true');
-      if (!approvalForSend) {
-        const assistantOptions = await assistantControls.prepareTurn(streamSessionId);
-        if (assistantOptions.profile !== 'legacy') {
-          fd.delete('use_web');
-          fd.set('allow_web_search', assistantOptions.web_mode === 'off' ? 'false' : 'true');
-          fd.set('mode', assistantOptions.profile === 'actions' ? 'agent' : 'chat');
-          if (assistantOptions.profile !== 'actions') fd.set('allow_bash', 'false');
-        }
-      }
+      // Save this conversation's settings before the turn reads them.
+      if (!approvalForSend) await assistantControls.prepareTurn(streamSessionId);
 
       const ragChk = el('rag-toggle');
       if (ragChk && !ragChk.checked) {

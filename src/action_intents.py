@@ -75,6 +75,16 @@ _CODE_FILE_TARGET = (
     r"scss|sass|less|sql|rs|go|java|kt|kts|swift|rb|php|sh|bash|zsh|fish|c|h|"
     r"cc|cpp|cxx|hpp|json|jsonl|yaml|yml|toml|xml|graphql|proto)\b"
 )
+# Words after "on"/"from" that are ordinary grammar, never a machine name.
+# Without these, "from where can I download X" or "news on Monday" routed a
+# web question to the shell/file workspace and withheld the web tools.
+_NOT_A_MACHINE_NAME = (
+    r"(?:this|that|these|those|my|our|your|his|her|their|its|it|them|the|a|an|"
+    r"same|current|where|which|what|who|whom|whose|when|why|how|here|there|"
+    r"now|then|today|tomorrow|tonight|yesterday|monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday|weekends?|scratch|top|time|home|"
+    r"average|behalf|purpose)\b"
+)
 _CODE_WORKSPACE_TARGET = (
     r"(?:repo(?:sitory)?|codebase|project|application|app|website|webs+app|"
     r"source(?:s+code)?|file|component|module|feature)"
@@ -164,7 +174,7 @@ _ROUTING_PATTERNS: tuple[tuple[str, str, Pattern[str]], ...] = tuple(
         ("workspace", "file/code inspection request", rf"{_PLEASE}(?:find|inspect|look\s+at|open|read|check)\b.{{0,120}}\b(?:file|folder|directory|repo|repository|code|source|logs?|trace|stack|diff)\b"),
         ("workspace", "server/process debugging request", rf"{_PLEASE}(?:check|debug|fix|restart|start|stop|kill|tail|inspect)\b.{{0,120}}\b(?:server|service|process|port|docker|container|tmux|endpoint|logs?)\b"),
         ("workspace", "local computer task request", r"\b(?:on|from|in|using|with)\s+(?:this|my|the)\s+(?:computer|machine|pc|laptop|device|system)\b|\b(?:local|host)\s+(?:computer|machine|files?|system)\b"),
-        ("workspace", "named computer task request", r"\b(?:on|from)\s+(?!this\b|my\b|the\b|a\b|an\b|that\b|it\b|same\b|current\b)(?:[a-z][a-z0-9_.-]{1,31})\b"),
+        ("workspace", "named computer task request", rf"\b(?:on|from)\s+(?!{_NOT_A_MACHINE_NAME})(?:[a-z][a-z0-9_.-]{{1,31}})\b"),
         ("workspace", "terminal workspace request", rf"\b(?:terminal|shell|workspace|tmux|docker|container|git|branch|commit|diff|pytest|stacktrace|traceback|{_BENCHMARK_COMMAND}|eval(?:uation)?s?)\b"),
 
         # Shell / remote-host intent.
