@@ -126,6 +126,33 @@ def _extract_meta(soup: BeautifulSoup) -> dict:
     return {"description": description, "keywords": keywords}
 
 
+def _structured_article_text(soup: BeautifulSoup) -> str:
+    """Read article text already published in the page's JSON-LD metadata."""
+    articles = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or script.get_text())
+        except (ValueError, TypeError):
+            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            graph = node.get("@graph")
+            candidates = graph if isinstance(graph, list) else [node]
+            for article in candidates:
+                if not isinstance(article, dict):
+                    continue
+                types = article.get("@type", [])
+                types = [types] if isinstance(types, str) else types
+                body = article.get("articleBody")
+                if (isinstance(types, list) and any(t in {"Article", "NewsArticle", "BlogPosting", "ReportageNewsArticle"} for t in types if isinstance(t, str))
+                        and isinstance(body, str) and len(body.strip()) >= 80):
+                    text = BeautifulSoup(body, "html.parser").get_text(" ", strip=True)
+                    articles.append(re.sub(r"\s+", " ", text).strip())
+    return max(articles, key=len, default="")
+
+
 def _extract_og_image(soup: BeautifulSoup) -> str:
     """Extract the best representative image URL from meta tags.
 
@@ -316,9 +343,9 @@ def fetch_webpage_content(url: str, timeout: int = 5, retry_attempt: int = 0,
     """
     effective_cap = min(max_bytes or WEB_FETCH_SOFT_MAX_BYTES, WEB_FETCH_HARD_MAX_BYTES)
     # The cap is part of the cache identity: a truncated soft-cap fetch must
-    # not be served to a later full-budget request for the same URL. v8 adds
-    # ``final_url``; older entries lack it and must not be served.
-    cache_key = generate_cache_key(f"{url}#cap={effective_cap}#extract=semantic-links-v8")
+    # not be served to a later full-budget request for the same URL. v9 adds
+    # structured article extraction and rejects empty HTML shells.
+    cache_key = generate_cache_key(f"{url}#cap={effective_cap}#extract=semantic-links-v9")
     cache_file = CONTENT_CACHE_DIR / f"{cache_key}.cache"
 
     # Check cache
@@ -357,9 +384,15 @@ def fetch_webpage_content(url: str, timeout: int = 5, retry_attempt: int = 0,
         error_logger.warning(f"Refused oversized body for {url}: {e}")
         return _empty_result(url, f"TooLarge: {e}")
     except httpx.HTTPStatusError as e:
+        if e.response.status_code in {502, 503, 504} and retry_attempt == 0:
+            return fetch_webpage_content(url, min(timeout, 3), retry_attempt=1,
+                                         max_bytes=max_bytes, bypass_cache=True)
         error_logger.warning(f"HTTP {e.response.status_code} fetching {url}: {e}")
         return _empty_result(url, f"HTTP {e.response.status_code}: {e}")
     except httpx.RequestError as e:
+        if isinstance(e, httpx.TimeoutException) and retry_attempt == 0:
+            return fetch_webpage_content(url, min(timeout, 3), retry_attempt=1,
+                                         max_bytes=max_bytes, bypass_cache=True)
         error_logger.error(f"NetworkError fetching {url} (attempt {retry_attempt}): {e}")
         return _empty_result(url, f"NetworkError: {e}")
     except RateLimitError as e:
@@ -550,10 +583,18 @@ def fetch_webpage_content(url: str, timeout: int = 5, retry_attempt: int = 0,
             **_size_fields,
         }
 
+    extraction_method = "html"
+    if len(main_content) < THIN_CONTENT_CHARS:
+        structured_text = _structured_article_text(soup)
+        if len(structured_text) > len(main_content):
+            main_content = structured_text
+            extraction_method = "structured_article"
+
     result = {
         "url": url,
         "title": title_text,
         "content": main_content,
+        "extraction_method": extraction_method,
         "linked_content": '\n'.join(_linked_text(area, link_base) for area in linked_areas),
         "page_entries": _page_entries(linked_areas, link_base),
         "lists": _extract_lists(soup),
@@ -564,8 +605,8 @@ def fetch_webpage_content(url: str, timeout: int = 5, retry_attempt: int = 0,
         "og_image": og_image,
         "js_rendered": js_rendered,
         "js_message": js_message,
-        "success": True,
-        "error": "",
+        "success": bool(main_content),
+        "error": "" if main_content else "No readable page text",
         **_size_fields,
     }
     _cache_result(cache_file, cache_key, result, url)

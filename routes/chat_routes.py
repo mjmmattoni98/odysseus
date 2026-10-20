@@ -35,6 +35,7 @@ from src import agent_runs
 from src.assistant_preferences import (
     load_preferences, assistant_turn, merge_sources, SourceRegistry,
 )
+from src.intelligent_search import decide_search_for_turn, previous_search_evidence
 from src.model_context import estimate_tokens
 from src.context_compactor import (
     apply_compaction_state,
@@ -2320,6 +2321,19 @@ def setup_chat_routes(
         turn_reports = []
         turn_sources = SourceRegistry()
 
+        if use_research and assistant_options.search_mode == "off":
+            raise HTTPException(400, "Web is Off. Select Auto or Always to use Deep Research.")
+
+        search_decision = await decide_search_for_turn(
+            assistant_options, sess, message, owner=owner, use_web=use_web,
+            allowed=(allow_tool_preprocessing and not tool_policy.blocks("web_search")
+                     and not use_research and not _explicitly_denies_web_lookup(message)),
+        )
+        if search_decision is not None:
+            turn_reports.append(search_decision.report(assistant_options.search_mode))
+            if search_decision.needs_search is not None:
+                use_web = search_decision.needs_search
+
         # Inline memory command
         memory_response = None
         if not tool_policy.blocks("manage_memory"):
@@ -3015,6 +3029,8 @@ def setup_chat_routes(
             if get_session_mode(session) == 'research_pending':
                 do_research = True
                 logger.info(f"Session {session} in research_pending — auto-triggering research")
+        if do_research and assistant_options.search_mode == "off":
+            raise HTTPException(400, "Web is Off. Select Auto or Always to use Deep Research.")
         att_ids = []
         if tool_approval_continuation:
             # Browser composer state is unrelated to the action that was
@@ -3047,7 +3063,50 @@ def setup_chat_routes(
             chat_handler.validate_and_extract_preset(preset_id)
 
         async def _prepare_stream() -> AsyncGenerator[str, None]:
-            nonlocal _explicit_web_intent, _search_enabled, allow_web_search, auto_escalated, chat_mode, client_runtime_context
+            nonlocal _explicit_web_intent, _search_enabled, allow_web_search, use_web, auto_escalated, chat_mode, client_runtime_context, _allow_browser_for_web_turn
+            intelligent_no_search = False
+            intelligent_search_enabled = False
+            if not do_research and not tool_approval_continuation:
+                if assistant_options.search_mode == "auto":
+                    yield f"data: {json.dumps({'type': 'context_status', 'data': {'label': 'Checking whether web search is needed…'}})}\n\n"
+                search_decision = await decide_search_for_turn(
+                    assistant_options, sess, message, owner=owner, use_web=use_web,
+                    allow_web_search=allow_web_search,
+                    allowed=(allow_tool_preprocessing and not pre_context_tool_policy.blocks("web_search")
+                             and not image_generation_session and not search_context
+                             and not is_internal_tool_request(request)
+                             and not _explicitly_denies_web_lookup(message)),
+                    include_history=not incognito,
+                )
+                if search_decision is not None:
+                    turn_reports.append(search_decision.report(assistant_options.search_mode))
+                    if search_decision.needs_search is not None:
+                        _search_enabled = search_decision.needs_search
+                        use_web = _search_enabled
+                        intelligent_search_enabled = _search_enabled
+                        intelligent_no_search = not _search_enabled
+                        allow_web_search = "true" if _search_enabled else "false"
+                        _explicit_web_intent = _search_enabled
+                        if _search_enabled:
+                            _allow_browser_for_web_turn = True
+                            if chat_mode == "chat":
+                                chat_mode = "agent"
+                                auto_escalated = True
+                        else:
+                            _allow_browser_for_web_turn = bool(_explicit_browser_intent or _local_browser_render_intent)
+                            if assistant_options.search_mode == "auto" and previous_search_evidence(message, sess.history) is not None:
+                                chat_mode = "chat"
+                                auto_escalated = False
+            # The saved Off setting wins over legacy flags, approvals, exact
+            # URL readers and every later intent or schema-selection path.
+            if assistant_options.search_mode == "off":
+                use_web = False
+                _search_enabled = False
+                allow_web_search = "false"
+                intelligent_no_search = True
+                intelligent_search_enabled = False
+                _explicit_web_intent = False
+                _allow_browser_for_web_turn = False
             # Decide once whether this turn runs on the compact (clean v3)
             # runtime. Every input is final here; the native workspace term of
             # the contract policy cannot veto a requested clean route. This one
@@ -3293,6 +3352,10 @@ def setup_chat_routes(
                 active_document=bool(active_doc), workspace=bool(workspace),
                 image_attachment=any(str(a.get('mime') or '').startswith('image/') for a in (ctx.preprocessed.attachment_meta or [])),
             ) if _use_turn_contract else frozenset()
+            if _use_turn_contract and intelligent_search_enabled:
+                _turn_capabilities = _turn_capabilities | {"search_browser"}
+            elif intelligent_no_search and not (_exact_url_fetch_intent or _explicit_browser_intent):
+                _turn_capabilities = _turn_capabilities - {"search_browser"}
             if 'image_editing' in _turn_capabilities and ctx.preprocessed.attachment_meta:
                 image_refs = ['odysseus://attachment/' + str(a['id']) for a in ctx.preprocessed.attachment_meta
                               if a.get('id') and str(a.get('mime') or '').startswith('image/')]
@@ -3373,12 +3436,12 @@ def setup_chat_routes(
             )
             if _explicit_past_chat_search_intent:
                 _explicit_web_intent = False
-            _explicit_web_intent = _explicit_web_intent or bool(
+            _explicit_web_intent = not intelligent_no_search and (_explicit_web_intent or bool(
                 _tool_intent
                 and _tool_intent.category == "web"
                 and not _explicit_personal_store_intent
                 and not _explicit_past_chat_search_intent
-            )
+            ))
             _contextual_web_link_followup = _is_contextual_web_link_followup(
                 getattr(sess, "history", []) or [],
                 message,
@@ -3395,7 +3458,8 @@ def setup_chat_routes(
                 and not _explicitly_denies_web_lookup(message)
             )
             if (
-                (_explicit_web_intent or _contextual_web_link_followup
+                not intelligent_no_search
+                and (_explicit_web_intent or _contextual_web_link_followup
                  or _contextual_web_turn_followup or _clean_v3_web_intent)
                 and web_intent_may_enable_for_turn(
                     None if (_contextual_web_turn_followup or _clean_v3_web_intent)
@@ -3511,6 +3575,9 @@ def setup_chat_routes(
             _global_disabled = get_setting("disabled_tools", [])
             if _global_disabled and isinstance(_global_disabled, list):
                 disabled_tools.update(_global_disabled)
+            if assistant_options.search_mode == "off":
+                disabled_tools.update(WEB_ACCESS_TOOL_NAMES | {"search_hf_models"})
+                disabled_tools.update(_BROWSER_MCP_TOOLS)
 
             # Light auto-escalation: the user is in chat mode and just expressed a
             # notes/calendar/email intent. Grant the relevant managers but withhold
@@ -3581,7 +3648,9 @@ def setup_chat_routes(
                 }.issubset(disabled_tools),
             }
             # Capture permission state before schema selection/reconciliation.
-            # Only deterministic request intent supplies grants, never inventory.
+            # Trusted request intent and the saved Intelligent search opt-in
+            # authorize web reads. d1 selects when to use that permission;
+            # offering a schema alone must never supply an execution grant.
             _request_authority = request_authority_for_http(
                 request, message, owner=_user, session_id=session, workspace=workspace,
                 history=_turn_history, policy=tool_policy,
@@ -3591,6 +3660,7 @@ def setup_chat_routes(
                                      for a in (ctx.preprocessed.attachment_meta or [])),
                 capabilities=({'search_browser'} if (
                     _explicit_browser_intent or _external_discovery_intent
+                    or intelligent_search_enabled
                 ) else ()),
             )
             if exact_tool_approval is not None:

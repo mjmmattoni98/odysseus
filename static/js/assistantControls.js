@@ -1,6 +1,11 @@
 import ui from './ui.js?v=20260916largetoolscroll1';
 
-const defaults = () => ({ thinking: 'auto', instructions: '', context_limits: {} });
+const defaults = () => ({ search_mode: 'auto', thinking: 'auto', instructions: '', context_limits: {} });
+const searchModes = {
+  off: { label: 'Off', description: 'Answer without using the web' },
+  auto: { label: 'Auto', description: 'Search only when needed' },
+  always: { label: 'Always', description: 'Search before every answer' },
+};
 let preferences = defaults();
 let runtime = {};
 let sessionId = null;
@@ -11,6 +16,39 @@ let dirty = true;
 let revision = 0;
 let saves = Promise.resolve();
 const el = id => document.getElementById(id);
+
+export function searchMode() { return preferences.search_mode; }
+
+export function renderSearchMode() {
+  const mode = searchModes[searchMode()];
+  const button = el('web-toggle-btn');
+  const label = el('web-mode-label');
+  if (label) label.textContent = `Web: ${mode.label}`;
+  if (button) {
+    button.title = `Web: ${mode.label} — ${mode.description}`;
+    button.setAttribute('aria-label', `Web: ${mode.label}. ${mode.description}`);
+    button.classList.toggle('active', searchMode() !== 'off');
+  }
+  // Compatibility for Compare's shared pre-search. This checkbox is derived,
+  // never an independent preference and never sent by the main composer.
+  if (el('web-toggle')) el('web-toggle').checked = searchMode() === 'always';
+  el('web-search-menu')?.querySelectorAll('[data-search-mode]').forEach(option => {
+    option.setAttribute('aria-checked', String(option.dataset.searchMode === searchMode()));
+  });
+}
+
+export async function setSearchMode(mode) {
+  if (!Object.hasOwn(searchModes, mode)) throw new Error('Invalid web search mode');
+  const version = generation;
+  await loading;
+  if (version !== generation) throw new Error('Conversation changed. Choose the web mode again.');
+  if (loadError) throw loadError;
+  preferences = { ...preferences, search_mode: mode };
+  dirty = true;
+  revision++;
+  renderSearchMode();
+  if (sessionId) await prepareTurn(sessionId);
+}
 
 // Ollama reloads a model whenever num_ctx changes between calls, and
 // background calls always use the default cap.
@@ -27,6 +65,7 @@ function runtimeText(contextValue) {
 }
 
 function render() {
+  renderSearchMode();
   if (!el('assistant-settings-btn')) return;
   el('assistant-thinking').value = preferences.thinking;
   el('assistant-instructions').value = preferences.instructions;
@@ -37,6 +76,8 @@ function render() {
 }
 
 export function loadSession(id) {
+  el('web-search-menu')?.classList.add('hidden');
+  el('web-toggle-btn')?.setAttribute('aria-expanded', 'false');
   const version = ++generation;
   sessionId = id;
   loadError = null;
@@ -48,7 +89,7 @@ export function loadSession(id) {
     if (!response.ok) throw new Error('Could not load conversation settings');
     const data = await response.json();
     if (version !== generation) return;
-    preferences = data.preferences;
+    preferences = { ...defaults(), ...data.preferences };
     runtime = data.runtime;
     render();
   }).catch(error => {
@@ -82,6 +123,43 @@ export async function prepareTurn(id) {
 }
 
 function init() {
+  const webButton = el('web-toggle-btn');
+  const webMenu = el('web-search-menu');
+  const closeWebMenu = () => {
+    webMenu?.classList.add('hidden');
+    webButton?.setAttribute('aria-expanded', 'false');
+  };
+  const openWebMenu = () => {
+    const rect = webButton.getBoundingClientRect();
+    webMenu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 296))}px`;
+    webMenu.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+    webMenu.classList.remove('hidden');
+    webButton.setAttribute('aria-expanded', 'true');
+    webMenu.querySelector('[aria-checked="true"]')?.focus();
+  };
+  webButton?.addEventListener('click', () => webMenu.classList.contains('hidden') ? openWebMenu() : closeWebMenu());
+  webButton?.addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); openWebMenu(); }
+  });
+  webMenu?.querySelectorAll('[data-search-mode]').forEach((option, index, options) => {
+    option.addEventListener('click', async () => {
+      closeWebMenu();
+      webButton.focus();
+      try { await setSearchMode(option.dataset.searchMode); }
+      catch (error) { ui.showError(error.message); }
+    });
+    option.addEventListener('keydown', event => {
+      if (event.key === 'Escape') { closeWebMenu(); webButton.focus(); }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        options[(index + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length].focus();
+      }
+    });
+  });
+  document.addEventListener('click', event => {
+    if (!webButton?.contains(event.target) && !webMenu?.contains(event.target)) closeWebMenu();
+  });
+  window.addEventListener('resize', closeWebMenu);
   el('assistant-settings-btn')?.addEventListener('click', async () => {
     await loading;
     if (sessionId && !dirty) await loadSession(sessionId);
@@ -118,4 +196,4 @@ function init() {
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
 else init();
 
-export default { loadSession, prepareTurn, contextReloadNote };
+export default { loadSession, prepareTurn, contextReloadNote, searchMode, setSearchMode, renderSearchMode };

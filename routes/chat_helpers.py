@@ -1246,7 +1246,8 @@ async def build_chat_context(
     if incognito or not allow_tool_preprocessing or is_research_spinoff or casual_low_signal:
         use_rag_val = False
 
-    use_web_val = _truthy_request_flag(use_web)
+    search_mode = current_preferences().search_mode
+    use_web_val = _truthy_request_flag(use_web) and search_mode != "off"
     # If pre-fetched search context was provided (compare mode), skip live web
     # search. Personal app requests should be served by their tools; pre-search
     # here caused calendar/email turns with use_web="false" to run irrelevant
@@ -1254,8 +1255,8 @@ async def build_chat_context(
     skip_web = (
         bool(search_context)
         or not allow_tool_preprocessing
-        or casual_low_signal
-        or bool(agent_mode and _PERSONAL_TOOL_CONTEXT_RE.search(context_message or ""))
+        or (search_mode != "always" and casual_low_signal)
+        or bool(search_mode != "always" and agent_mode and _PERSONAL_TOOL_CONTEXT_RE.search(context_message or ""))
     )
 
     # Build context preface
@@ -1307,11 +1308,28 @@ async def build_chat_context(
     # query-rewrite model call are all synchronous; on the event loop they
     # stalled every other request for the whole preface build.
     preface, rag_sources, web_sources, used_memories, used_memory_ids = await asyncio.to_thread(_build_preface)
+    if search_mode == "auto" and not use_web_val and not incognito:
+        from src.intelligent_search import previous_search_evidence
+        from src.assistant_preferences import record_search_report
+        previous = previous_search_evidence(context_message, sess.history)
+        if previous is not None:
+            preface.append({"role": "system", "content": (
+                "The user is asking about the previous answer's search record. "
+                f"That answer performed a web search: {previous['searched']}. "
+                f"It reused earlier search results: {previous['reused']}. "
+                f"Saved sources: {previous['results']}; sources with retrieved page text: {previous['pages_read']}. "
+                "Answer using this record. Do not claim articles were read when only snippets were available. "
+                "No new search was performed for this question."
+            )})
+            web_sources = previous["sources"]
+            if web_sources:
+                preface.append(untrusted_context_message("sources used for the previous answer", json.dumps(web_sources)))
+                record_search_report({"state": "reused", "results": len(web_sources), "pages_read": previous["pages_read"]})
     if callable(record_memory_uses):
         record_memory_uses(used_memory_ids)
 
     # Inject pre-fetched search context (compare mode)
-    if search_context and allow_tool_preprocessing and not casual_low_signal:
+    if search_context and allow_tool_preprocessing and search_mode != "off" and not casual_low_signal:
         preface.append(untrusted_context_message("prefetched search context", search_context))
 
     # YouTube transcripts

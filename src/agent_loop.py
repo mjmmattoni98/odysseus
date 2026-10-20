@@ -21486,6 +21486,11 @@ async def stream_agent_loop(
                 "I can’t perform this request with the currently permitted tools "
                 f"(unavailable: {unavailable}). I haven’t substituted another tool."
             )
+            from src.assistant_preferences import current_preferences
+            from src.tool_policy import WEB_ACCESS_TOOL_NAMES
+            if (current_preferences().search_mode == "off"
+                    and turn_contract.unavailable <= WEB_ACCESS_TOOL_NAMES | {"capability:search_browser", "search_hf_models"}):
+                clarification = "Web is Off for this conversation. Select Auto or Always in the Web menu to look this up."
             yield 'data: ' + json.dumps({"delta": clarification}) + '\n\n'
             yield 'data: [DONE]\n\n'
             return

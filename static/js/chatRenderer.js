@@ -1610,7 +1610,7 @@ export function buildSourcesBox(sources, type, expanded) {
   }
   var arrow = expanded ? 'down' : 'right';
   var expandedClass = expanded ? ' expanded' : '';
-  return '<div class="sources-section">'
+  return '<div class="sources-section" data-source-type="' + (type === 'research' ? 'research' : 'web') + '">'
     + '<div class="sources-header" data-sources-id="' + id + '" onclick="window.toggleSources(\'' + id + '\')">'
     + '<div class="sources-header-left">' + SEARCH_ICON + '<span>' + count + ' ' + label + '</span></div>'
     + '<span class="sources-toggle" id="' + id + '-toggle" data-arrow="' + arrow + '"></span>'
@@ -1620,21 +1620,61 @@ export function buildSourcesBox(sources, type, expanded) {
     + '</div></div>';
 }
 
-export function updateSearchStatus(holder, reports) {
-  if (!holder || !reports?.length) return;
+export function updateSearchStatus(holder, reports, sources) {
+  if (!holder) return;
+  if (Array.isArray(reports)) holder._searchReports = reports;
+  if (Array.isArray(sources)) holder._webSources = sources;
+  reports = holder._searchReports || [];
+  sources = holder._webSources || [];
+  if (!reports.length && !sources.length) return;
   let status = holder.querySelector(':scope > .search-status');
   if (!status) {
     status = document.createElement('div');
-    status.className = 'search-status sources-section';
+    status.className = 'search-status';
     status.setAttribute('role', 'status');
-    holder.appendChild(status);
+    holder.insertBefore(status, holder.querySelector(':scope > .msg-footer'));
   }
+  status.dataset.state = reports.some(report => report.state === 'failed' || (report.state === 'ok' && !report.pages_read)) ? 'limited' : 'ok';
   status.replaceChildren(...reports.map(report => {
     const row = document.createElement('div');
-    row.className = 'sources-header';
+    row.className = 'search-status-row';
     row.textContent = searchStatusText(report);
     return row;
   }));
+  const list = document.createElement('ol');
+  list.className = 'web-source-list';
+  const seen = new Set();
+  for (const source of sources) {
+    let url;
+    try { url = new URL(source.url); } catch { continue; }
+    if (!['https:', 'http:'].includes(url.protocol) || seen.has(url.href)) continue;
+    seen.add(url.href);
+    const item = document.createElement('li');
+    const link = document.createElement('a');
+    link.href = url.href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.className = 'web-source-link';
+    const title = document.createElement('span');
+    title.className = 'web-source-title';
+    title.textContent = source.title || url.hostname;
+    const detail = document.createElement('span');
+    detail.className = 'web-source-detail';
+    detail.textContent = url.hostname.replace(/^www\./, '') + ' · ' + (sourceStatusLabel(source) || 'Search result');
+    link.append(title, detail);
+    item.value = Number.isInteger(source.citation) ? source.citation : seen.size;
+    item.appendChild(link);
+    list.appendChild(item);
+  }
+  if (list.childElementCount) {
+    const label = document.createElement('div');
+    label.className = 'web-source-heading';
+    label.textContent = `Sources (${list.childElementCount})`;
+    status.append(label, list);
+    // Evidence belongs outside the replaceable answer body. Old collapsed
+    // boxes are removed after live reconciliation and history rendering.
+    holder.querySelectorAll('.body .sources-section[data-source-type="web"]').forEach(node => node.remove());
+  }
 }
 
 /**
@@ -3503,6 +3543,7 @@ export function addMessage(role, content, modelName, metadata) {
         if (metadata?.memories_used?.length) firstWrap._memoriesUsed = metadata.memories_used;
         firstWrap.appendChild(createMsgFooter(firstWrap));
         if (metadata) displayMetrics(firstWrap, metadata);
+        updateSearchStatus(firstWrap, metadata.search_reports, metadata.web_sources);
       }
 
       if (window.hljs) {
@@ -3873,7 +3914,7 @@ export function addMessage(role, content, modelName, metadata) {
       wrap.appendChild(createUserMsgFooter(wrap));
     }
 
-    if (role === 'assistant' && metadata?.search_reports?.length) updateSearchStatus(wrap, metadata.search_reports);
+    if (role === 'assistant') updateSearchStatus(wrap, metadata?.search_reports, metadata?.web_sources);
     box.appendChild(wrap);
 
     // TTS is now part of the msg-actions system

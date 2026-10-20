@@ -2,6 +2,23 @@ from unittest.mock import MagicMock
 from types import SimpleNamespace
 from src.chat_processor import ChatProcessor
 
+def test_web_off_blocks_prefetch_and_automatic_url_reads(monkeypatch):
+    from src.assistant_preferences import AssistantPreferences, assistant_turn
+
+    search = MagicMock(side_effect=AssertionError("Web Off must not search"))
+    fetch = MagicMock(side_effect=AssertionError("Web Off must not read URLs"))
+    monkeypatch.setattr("src.chat_processor.comprehensive_web_search", search)
+    monkeypatch.setattr("src.chat_processor.fetch_webpage_content", fetch)
+    processor = ChatProcessor(memory_manager=MagicMock(), personal_docs_manager=MagicMock())
+    session = SimpleNamespace(endpoint_url="http://local", model="test", headers={})
+    with assistant_turn(AssistantPreferences(search_mode="off")):
+        processor.build_context_preface(
+            message="Summarize https://example.com", session=session, use_web=True,
+            use_rag=False, use_memory=False, use_skills=False,
+        )
+    search.assert_not_called()
+    fetch.assert_not_called()
+
 def test_build_context_preface_web_search_success(monkeypatch):
     """Test that LLM correctly extracts and uses a web search query."""
     mock_llm_call = MagicMock(return_value="extracted query")

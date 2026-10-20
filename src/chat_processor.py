@@ -460,7 +460,9 @@ class ChatProcessor:
 
         # Add web search if enabled
         web_sources = []
-        if use_web:
+        from src.assistant_preferences import current_preferences
+        web_off = current_preferences().search_mode == "off"
+        if use_web and not web_off:
             _report_progress(progress, "web_search")
             try:
                 from src.llm_core import llm_call
@@ -536,7 +538,7 @@ class ChatProcessor:
         # hundreds of KB of duplicate page HTML and confuses the model) or for
         # link-heavy pastes (>3 URLs typically means it's a boilerplate-laden
         # blog post, not a "summarize this URL" request).
-        urls = extract_urls(message)
+        urls = extract_urls(message) if not web_off else []
         non_yt_urls = [u for u in urls if not is_youtube_url(u)]
         skip_url_fetch = len(message) > 2000 or len(non_yt_urls) > 3
         if not skip_url_fetch:

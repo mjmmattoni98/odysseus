@@ -9,6 +9,7 @@ const renderer = await readFile(new URL('../static/js/chatRenderer.js', import.m
 const chat = await readFile(new URL('../static/js/chat.js', import.meta.url), 'utf8');
 const addMessage = renderer.slice(renderer.indexOf('export function addMessage('), renderer.indexOf('\nconst chatRenderer =')).replace('export ', '');
 const resume = chat.slice(chat.indexOf('export async function resumeStream('), chat.indexOf('\n  /**\n   * Check for background streams')).replace('export ', '');
+const evidence = renderer.slice(renderer.indexOf('export function updateSearchStatus('), renderer.indexOf('\n/**\n * Build the RAG')).replace('export ', '');
 let browser;
 before(async () => { browser = await chromium.launch({ headless: true }); });
 after(async () => { await browser?.close(); });
@@ -24,12 +25,13 @@ async function setup() {
     return route.fulfill({ contentType: 'text/javascript', body: source });
   });
   await page.goto('http://render.test/');
-  await page.evaluate(async ({ addMessage, resume }) => {
+  await page.evaluate(async ({ addMessage, resume, evidence }) => {
     const noop = () => {};
     const esc = value => { const node = document.createElement('div'); node.textContent = String(value ?? ''); return node.innerHTML; };
     Object.assign(window, {
       uiModule: { esc, scrollHistory: noop, showToast: value => window.toasts.push(value), showError: error => { throw Error(error); }, el: id => document.getElementById(id), captureHistoryScroll: () => ({ y: scrollY }), restoreHistoryScroll: s => scrollTo(0, s.y) },
       hideWelcomeScreen: noop, resolveDocumentPlaceholderLinks: x => x,
+      stripToolBlocks: x => x, _renderAssistantBody: x => window.markdownModule.mdToHtml(x),
       replyModelPair: () => ({ actualModel: 'test', requestedModel: 'test' }),
       modelRouteLabel: () => 'test', sameModelName: () => true, applyModelColor: noop,
       roleTimestamp: () => document.createElement('span'),
@@ -58,9 +60,11 @@ async function setup() {
     window.applyModelRouteEventState = (await import('/static/js/chatModelProvenance.js')).applyModelRouteEventState;
     window.createTerminalStreamError = (await import('/static/js/chatStreamErrors.js')).createTerminalStreamError;
     window.generatedImageResult = (await import('/static/js/generatedImageResult.js')).generatedImageResult;
+    Object.assign(window, await import('/static/js/searchEvidence.js'));
+    window.updateSearchStatus = (0, eval)('(' + evidence + ')');
     window.addMessage = (0, eval)('(' + addMessage + ')');
     window.resumeStream = (0, eval)('(' + resume + ')');
-    window.chatRenderer = { addMessage: window.addMessage, recordSessionMetricsCost: noop, buildSourcesBox, buildFindingsBox, buildRagSourcesBox };
+    window.chatRenderer = { addMessage: window.addMessage, recordSessionMetricsCost: noop, buildSourcesBox, buildFindingsBox, buildRagSourcesBox, updateSearchStatus };
     let controller;
     const stream = new ReadableStream({ start(value) { controller = value; } });
     window.send = event => controller.enqueue(new TextEncoder().encode('data: ' + (typeof event === 'string' ? event : JSON.stringify(event)) + '\n\n'));
@@ -68,7 +72,7 @@ async function setup() {
     window.fetch = async url => String(url).includes('/api/chat/resume/')
       ? new Response(stream, { headers: { 'X-Odysseus-Run-Id': 'run-1' } })
       : new Response(JSON.stringify({ history: window.savedHistory }));
-  }, { addMessage, resume });
+  }, { addMessage, resume, evidence });
   return page;
 }
 
@@ -105,10 +109,68 @@ test('legacy history keeps round prose without explicit replacement scope', asyn
   } finally { await page.close(); }
 });
 
+test('saved search sources are visible beneath the answer and survive body replacement', async () => {
+  const page = await setup();
+  try {
+    for (const rounds of [false, true]) {
+      const result = await page.evaluate(rounds => {
+        document.querySelector('#chat-history').replaceChildren();
+        const sources = [
+          { url: 'https://example.com/article?a=1&b=2', title: 'News <img src=x onerror=alert(1)>', citation: 4, read_status: 'read' },
+          { url: 'https://blocked.example/news', title: 'Blocked news', citation: 5, read_status: 'failed', snippet_available: true },
+          { url: 'javascript:alert(1)', title: 'Unsafe source' },
+        ];
+        const metadata = { _fromHistory: true, web_sources: sources, search_reports: [{ state: 'ok', results: 2, pages_read: 1 }] };
+        if (rounds) Object.assign(metadata, { round_texts: ['Draft', 'Answer'], tool_events: [{ round: 1, tool: 'web_search', exit_code: 0 }] });
+        addMessage('assistant', 'Answer', 'test', metadata);
+        const root = document.querySelector('#chat-history');
+        const holder = root.querySelector('.web-source-list').closest('.msg-ai');
+        holder.querySelector('.body').textContent = 'Final replacement';
+        updateSearchStatus(holder, [{ state: 'ok', results: 2, pages_read: 1 }]);
+        return { links: [...holder.querySelectorAll('.web-source-link')].map(x => ({ href: x.href, target: x.target, rel: x.rel })),
+          outside: !holder.querySelector('.body .web-source-list'), count: holder.querySelectorAll('.web-source-list').length,
+          text: holder.innerText, injected: !!holder.querySelector('.search-status img'),
+          citations: [...holder.querySelectorAll('.web-source-list li')].map(x => x.value) };
+      }, rounds);
+      assert.equal(result.links.length, 2);
+      assert.equal(result.links[0].href, 'https://example.com/article?a=1&b=2');
+      assert.ok(result.links.every(x => x.target === '_blank' && x.rel.includes('noopener')));
+      assert.equal(result.outside, true);
+      assert.equal(result.count, 1);
+      assert.equal(result.injected, false);
+      assert.deepEqual(result.citations, [4, 5]);
+      assert.match(result.text, /Final replacement[\s\S]*Sources \(2\)/);
+      assert.match(result.text, /snippet/i);
+    }
+  } finally { await page.close(); }
+});
+
 async function startReplay(page) {
   await page.evaluate(() => { window.running = resumeStream('s'); });
   await page.waitForSelector('.msg-ai');
 }
+
+test('resumed live sources survive metrics and final answer replacement without saved metadata', async () => {
+  const page = await setup();
+  try {
+    await startReplay(page);
+    const result = await page.evaluate(async () => {
+      send({ type: 'search_status', data: { state: 'ok', results: 1, pages_read: 1 } });
+      send({ type: 'web_sources', data: [{ url: 'https://example.com/live', title: 'Live evidence', read_status: 'read' }] });
+      send({ delta: 'Draft' });
+      send({ type: 'final_response', content: 'Final answer', render_owner: 'structured', replacement_scope: 'turn' });
+      send({ type: 'metrics', data: { output_tokens: 12 } });
+      send('[DONE]');
+      await running;
+      const root = document.querySelector('#chat-history');
+      return { text: root.innerText, links: [...root.querySelectorAll('.web-source-link')].map(x => x.href), count: root.querySelectorAll('.web-source-list').length };
+    });
+    assert.deepEqual(result.links, ['https://example.com/live']);
+    assert.equal(result.count, 1);
+    assert.match(result.text, /Final answer[\s\S]*Live evidence/);
+    assert.doesNotMatch(result.text, /Draft/);
+  } finally { await page.close(); }
+});
 
 test('resume tool-only final is visible, scoped, and keeps the open timeline at completion', async () => {
   const page = await setup();

@@ -52,3 +52,21 @@ async def test_preprocess_can_skip_external_context_and_attachment_work(monkeypa
     assert text_ctx == enhanced
     assert youtube == []
     assert attachment_meta == []
+
+
+@pytest.mark.asyncio
+async def test_web_off_skips_youtube_fetches_even_with_tool_preprocessing_enabled(monkeypatch):
+    from src.assistant_preferences import AssistantPreferences, assistant_turn
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail("Web Off must not fetch YouTube content")
+
+    monkeypatch.setattr("src.chat_handler.extract_transcript_async", unexpected)
+    monkeypatch.setattr("src.chat_handler.fetch_youtube_comments", unexpected)
+    handler = ChatHandler(None, None, None, None, None, _UploadHandler())
+    session = SimpleNamespace(model="text-only", endpoint_url="", owner="user", id="session")
+    message = "Summarize https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    with assistant_turn(AssistantPreferences(search_mode="off")):
+        enhanced, _, _, youtube, _ = await handler.preprocess_message(message, [], session)
+    assert enhanced == message
+    assert youtube == []

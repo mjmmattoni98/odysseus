@@ -2758,6 +2758,16 @@ body.bg-pattern-ascii-fireflies {
       opacity: 0.8;
       background: color-mix(in srgb, var(--accent) 8%, transparent);
     }
+    #web-toggle-btn.web-mode-btn { gap:6px; opacity:1; white-space:nowrap; font:inherit; font-size:12px; padding:6px 9px; flex-shrink:0; }
+    .web-search-menu { position:fixed; z-index:10000; width:280px; max-width:calc(100vw - 16px); padding:8px; border:1px solid var(--border); border-radius:12px; background:var(--bg); color:var(--fg); box-shadow:0 8px 30px #0004; }
+    .web-search-menu.hidden { display:none; }
+    .web-search-menu-label { padding:4px 9px 8px; font-size:12px; opacity:.7; }
+    .web-search-menu button { display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; height:auto; min-height:56px; padding:10px; text-align:left; color:inherit; background:none; border:0; border-radius:7px; cursor:pointer; font:inherit; line-height:1.35; }
+    .web-search-menu button:hover, .web-search-menu button[aria-checked="true"] { background:color-mix(in srgb, var(--fg) 9%, transparent); }
+    .web-search-menu strong { display:block; font-size:13px; font-weight:500; }
+    .web-search-menu small { display:block; margin-top:3px; font-size:12px; opacity:.7; }
+    .web-search-menu .web-mode-check { visibility:hidden; }
+    .web-search-menu [aria-checked="true"] .web-mode-check { visibility:visible; }
 	    .input-icon-btn.active,
 	    .input-icon-btn.expanded {
 	      opacity: 1;
@@ -6053,12 +6063,21 @@ body.bg-pattern-ascii-fireflies {
     }
     .search-status {
       font-size: 0.85em;
-      color: var(--red);
-      margin-top: 4px;
-      padding: 4px;
-      border-left: 2px solid var(--red);
-      background: color-mix(in srgb, var(--red) 5%, transparent);
+      color: var(--fg);
+      margin-top: 14px;
+      padding: 12px 0 0;
+      border-top: 1px solid var(--border);
     }
+    .search-status-row { opacity:.7; margin-bottom:4px; line-height:1.5; }
+    .search-status[data-state="limited"] .search-status-row { color:var(--red); opacity:1; }
+    .web-source-heading { margin:12px 0 6px; font-weight:600; }
+    .web-source-list { margin:0; padding-left:25px; }
+    .web-source-list li { padding:3px 0 6px 3px; }
+    .web-source-link { display:block; color:inherit; text-decoration:none; overflow-wrap:anywhere; padding:3px 0; }
+    .web-source-link:hover .web-source-title { text-decoration:underline; }
+    .web-source-link:focus-visible { outline:2px solid var(--fg); outline-offset:3px; border-radius:3px; }
+    .web-source-title { display:block; line-height:1.5; }
+    .web-source-detail { display:block; opacity:.65; font-size:.9em; line-height:1.5; }
     /* Loading indicator for messages */
     .loading-indicator {
       display: flex;

@@ -1196,6 +1196,11 @@ def _chat_endpoint(
     async def fake_build_context(*args, **kwargs):
         return context
 
+    async def no_search_decision(*args, **kwargs):
+        return None
+
+    # These tests exercise model selection without an external d1 request.
+    monkeypatch.setattr(chat_routes, "decide_search_for_turn", no_search_decision)
     monkeypatch.setattr(chat_routes, "_verify_session_owner", lambda *args, **kwargs: None)
     monkeypatch.setattr(chat_routes, "effective_user", lambda request: owner)
     monkeypatch.setattr(chat_routes, "_clear_orphaned_session_endpoint", lambda *args, **kwargs: False)

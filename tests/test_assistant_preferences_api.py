@@ -33,12 +33,12 @@ def client(monkeypatch):
     engine.dispose()
 
 
-DEFAULTS = {"thinking": "auto", "instructions": "", "context_limits": {}}
+DEFAULTS = {"search_mode": "off", "thinking": "auto", "instructions": "", "context_limits": {}}
 
 
 def test_existing_conversation_uses_defaults_and_preferences_round_trip(client):
     assert client.get("/api/session/alice/assistant").json()["preferences"] == DEFAULTS
-    options = {"thinking": "high", "instructions": "Compare costs", "context_limits": {"local-model": 16384}}
+    options = {"search_mode": "auto", "thinking": "high", "instructions": "Compare costs", "context_limits": {"local-model": 16384}}
     saved = client.put("/api/session/alice/assistant", json=options)
     assert saved.status_code == 200
     assert client.get("/api/session/alice/assistant").json()["preferences"] == options

@@ -90,3 +90,44 @@ def test_readable_top_pages_do_not_trigger_extra_fetches(search, monkeypatch):
     monkeypatch.setattr(search, "fetch_webpage_content", fetch)
     search.comprehensive_web_search("test", max_pages=3, return_sources=True)
     assert len(fetched) == 3
+
+
+def test_search_expands_a_short_result_set_when_every_page_is_unreadable(search, monkeypatch):
+    """The news failure: two blocked results leave no lower-ranked backfill."""
+    calls = []
+    def provider(name, query, count, time_filter):
+        calls.append(count)
+        names = ["blocked1", "blocked2"] if len(calls) == 1 else ["blocked1", "blocked2", "readable"]
+        return [{"url": f"https://example.com/{name}", "title": name, "snippet": "news"} for name in names]
+    monkeypatch.setattr(search, "_call_provider", provider)
+    monkeypatch.setattr(search, "fetch_webpage_content", lambda url, *args, **kwargs: {
+        "url": url, "title": "News", "success": url.endswith("readable"),
+        "content": "Article text" if url.endswith("readable") else "", "error": "HTTP 403",
+    })
+    report = {}
+    _, sources = search.comprehensive_web_search("latest tech news", return_sources=True, status=report)
+    assert report["pages_read"] == 1
+    assert any(source["read_status"] == "read" for source in sources)
+    assert len(calls) <= 3
+
+
+def test_unreadable_pages_remain_snippets_and_recovery_preserves_site_scope(search, monkeypatch):
+    calls = []
+    def provider(*args):
+        calls.append(args)
+        return [{"url": "https://example.com/blocked", "title": "Blocked", "snippet": "news"},
+                {"url": "https://other.example/irrelevant", "title": "Wrong site", "snippet": "news"}]
+    fetched = []
+    def fetch(url, *args, **kwargs):
+        fetched.append(url)
+        return {"url": url, "success": False, "content": "", "error": "HTTP 403 secret upstream details"}
+    monkeypatch.setattr(search, "_call_provider", provider)
+    monkeypatch.setattr(search, "fetch_webpage_content", fetch)
+    report = {}
+    output, sources = search.comprehensive_web_search("site:example.com news", return_sources=True, status=report)
+    assert report["pages_read"] == 0
+    assert all("other.example" not in url for url in fetched)
+    assert all(source["read_status"] != "read" for source in sources)
+    assert "Only search snippets" in output
+    assert "secret upstream" not in str(sources)
+    assert len(calls) <= 3

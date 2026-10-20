@@ -48,6 +48,9 @@ export function handleUIControl(uiData) {
 
   try {
     if (uiEvent === 'toggle' || uiData.ui_event === 'toggle') {
+      // Web mode is controlled by the user and saved with the conversation.
+      // A model-produced UI event must not override an Off selection.
+      if (uiData.toggle_name === 'web') return;
       var toggleMap = {
         web: 'web-toggle', bash: 'bash-toggle', rag: 'rag-toggle',
         research: 'research-toggle', incognito: 'incognito-toggle',

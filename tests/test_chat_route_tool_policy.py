@@ -742,9 +742,9 @@ def test_frontend_generic_web_prose_does_not_grant_shell_authority():
     assert "_explicitWorkspaceTarget" in workspace_line
 
 
-def test_frontend_sends_explicit_allow_web_search_false_in_agent_mode():
-    """chat.js must send allow_web_search=false when web toggle is off in agent mode."""
+def test_frontend_uses_saved_conversation_mode_for_web_search():
+    """The main composer saves its mode before sending, without a second flag."""
     source = _CHAT_JS.read_text(encoding="utf-8")
-    assert "fd.append('allow_web_search', el('web-toggle').checked ? 'true' : 'false')" in source, (
-        "Frontend must send explicit allow_web_search=false in agent mode when toggle is off"
-    )
+    assert "await assistantControls.prepareTurn(" in source
+    assert "fd.append('allow_web_search'" not in source
+    assert "fd.append('use_web'" not in source

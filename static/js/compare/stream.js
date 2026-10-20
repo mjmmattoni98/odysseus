@@ -470,6 +470,18 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
     const fd = new FormData();
     fd.append('message', message);
     fd.append('session', sessionId);
+    if (!opts.toolApproval) {
+      const searchMode = ['agent', 'research', 'search'].includes(state._compareMode) ? 'always' : 'off';
+      const preferencesUrl = `${state.API_BASE}/api/session/${encodeURIComponent(sessionId)}/assistant`;
+      const currentSettings = await fetch(preferencesUrl);
+      if (!currentSettings.ok) throw new Error('Could not load conversation settings for this comparison');
+      const { preferences } = await currentSettings.json();
+      const settingsResponse = await fetch(preferencesUrl, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...preferences, search_mode: searchMode }),
+      });
+      if (!settingsResponse.ok) throw new Error('Could not configure web search for this comparison');
+    }
     if (opts.toolApproval) {
       fd.append('tool_approval_id', opts.toolApproval.approval_id || '');
       fd.append('tool_approval_decision', opts.toolApproval.decision || '');

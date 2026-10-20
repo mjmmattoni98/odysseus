@@ -1,6 +1,7 @@
 // compare/selector.js — model selection modal
 import state from './state.js';
 import Storage from '../storage.js';
+import assistantControls from '../assistantControls.js';
 import { fetchModels, _persistSelections, getExcludedModels } from './models.js';
 import { showScoreboard } from './scoreboard.js?v=20260909voteconfirmalign1';
 import { EYE_OPEN, EYE_CLOSED, ICON_DICE, ICON_PARALLEL, ICON_SEQUENTIAL, SAVE_ICON, WAVE_FRAMES, CHAT_ICON } from './icons.js?v=20260908compareprompts1';
@@ -35,7 +36,7 @@ function _syncToolbarIndicator(active) {
 
 /** Disable tool toggles (web, bash, RAG, research) for clean comparison. */
 function disableToolToggles() {
-  const ids = ['web-toggle', 'bash-toggle', 'rag-toggle', 'research-toggle'];
+  const ids = ['bash-toggle', 'rag-toggle', 'research-toggle'];
   state._savedToggles = {};
   ids.forEach(id => {
     const chk = document.getElementById(id);
@@ -48,6 +49,7 @@ function disableToolToggles() {
 
 /** Restore tool toggles to pre-compare state. */
 function restoreToolToggles() {
+  assistantControls.renderSearchMode();
   if (!state._savedToggles) return;
   Object.entries(state._savedToggles).forEach(([id, wasChecked]) => {
     const chk = document.getElementById(id);

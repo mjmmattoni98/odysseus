@@ -57,6 +57,33 @@ Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration
 - **Notes, Tasks + Calendar** — reminders, todos, scheduled agent tasks, and CalDAV sync.
 - **Extras** — gallery/image editor, themes, uploads, web search, presets, sessions, and 2FA.
 
+### Intelligent search
+
+Use the **Web** menu in the composer. Its single saved conversation setting is
+**Off** (no web access), **Auto** (search only when needed), or **Always** (search
+before every answer). Changes save immediately, and new chats default to Auto.
+Off also blocks automatic URL reads and cannot be overridden by a message.
+
+Search answers show clickable sources below the reply, with labels for retrieved
+page text versus search snippets. Transient page failures retry once; when every
+initial page is unreadable, the search tries more results and one configured
+alternative provider. Questions about the preceding search reuse its saved
+evidence in Auto mode instead of running an unrelated lookup.
+
+Auto uses Ollama's `d1:3b` with the message and recent conversation context;
+the chat model still writes the answer. Install it with `ollama pull d1:3b`.
+If d1 is unavailable, times out, or returns an uncertain decision,
+Auto falls back to request-based routing and shows that status. It
+uses the conversation's local Ollama endpoint, another enabled Ollama endpoint
+visible to the conversation owner, or `OLLAMA_BASE_URL`. Operators can override
+that server with `ODYSSEUS_SEARCH_DECISION_URL`.
+
+Verify the real decision model without performing web searches:
+
+```bash
+./venv/bin/python scripts/verify_intelligent_search.py --url http://localhost:11434
+```
+
 ## Demo
 
 A full hover-to-play tour lives on the [Odysseus landing page](https://odysseus-dev.github.io/odysseus/). Its source lives under [`website/`](website/).

@@ -674,7 +674,7 @@ async def test_build_chat_context_keeps_cookie_user_owner_scope(monkeypatch):
     }
 
 
-async def _build_context_web_probe(monkeypatch, *, message, use_web, agent_mode):
+async def _build_context_web_probe(monkeypatch, *, message, use_web, agent_mode, history=(), incognito=True):
     captured = {"use_web": None}
 
     async def fake_preprocess(chat_handler, message, att_ids, sess, **kwargs):
@@ -722,13 +722,13 @@ async def _build_context_web_probe(monkeypatch, *, message, use_web, agent_mode)
         endpoint_url="http://model.local/v1/chat/completions",
         model="test-model",
         headers={},
-        history=[],
+        history=list(history),
         messages=[],
     )
     sess.get_context_messages = lambda: list(sess.messages)
     request = SimpleNamespace(state=SimpleNamespace(api_token=False, current_user="alice"))
 
-    await build_chat_context(
+    ctx = await build_chat_context(
         sess=sess,
         request=request,
         chat_handler=SimpleNamespace(),
@@ -736,10 +736,32 @@ async def _build_context_web_probe(monkeypatch, *, message, use_web, agent_mode)
         message=message,
         session_id="session-1",
         use_web=use_web,
-        incognito=True,
+        incognito=incognito,
+        persist_user_message=False,
         agent_mode=agent_mode,
     )
+    captured["context"] = ctx
     return captured
+
+
+@pytest.mark.asyncio
+async def test_search_confirmation_uses_saved_record_and_preserves_clickable_sources(monkeypatch):
+    from core.models import ChatMessage
+    from src.assistant_preferences import AssistantPreferences, assistant_turn, search_reports
+
+    sources = [{"url": "https://news.example/article", "title": "News", "read_status": "failed"}]
+    history = [ChatMessage("assistant", "News summary", metadata={"web_sources": sources,
+               "search_reports": [{"state": "ok", "results": 1, "pages_read": 0}]})]
+    with assistant_turn(AssistantPreferences(search_mode="auto")):
+        captured = await _build_context_web_probe(monkeypatch, message="Did you search the web?",
+                    use_web=False, agent_mode=False, history=history, incognito=False)
+        reports = search_reports()
+    ctx = captured["context"]
+    assert captured["use_web"] is False
+    assert ctx.web_sources == sources
+    assert any("performed a web search: True" in part["content"] for part in ctx.preface)
+    assert any("sources with retrieved page text: 0" in part["content"] for part in ctx.preface)
+    assert reports[-1]["state"] == "reused"
 
 
 @pytest.mark.asyncio

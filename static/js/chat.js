@@ -2579,14 +2579,6 @@ import { setActionLabel } from './a11yLabel.js';
 	        fd.append('approved_plan', _pendingApprovedPlan.slice(0, 8192));
 	        _pendingApprovedPlan = '';
 	      }
-	      if (el('web-toggle').checked) {
-	        if (!isAgentMode) {
-	          fd.append('use_web', 'true');
-        }
-      }
-      if (isAgentMode) {
-        fd.append('allow_web_search', el('web-toggle').checked ? 'true' : 'false');
-      }
 	      if (!approvalForSend && el('research-toggle').checked) {
 	        fd.append('use_research', 'true');
 	        // Research always runs in chat mode — override agent if set
@@ -2596,7 +2588,12 @@ import { setActionLabel } from './a11yLabel.js';
       fd.append('allow_bash', el('bash-toggle').checked ? 'true' : 'false');
       if (workspaceAgentIntent) fd.set('allow_bash', 'true');
       // Save this conversation's settings before the turn reads them.
-      if (!approvalForSend) await assistantControls.prepareTurn(streamSessionId);
+      if (!approvalForSend) {
+        const preferences = await assistantControls.prepareTurn(streamSessionId);
+        if (preferences.search_mode === 'off' && el('research-toggle').checked) {
+          throw new Error('Web is Off. Select Auto or Always to use Deep Research.');
+        }
+      }
 
       const ragChk = el('rag-toggle');
       if (ragChk && !ragChk.checked) {
@@ -2932,7 +2929,13 @@ import { setActionLabel } from './a11yLabel.js';
           body, html: _terminalAnswerHtml(text, body), raw: text, messageId, render_owner: renderOwner, replacement_scope: replacementScope,
         });
         if (result.changed && window.hljs) body.querySelectorAll('pre code').forEach(block => window.hljs.highlightElement(block));
-        if (result.accepted) _turnRendering.settle();
+        if (result.accepted) {
+          _turnRendering.settle();
+          if (_searchReports.length || (_sourcesType === 'web' && _sourcesData?.length)) {
+            if (roundHolder !== holder) holder.querySelector(':scope > .search-status')?.remove();
+            chatRenderer.updateSearchStatus(roundHolder, _searchReports, _sourcesType === 'web' ? _sourcesData : []);
+          }
+        }
         return result.accepted;
       }
       async function _replaceLiveTurnWithSavedAssistantMessage(_attempt = 0) {
@@ -2959,6 +2962,10 @@ import { setActionLabel } from './a11yLabel.js';
             return _replaceLiveTurnWithSavedAssistantMessage(_attempt + 1);
           }
           if (!saved || !String(saved.content || '').trim()) return false;
+          if (saved.metadata?.web_sources?.length) {
+            _sourcesData = saved.metadata.web_sources;
+            _sourcesType = 'web';
+          }
           const scrollSnapshot = uiModule.captureHistoryScroll?.();
           const rendered = _renderTerminalAnswer(saved.content, _savedAssistantMessageId, saved.metadata?.render_owner, saved.metadata?.replacement_scope);
           uiModule.restoreHistoryScroll?.(scrollSnapshot);
@@ -4383,7 +4390,7 @@ import { setActionLabel } from './a11yLabel.js';
                 scheduleFirstTokenWaitMessages();
               } else if (json.type === 'search_status') {
                 _searchReports.push(json.data);
-                if (!_isBg) chatRenderer.updateSearchStatus(holder, _searchReports);
+                if (!_isBg) chatRenderer.updateSearchStatus(roundHolder || holder, _searchReports);
               } else if (json.type === 'web_sources') {
                 if (_isBg) {
                   if (json.data && json.data.length > 0) {
@@ -4398,6 +4405,7 @@ import { setActionLabel } from './a11yLabel.js';
                 if (json.data && json.data.length > 0) {
                   _sourcesData = json.data; _sourcesType = 'web';
                   _sourcesHtml = _buildSourcesBox(json.data, 'web');
+                  chatRenderer.updateSearchStatus(roundHolder || holder, _searchReports, json.data);
                 }
               } else if (json.type === 'workspace_rejected') {
                 // Server refused to bind the posted workspace (deleted folder,
@@ -5421,6 +5429,10 @@ import { setActionLabel } from './a11yLabel.js';
         }
 
 
+        if (_searchReports.length || (_sourcesType === 'web' && _sourcesData?.length)) {
+          if (roundHolder !== holder) holder.querySelector(':scope > .search-status')?.remove();
+          chatRenderer.updateSearchStatus(roundHolder, _searchReports, _sourcesType === 'web' ? _sourcesData : []);
+        }
         if (window.hljs) {
           roundHolder.querySelectorAll('pre code').forEach((block) => {
             window.hljs.highlightElement(block);
@@ -6315,6 +6327,8 @@ import { setActionLabel } from './a11yLabel.js';
     let gotDelta = false;
     let leftSession = false;
     let metricsData = null;
+    let replayWebSources = [];
+    const replaySearchReports = [];
     let replayError = null;
     let canonicalTerminalSeen = false;
     let currentToolBubble = null;
@@ -6551,7 +6565,13 @@ import { setActionLabel } from './a11yLabel.js';
                      json.type === 'research_progress' || json.type === 'research_sources' ||
                      json.type === 'research_findings' || json.type === 'research_done') {
             rich = true;
-            if (json.type === 'tool_start') {
+            if (json.type === 'web_sources') {
+              replayWebSources = json.data || [];
+              chatRenderer.updateSearchStatus(roundHolder, replaySearchReports, replayWebSources);
+            } else if (json.type === 'search_status') {
+              replaySearchReports.push(json.data);
+              chatRenderer.updateSearchStatus(roundHolder, replaySearchReports, replayWebSources);
+            } else if (json.type === 'tool_start') {
               startReplayTool(json);
             } else if (json.type === 'tool_output') {
               finishReplayTool(json);
@@ -6640,7 +6660,11 @@ import { setActionLabel } from './a11yLabel.js';
           body.insertAdjacentHTML('beforeend', chatRenderer.buildRagSourcesBox(metricsData.rag_sources));
         }
       }
-      if (metricsData) displayMetrics(target, metricsData);
+      if (metricsData) {
+        displayMetrics(target, metricsData);
+      }
+      if (target !== holder) holder.querySelector(':scope > .search-status')?.remove();
+      chatRenderer.updateSearchStatus(target, metricsData?.search_reports || replaySearchReports, metricsData?.web_sources || replayWebSources);
     }
     replayRendering.settle();
     replayMarker.remove();

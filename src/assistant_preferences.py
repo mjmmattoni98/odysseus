@@ -18,6 +18,7 @@ RETIRED_PREFERENCE_FIELDS = frozenset({"profile", "web_mode"})
 class AssistantPreferences(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    search_mode: Literal["off", "auto", "always"] = "auto"
     # "auto" uses the Settings default (local_thinking_effort).
     thinking: Literal["auto", "off", "low", "medium", "high"] = "auto"
     instructions: str = Field("", max_length=10000)
@@ -108,6 +109,9 @@ def context_limit(url, model):
 def parse_preferences(data):
     if isinstance(data, dict):
         data = {key: value for key, value in data.items() if key not in RETIRED_PREFERENCE_FIELDS}
+        legacy_mode = data.get("search_mode")
+        if isinstance(legacy_mode, str) and legacy_mode in {"manual", "intelligent"}:
+            data["search_mode"] = {"manual": "off", "intelligent": "auto"}[legacy_mode]
     preferences = AssistantPreferences.model_validate(data)
     for model, limit in preferences.context_limits.items():
         if not model.strip() or len(model) > 256 or isinstance(limit, bool) or not MIN_CONTEXT_LIMIT <= limit <= MAX_CONTEXT_LIMIT:
@@ -120,12 +124,23 @@ def load_preferences(session_id):
 
     with SessionLocal() as db:
         row = db.query(Session.assistant_preferences).filter(Session.id == session_id).first()
-        return parse_preferences(row[0]) if row and row[0] else DEFAULT_PREFERENCES
+        if row:
+            # A saved chat without this setting predates the unified control.
+            # New composers save their Auto default before sending the turn.
+            stored = {"search_mode": "off", **(row[0] or {})}
+            return parse_preferences(stored)
+        return DEFAULT_PREFERENCES
 
 
 def assistant_prompt(preferences):
     """The conversation's custom instructions, appended to the system prompt."""
-    return preferences.instructions
+    web_instruction = (
+        "Web is Off for this conversation. Answer without web search, browsing, "
+        "or fetching URLs, even when the message asks to search. If current "
+        "information is required, ask the user to select Web: Auto or Always."
+        if preferences.search_mode == "off" else ""
+    )
+    return "\n\n".join(part for part in (preferences.instructions, web_instruction) if part)
 
 
 def merge_sources(existing, incoming):

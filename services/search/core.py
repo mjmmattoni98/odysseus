@@ -1171,7 +1171,8 @@ def comprehensive_web_search(
 
     # Build sources list for the frontend (before content fetching)
     _source_list = [
-        {"url": r.get("url", ""), "title": r.get("title", ""), "read_status": "snippet"}
+        {"url": r.get("url", ""), "title": r.get("title", ""), "read_status": "snippet",
+         "snippet_available": bool(r.get("snippet"))}
         for r in search_results if r.get("url")
     ]
 
@@ -1204,7 +1205,15 @@ def comprehensive_web_search(
                     result["source_index"] = _url_index.get(url)
                     fetched_content.append(result)
                     source_by_url[url]["read_status"] = "read"
+                    source_by_url[url]["retrieval_method"] = result.get("extraction_method", "http")
                     source_by_url[url]["partial"] = bool(result.get("truncated") or len(result["content"]) > 3000)
+                else:
+                    error = str(result.get("error") or "").lower()
+                    source_by_url[url]["failure_reason"] = (
+                        "access_restricted" if result.get("error_kind") == "access_challenge" or any(code in error for code in ("http 401", "http 403", "http 429"))
+                        else "timeout" if "timeout" in error or "timed out" in error
+                        else "unavailable"
+                    )
             except Exception as e:
                 logger.error(f"Exception while fetching {url}: {str(e)}")
 
@@ -1214,6 +1223,40 @@ def comprehensive_web_search(
         missing = len(filtered_urls) - len(fetched_content)
         if missing > 0 and backfill_urls:
             fetch_pages(executor, backfill_urls[:missing])
+
+        # A short provider response can consist entirely of blocked pages.
+        # Ask for a larger result set, then try one configured alternative.
+        # Keep the same query/scope and cap both requests and extra downloads.
+        if not fetched_content and max_pages > 0:
+            recovery_providers = [report["provider"]] + [p for p in provider_chain if p != report["provider"]][:1]
+            for provider_name in recovery_providers:
+                try:
+                    extra = _call_provider(provider_name, provider_query, min(10, max(8, fetch_count * 2)), time_filter)
+                    extra = rank_search_results(provider_query, _filter_low_relevance_results(provider_query, extra))
+                except Exception:
+                    report["attempts"].append({"provider": provider_name, "state": "failed", "stage": "readable_sources"})
+                    continue
+                added = []
+                for result in extra:
+                    url = result.get("url")
+                    if not url or url in source_by_url or not url_passes_filters(url):
+                        continue
+                    search_results.append(result)
+                    citation = registry.number(url) if registry else len(_source_list) + 1
+                    _url_index[url] = citation
+                    source = {"url": url, "title": result.get("title", ""), "citation": citation,
+                              "read_status": "snippet", "snippet_available": bool(result.get("snippet"))}
+                    _source_list.append(source)
+                    source_by_url[url] = source
+                    added.append(url)
+                    if len(added) >= max_pages:
+                        break
+                if added:
+                    fetch_pages(executor, added)
+                report["attempts"].append({"provider": provider_name, "state": "ok" if fetched_content else "empty", "stage": "readable_sources"})
+                if fetched_content:
+                    report["retrieval_recovery"] = True
+                    break
 
     logger.info(f"Successfully fetched content from {len(fetched_content)} pages")
 
@@ -1229,6 +1272,8 @@ def comprehensive_web_search(
     output_parts.append("")
 
     output_parts.append("SEARCH RESULTS SUMMARY:")
+    if not fetched_content:
+        output_parts.append("Only search snippets are available. No page text was retrieved; do not claim to have read the articles or verified details beyond these snippets.")
     output_parts.append("-" * 50)
     for i, result in enumerate(search_results, 1):
         i = _url_index.get(result.get("url"), i)

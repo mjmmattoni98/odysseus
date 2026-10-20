@@ -12,6 +12,7 @@ from src import llm_core
 @pytest.mark.parametrize("data", [
     {"thinking": "yes"}, {"instructions": "x" * 10001}, {"context_limits": {"model": 0}},
     {"context_limits": {"model": 999999}}, {"unexpected": True},
+    {"search_mode": "unknown"},
 ])
 def test_invalid_preferences_are_rejected(data):
     with pytest.raises(ValueError):
@@ -26,6 +27,11 @@ def test_settings_saved_by_retired_profiles_still_load():
     assert parse_preferences(stored) == AssistantPreferences(
         thinking="off", instructions="Be brief", context_limits={"m": 16384},
     )
+
+
+@pytest.mark.parametrize(("legacy", "mode"), [("manual", "off"), ("intelligent", "auto")])
+def test_old_search_settings_migrate_to_the_single_mode(legacy, mode):
+    assert parse_preferences({"search_mode": legacy}).search_mode == mode
 
 
 def test_auto_thinking_defers_to_the_settings_default(monkeypatch):

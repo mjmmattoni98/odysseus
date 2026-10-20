@@ -932,14 +932,9 @@ function initializeEventListeners() {
     // Hide/show model picker
     const _mpw = el('model-picker-wrap');
     if (_mpw) _mpw.style.display = active ? 'none' : '';
-    // Mutual exclusion: group disables research + web search
+    // Group mode disables Deep Research
     if (active) {
       _syncResearchIndicator(false);
-      const _webChk = el('web-toggle');
-      if (_webChk && _webChk.checked) {
-        _webChk.checked = false;
-        saveToolPref('web', (loadToggleState().mode || 'chat'), false);
-      }
     }
     const s = loadToggleState(); s.group = active; saveToggleState(s);
     updatePlusDot();
@@ -1771,7 +1766,6 @@ function initializeEventListeners() {
   // Mode-affected tools: default ON in Agent mode, default OFF in Chat mode,
   // but the user's explicit per-mode override is persisted and honored.
   const MODE_TOOLS = [
-    { btnId: 'web-toggle-btn',  checkboxId: 'web-toggle',  stateKey: 'web' },
     { btnId: 'bash-toggle-btn', checkboxId: 'bash-toggle', stateKey: 'bash' },
   ];
 
@@ -2014,7 +2008,6 @@ function initializeEventListeners() {
       }
     });
   }
-  setupToggle('web-toggle-btn', 'web-toggle', 'web');
   setupToggle('bash-toggle-btn', 'bash-toggle', 'bash');
   try { workspaceModule.initWorkspace(); } catch (_) {}
 
@@ -2262,16 +2255,7 @@ function initializeEventListeners() {
       if (overflowRes) overflowRes.classList.toggle('active', resState);
       const toolRes = el('tool-research-btn');
       if (toolRes) toolRes.classList.toggle('active', resState);
-      // On load: if both research and web are ON, research wins
-      if (resState) {
-        const webChk = el('web-toggle');
-        const webBtn = el('web-toggle-btn');
-        if (webChk && webChk.checked) {
-          webChk.checked = false;
-          if (webBtn) webBtn.classList.remove('active');
-          saveToolPref('web', (st.mode || 'chat'), false);
-        }
-      }
+      // Research keeps its own run state; the saved Web mode is unchanged.
 
       researchBtn.addEventListener('click', () => {
         const chk = el('research-toggle');
@@ -2281,14 +2265,6 @@ function initializeEventListeners() {
           _showToolSplash('research');
           // Clear character — mutually exclusive with research
           if (presetsModule && presetsModule.deactivateCharacter) presetsModule.deactivateCharacter();
-          // Research and Web search are mutually exclusive
-          const webChk = el('web-toggle');
-          const webBtn = el('web-toggle-btn');
-          if (webChk && webChk.checked) {
-            webChk.checked = false;
-            if (webBtn) webBtn.classList.remove('active');
-            saveToolPref('web', (loadToggleState().mode || 'chat'), false);
-          }
           // Research requires chat mode — force switch from agent
           const rs = loadToggleState();
           if (rs.mode === 'agent') {
@@ -2314,7 +2290,7 @@ function initializeEventListeners() {
     if (!inputLeft || !overflowMenu || !overflowWrapper) return;
 
     // Buttons that can be collapsed (in reverse priority — last collapsed first)
-    const collapsibleIds = ['bash-toggle-btn', 'web-toggle-btn'];
+    const collapsibleIds = ['bash-toggle-btn'];
     const collapsibleBtns = collapsibleIds.map(id => el(id)).filter(Boolean);
     // Map of toolbar btn id → overflow mirror element (created dynamically)
     const overflowMirrors = new Map();
@@ -2556,14 +2532,6 @@ function initializeEventListeners() {
         _showToolSplash('research');
         // Clear character — mutually exclusive with research
         if (presetsModule && presetsModule.deactivateCharacter) presetsModule.deactivateCharacter();
-        // Mutual exclusion with web search
-        const webChk = el('web-toggle');
-        const webBtn = el('web-toggle-btn');
-        if (webChk && webChk.checked) {
-          webChk.checked = false;
-          if (webBtn) webBtn.classList.remove('active');
-          saveToolPref('web', (loadToggleState().mode || 'chat'), false);
-        }
         // Research requires chat mode
         const rs2 = loadToggleState();
         if (rs2.mode === 'agent') {
@@ -2689,14 +2657,14 @@ function initializeEventListeners() {
         }
         // Default to plain chat: disable tools visually, switch to chat mode.
         // IMPORTANT: don't overwrite the user's persisted per-mode tool prefs
-        // (`web_agent`, `bash_agent`, `web_chat`, `bash_chat`). Nobody mode is
+        // (`bash_agent`, `bash_chat`). Nobody mode is
         // ephemeral — their agent-mode defaults must come back on toggle-off.
         const beforeNobody = Storage.getJSON(Storage.KEYS.TOGGLES, {}) || {};
         if (!beforeNobody.nobody_prev_mode) beforeNobody.nobody_prev_mode = beforeNobody.mode || 'agent';
         Storage.setJSON(Storage.KEYS.TOGGLES, beforeNobody);
-        const _offIds = ['web-toggle', 'bash-toggle', 'research-toggle'];
+        const _offIds = ['bash-toggle', 'research-toggle'];
         _offIds.forEach(id => { const c = el(id); if (c) c.checked = false; });
-        ['web-toggle-btn', 'bash-toggle-btn'].forEach(id => { const b = el(id); if (b) b.classList.remove('active'); });
+        ['bash-toggle-btn'].forEach(id => { const b = el(id); if (b) b.classList.remove('active'); });
         if (typeof window.__odysseusSetChatMode === 'function') {
           window.__odysseusSetChatMode('chat');
         } else {
@@ -2748,7 +2716,7 @@ function initializeEventListeners() {
         const _ts = Storage.getJSON(Storage.KEYS.TOGGLES, {});
         const _restoreMode = _ts.nobody_prev_mode || 'agent';
         delete _ts.nobody_prev_mode;
-        ['web_agent', 'bash_agent', 'web_chat', 'bash_chat'].forEach(k => {
+        ['bash_agent', 'bash_chat'].forEach(k => {
           if (_ts[k] === false) delete _ts[k];
         });
         Storage.setJSON(Storage.KEYS.TOGGLES, _ts);

@@ -1,5 +1,6 @@
 venv/
 .venv/
+.odysseus-dev/
 node_modules/
 services/node_modules/
 __pycache__/

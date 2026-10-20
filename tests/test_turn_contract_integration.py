@@ -87,6 +87,27 @@ async def test_actual_generator_reports_unavailable_before_inference(
     assert chunks[3] == "data: [DONE]\n\n"
 
 
+@pytest.mark.asyncio
+async def test_web_off_explains_the_saved_mode_before_inference(forbidden_inference_and_execution):
+    from src.agent_loop import stream_agent_loop
+    from src.assistant_preferences import AssistantPreferences, assistant_turn
+    from src.tool_policy import WEB_ACCESS_TOOL_NAMES
+
+    selected = contract({"search_browser"}, required_tools={"web_search"},
+                        policy=ToolPolicy(disabled_tools=WEB_ACCESS_TOOL_NAMES))
+    with assistant_turn(AssistantPreferences(search_mode="off")):
+        chunks = [chunk async for chunk in stream_agent_loop(
+            "https://inference.invalid", "unused-model",
+            [{"role": "user", "content": "Search the web for the latest news"}],
+            turn_contract=selected,
+        )]
+    text = "".join(json.loads(chunk.removeprefix("data: ")).get("delta", "")
+                   for chunk in chunks if "[DONE]" not in chunk)
+    assert "Web is Off" in text
+    assert "Select Auto or Always" in text
+    assert "unavailable:" not in text
+
+
 def test_unknown_contract_reaches_model_instead_of_forced_clarification():
     from src.agent_loop import _blocks_before_inference
 

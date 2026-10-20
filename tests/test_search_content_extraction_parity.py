@@ -1,6 +1,7 @@
 """Content extraction behavior for the canonical services.search.content module."""
 
 import httpx
+import json
 import pytest
 
 pytest.importorskip("bs4")
@@ -34,6 +35,32 @@ class _FakeErrorResponse:
         raise httpx.HTTPStatusError(
             f"{self.status_code} error", request=None, response=self
         )
+
+
+def test_article_text_embedded_in_structured_data_recovers_an_empty_js_shell(tmp_path, monkeypatch):
+    article = "A verifiable report with measured results, published on the public page. " * 12
+    data = {"@graph": [{"@type": "NewsArticle", "articleBody": article}]}
+    markup = '<html><head><title>News</title><script type="application/ld+json">' + json.dumps(data) + '</script></head><body><main><div id="app"></div></main></body></html>'
+    monkeypatch.setattr(service_content, 'CONTENT_CACHE_DIR', tmp_path)
+    monkeypatch.setattr(service_content, '_get_public_url', lambda *a, **k: _FakeResponse(markup))
+    result = service_content.fetch_webpage_content('https://example.org/js-article')
+    assert result['success']
+    assert article.strip() in result['content']
+    assert result['extraction_method'] == 'structured_article'
+
+
+def test_transient_gateway_failure_retries_once_before_losing_a_source(tmp_path, monkeypatch):
+    responses = iter([_FakeErrorResponse(503), _FakeResponse('<article>Recovered public article text</article>')])
+    monkeypatch.setattr(service_content, 'CONTENT_CACHE_DIR', tmp_path)
+    calls = []
+    def fetch(*args, **kwargs):
+        calls.append(kwargs)
+        return next(responses)
+    monkeypatch.setattr(service_content, '_get_public_url', fetch)
+    result = service_content.fetch_webpage_content('https://example.org/transient')
+    assert result['success']
+    assert 'Recovered public article' in result['content']
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize('markup', [

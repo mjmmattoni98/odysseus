@@ -10,6 +10,7 @@ window.cancelActiveTour = function cancelActiveTour() {
 };
 
 import Storage from './storage.js';
+import assistantControls from './assistantControls.js';
 import uiModule from './ui.js?v=20260916largetoolscroll1';
 import sessionModule from './sessions.js';
 import modelsModule from './models.js';
@@ -932,6 +933,12 @@ function _syncToggleUI(name, state) {
 }
 
 async function _quickToggle(name) {
+  if (name === 'web') {
+    const mode = assistantControls.searchMode() === 'off' ? 'auto' : 'off';
+    await assistantControls.setSearchMode(mode);
+    await typewriterReply(`Web: ${mode}`);
+    return true;
+  }
   const toggleMap = { web: 'web-toggle', bash: 'bash-toggle', research: 'research-toggle' };
   const chk = document.getElementById(toggleMap[name]);
   if (!chk) return false;
@@ -943,6 +950,13 @@ async function _quickToggle(name) {
 }
 
 async function _applyToggle(name, val) {
+  if (name === 'web') {
+    const mode = val === 'on' ? 'always' : ['off', 'auto', 'always'].includes(val) ? val
+      : assistantControls.searchMode() === 'off' ? 'auto' : 'off';
+    await assistantControls.setSearchMode(mode);
+    await typewriterReply(`Web: ${mode}`);
+    return;
+  }
   const toggleMap = { web: 'web-toggle', bash: 'bash-toggle', research: 'research-toggle' };
   const chk = document.getElementById(toggleMap[name]);
   if (!chk) return;
@@ -1228,7 +1242,7 @@ async function _cmdSessionExport(args, ctx) {
 
 // ── Toggle handlers ──
 
-async function _cmdToggleWeb(args, ctx) { const v = (args[0]||'').toLowerCase(); if (v === 'on' || v === 'off') _applyToggle('web', v); else _quickToggle('web'); return true; }
+async function _cmdToggleWeb(args, ctx) { const v = (args[0]||'').toLowerCase(); if (['on', 'off', 'auto', 'always'].includes(v)) await _applyToggle('web', v); else await _quickToggle('web'); return true; }
 async function _cmdToggleBash(args, ctx) { const v = (args[0]||'').toLowerCase(); if (v === 'on' || v === 'off') _applyToggle('bash', v); else _quickToggle('bash'); return true; }
 async function _cmdToggleRag(args, ctx) { const v = (args[0]||'').toLowerCase(); if (v === 'on' || v === 'off') _applyToggle('rag', v); else _quickToggle('rag'); return true; }
 async function _cmdToggleResearch(args, ctx) { const v = (args[0]||'').toLowerCase(); if (v === 'on' || v === 'off') _applyToggle('research', v); else _quickToggle('research'); return true; }
@@ -1310,12 +1324,12 @@ async function _cmdToggleShow(args, ctx) {
   if (!name || !toggleMap[name]) {
     const status = Object.keys(toggleMap).map(k => {
       const chk = document.getElementById(toggleMap[k]);
-      return `  ${k}: ${chk && chk.checked ? 'on' : 'off'}`;
+      return `  ${k}: ${k === 'web' ? assistantControls.searchMode() : chk && chk.checked ? 'on' : 'off'}`;
     }).join('\n');
-    slashReply(`<pre>Toggles:\n${status}\n\nUsage: /toggle &lt;name&gt; [on|off]</pre>`);
+    slashReply(`<pre>Toggles:\n${status}\n\nUsage: /toggle web [off|auto|always]</pre>`);
     return true;
   }
-  _applyToggle(name, val);
+  await _applyToggle(name, val);
   return true;
 }
 
@@ -1973,12 +1987,11 @@ async function _cmdRagRemove(args, ctx) {
 async function _cmdWebSearch(args, ctx) {
   const query = args.join(' ');
   if (!query) { slashReply('Usage: /search &lt;query&gt;'); return true; }
-  // Enable web toggle for this search, then fall through to normal chat
-  const chk = document.getElementById('web-toggle');
-  const btn = document.getElementById('web-toggle-btn');
-  if (chk) chk.checked = true;
-  if (btn) btn.classList.add('active');
-  uiModule.el('message').value = query;
+  if (assistantControls.searchMode() === 'off') {
+    slashReply('Web is Off. Select Auto or Always in the Web menu to search.');
+    return true;
+  }
+  uiModule.el('message').value = `Search the web for: ${query}`;
   return false; // fall through to normal chat submit
 }
 
@@ -2495,8 +2508,7 @@ async function _cmdDemo(args, ctx) {
   // Beat between the welcome line and the first hint so it doesn't snap in.
   await delay(900);
 
-  // Reset to a known starting state so the interactive steps (switch to Agent,
-  // turn Web on) actually have something to do.
+  // Start the mode-switching part of the tour in Chat mode.
   try {
     const _agentBtn = document.getElementById('mode-agent-btn');
     const _chatBtn  = document.getElementById('mode-chat-btn');
@@ -2506,21 +2518,9 @@ async function _cmdDemo(args, ctx) {
       const _t = _agentBtn.closest('.mode-toggle');
       if (_t) _t.classList.add('mode-chat');
     }
-    // Web is persisted per-mode under web_chat / web_agent. Zero both so the
-    // toggle is genuinely off when the user reaches the "turn it on" step.
     const _st = Storage.getJSON(Storage.KEYS.TOGGLES, {});
     _st.mode = 'chat';
-    _st.web_chat = false;
-    _st.web_agent = false;
     Storage.setJSON(Storage.KEYS.TOGGLES, _st);
-    // If the web button is currently on, click it to fully unwind it via the
-    // existing handler (covers any state the click handler tracks that we
-    // can't see from here).
-    const _wbtn = document.getElementById('web-toggle-btn');
-    if (_wbtn && _wbtn.classList.contains('active')) _wbtn.click();
-    _wbtn?.classList.remove('active');
-    const _webCb = document.getElementById('web-toggle');
-    if (_webCb) _webCb.checked = false;
   } catch {}
 
   const sidebar = document.getElementById('sidebar');
@@ -2530,12 +2530,12 @@ async function _cmdDemo(args, ctx) {
       before() { if (sidebar?.classList.contains('hidden')) sidebar.classList.remove('hidden'); } },
     { sel: '#model-picker-btn',   text: 'Pick your LLM, Local or API.', advanceOnClick: true },
     { sel: '#mode-agent-btn',     text: '<b>Agent mode</b> gives Odysseus more control of the app when your model supports tools: create a theme, download a model, make a daily task, organize things, and more.', mode: 'click' },
-    { sel: '#web-toggle-btn',     text: 'Toggle tools like <b>web search</b>. Odysseus comes with private built-in <b>SearXNG</b> search.', mode: 'click' },
+    { sel: '#web-toggle-btn',     text: 'Choose <b>Web: Off, Auto, or Always</b>. Auto decides when to search; Always searches before every answer. Your choice is saved with this conversation.', mode: 'click' },
     { sel: '#overflow-plus-btn',  text: 'More tools can be found here, or in your sidebar. <b>Click to peek.</b>',
       advanceOnClick: true, pulseNext: true, afterDelay: 2200 },
     { sel: '#message',            text: 'Write your prompt here. Drag and drop files to attach them. <b>/prompt</b> for random prompt, <b>/help</b> for more.',
       finishLabel: true,
-      before() { document.getElementById('overflow-menu')?.classList.add('hidden'); } },
+      before() { document.getElementById('overflow-menu')?.classList.add('hidden'); document.getElementById('web-search-menu')?.classList.add('hidden'); document.getElementById('web-toggle-btn')?.setAttribute('aria-expanded', 'false'); } },
   ];
 
   let i = 0;
@@ -6099,7 +6099,7 @@ const COMMANDS = {
     alias: ['ws', 'websearch'],
     category: 'Utility',
     hidden: true,
-    help: 'Web search (sends query with web enabled)',
+    help: 'Search the web (requires Web: Auto or Always)',
     handler: _cmdWebSearch,
     noUserBubble: true,
     usage: '/search query'

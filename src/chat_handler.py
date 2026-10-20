@@ -146,7 +146,8 @@ class ChatHandler:
         attachment_meta: List[Dict[str, Any]] = []
 
         # Extract URLs and process YouTube transcripts
-        urls = extract_urls(enhanced_message) if allow_tool_preprocessing else []
+        from src.assistant_preferences import current_preferences
+        urls = extract_urls(enhanced_message) if allow_tool_preprocessing and current_preferences().search_mode != "off" else []
         youtube_transcripts: List[str] = []
 
         has_youtube = False
