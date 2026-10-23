@@ -67,6 +67,17 @@ def client(monkeypatch):
     import routes.model_routes as mr
     from fastapi import FastAPI
 
+    # Keep accepted endpoints out of the worker's shared database: once the
+    # real modules are imported, the loopback cases create a real endpoint
+    # that later tests would resolve as a default.
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from core.database import Base
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(mr, "SessionLocal", sessionmaker(bind=engine))
+
     app = FastAPI()
     router = mr.setup_model_routes(model_discovery=None)
     app.include_router(router)
