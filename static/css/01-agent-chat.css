@@ -2778,6 +2778,11 @@ body.bg-pattern-ascii-fireflies {
       background: color-mix(in srgb, var(--accent) 8%, transparent);
     }
     #web-toggle-btn.web-mode-btn { gap:6px; opacity:1; white-space:nowrap; font:inherit; font-size:12px; padding:6px 9px; flex-shrink:0; }
+    /* Narrow composers shorten the label (app.js checkToolbarOverflow) rather than clip it. */
+    #web-toggle-btn.web-mode-short .web-mode-prefix,
+    #web-toggle-btn.web-mode-short .web-mode-caret,
+    #web-toggle-btn.web-mode-icon-only .web-mode-text,
+    #web-toggle-btn.web-mode-icon-only .web-mode-caret { display:none; }
     .web-search-menu { position:fixed; z-index:10000; width:280px; max-width:calc(100vw - 16px); padding:8px; border:1px solid var(--border); border-radius:12px; background:var(--bg); color:var(--fg); box-shadow:0 8px 30px #0004; }
     .web-search-menu.hidden { display:none; }
     .web-search-menu-label { padding:4px 9px 8px; font-size:12px; opacity:.7; }

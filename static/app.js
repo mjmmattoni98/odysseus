@@ -2292,6 +2292,10 @@ function initializeEventListeners() {
     // Buttons that can be collapsed (in reverse priority — last collapsed first)
     const collapsibleIds = ['bash-toggle-btn'];
     const collapsibleBtns = collapsibleIds.map(id => el(id)).filter(Boolean);
+    // When that is not enough, the Web button shortens "Web: Auto ▾" to its
+    // mode, then to the icon; its title and menu still name the mode.
+    const webBtn = el('web-toggle-btn');
+    const webCompactSteps = ['web-mode-short', 'web-mode-icon-only'];
     // Map of toolbar btn id → overflow mirror element (created dynamically)
     const overflowMirrors = new Map();
 
@@ -2328,6 +2332,7 @@ function initializeEventListeners() {
 
       // Uncollapse all to measure natural widths
       collapsibleBtns.forEach(btn => btn.classList.remove('toolbar-collapsed'));
+      if (webBtn) webBtn.classList.remove(...webCompactSteps);
       overflowMirrors.forEach(m => m.style.display = 'none');
 
       // Temporarily allow overflow for accurate measurement
@@ -2380,6 +2385,14 @@ function initializeEventListeners() {
           if (totalWidth <= available) break;
         }
       }
+      if (webBtn && webBtn.offsetWidth) {
+        for (const step of webCompactSteps) {
+          if (totalWidth <= available) break;
+          const fullWidth = webBtn.offsetWidth;
+          webBtn.classList.add(step);
+          totalWidth -= fullWidth - webBtn.offsetWidth;
+        }
+      }
 
       // Restore
       inputLeft.style.overflow = prevOverflow;
@@ -2392,6 +2405,11 @@ function initializeEventListeners() {
     collapsibleBtns.forEach(btn => {
       observer.observe(btn, { attributes: true, attributeFilter: ['class'] });
     });
+    // Off/Auto/Always differ in width, so a mode change re-checks the fit.
+    if (webBtn) {
+      new MutationObserver(() => requestAnimationFrame(checkToolbarOverflow))
+        .observe(webBtn, { subtree: true, childList: true, characterData: true });
+    }
 
     // Run on resize and on load
     window.addEventListener('resize', () => requestAnimationFrame(checkToolbarOverflow));

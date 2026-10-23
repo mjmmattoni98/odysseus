@@ -23,7 +23,7 @@ export function renderSearchMode() {
   const mode = searchModes[searchMode()];
   const button = el('web-toggle-btn');
   const label = el('web-mode-label');
-  if (label) label.textContent = `Web: ${mode.label}`;
+  if (label) label.textContent = mode.label;
   if (button) {
     button.title = `Web: ${mode.label} — ${mode.description}`;
     button.setAttribute('aria-label', `Web: ${mode.label}. ${mode.description}`);

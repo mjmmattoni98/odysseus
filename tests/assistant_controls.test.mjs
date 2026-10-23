@@ -85,7 +85,7 @@ test('the Web menu saves immediately, survives switching chats, and new chats de
     return { ok: true, json: async () => ({ preferences: saved.get(url) || { ...DEFAULTS, search_mode: 'off' }, runtime: {} }) };
   };
   await controls.loadSession('conversation');
-  assert.equal(document.getElementById('web-mode-label').textContent, 'Web: Off');
+  assert.equal(document.getElementById('web-mode-label').textContent, 'Off');
   await controls.setSearchMode('always');
   assert.equal(saved.get('/api/session/conversation/assistant').search_mode, 'always');
   assert.equal(document.getElementById('web-toggle').checked, true);
@@ -94,7 +94,7 @@ test('the Web menu saves immediately, survives switching chats, and new chats de
   await controls.loadSession('conversation');
   assert.equal(controls.searchMode(), 'always');
   await controls.loadSession(null);
-  assert.equal(document.getElementById('web-mode-label').textContent, 'Web: Auto');
+  assert.equal(document.getElementById('web-mode-label').textContent, 'Auto');
   assert.equal(document.getElementById('web-toggle').checked, false);
   for (const id of ['bash-toggle-btn', 'bash-toggle', 'mode-agent-btn']) assert.equal(document.elements.has(id), false);
 });
