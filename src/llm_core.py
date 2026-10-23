@@ -1125,6 +1125,17 @@ def _apply_ollama_keep_alive(payload: Dict, url: str) -> None:
 _OLLAMA_THINK_EFFORT_CHOICES = ("auto", "off", "low", "medium", "high")
 
 
+def settings_thinking_effort() -> str:
+    """Settings default thinking effort (``local_thinking_effort``)."""
+    try:
+        from src.settings import load_settings
+
+        raw = str(load_settings().get("local_thinking_effort") or "auto").strip().lower()
+    except Exception:
+        return "auto"
+    return raw if raw in _OLLAMA_THINK_EFFORT_CHOICES else "auto"
+
+
 def _ollama_thinking_effort() -> str:
     """Selected thinking effort for local Ollama models.
 
@@ -1136,13 +1147,7 @@ def _ollama_thinking_effort() -> str:
     preferences = current_preferences()
     if preferences.thinking != "auto":
         return preferences.thinking
-    try:
-        from src.settings import load_settings
-
-        raw = str(load_settings().get("local_thinking_effort") or "auto").strip().lower()
-    except Exception:
-        return "auto"
-    return raw if raw in _OLLAMA_THINK_EFFORT_CHOICES else "auto"
+    return settings_thinking_effort()
 
 
 def _normalize_think_override(value) -> Optional[str]:

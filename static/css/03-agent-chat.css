@@ -2506,6 +2506,84 @@ details a:hover {
   --_btn-ic: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.5' stroke-linecap='round'%3E%3Cline x1='18' y1='6' x2='6' y2='18'/%3E%3Cline x1='6' y1='6' x2='18' y2='18'/%3E%3C/svg%3E");
 }
 
+/* ===== CONVERSATION SETTINGS ===== */
+
+.assistant-settings-body {
+  gap: 14px;
+  padding: 0 4px 2px;
+}
+/* .settings-row/.settings-col set display, which would beat [hidden]. */
+.assistant-settings-body [hidden] { display: none !important; }
+.assistant-settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.assistant-settings-section + .assistant-settings-section {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.assistant-settings-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.assistant-settings-heading > .admin-toggle-sub {
+  flex-shrink: 0;
+  margin: 0 0 0 auto;
+}
+.assistant-model-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'Fira Code', monospace;
+  font-size: 12px;
+  font-weight: 400;
+  color: color-mix(in srgb, var(--fg) 75%, transparent);
+}
+#assistant-instructions {
+  flex: none;
+  min-height: 104px;
+  padding: 8px 10px;
+  line-height: 1.45;
+  resize: vertical;
+}
+.assistant-settings-body .settings-row { flex-wrap: wrap; }
+.assistant-settings-body .settings-label { flex: 0 0 92px; }
+.assistant-settings-body .settings-col { gap: 4px; }
+#assistant-context { flex: 0 1 120px; }
+#assistant-thinking,
+#assistant-context,
+.assistant-settings-body .settings-row > .char-action-btn {
+  height: 30px;
+  box-sizing: border-box;
+}
+/* Same chevron as .memory-sort-select: .settings-select hides the native one. */
+#assistant-thinking {
+  padding-right: 24px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 10px 10px;
+}
+.admin-toggle-sub.assistant-settings-warning { color: var(--red); }
+.assistant-settings-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.assistant-settings-footer > .confirm-btn-primary { color: var(--bg); }
+.assistant-settings-footer > .confirm-btn:disabled { opacity: 0.6; cursor: default; }
+
 .preset-tabs {
   display: flex;
   gap: 0;

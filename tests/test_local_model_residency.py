@@ -530,7 +530,7 @@ def test_session_runtime_reports_default_cap(monkeypatch):
     from fastapi.testclient import TestClient
     from routes import session_routes
     import src.assistant_preferences as ap
-    from src import model_context
+    from src import llm_core, model_context
 
     monkeypatch.setattr(session_routes, "router", APIRouter(prefix="/api"))
     monkeypatch.setattr(session_routes, "_verify_session_owner", lambda request, sid: None, raising=False)
@@ -540,6 +540,7 @@ def test_session_runtime_reports_default_cap(monkeypatch):
     monkeypatch.setattr(oc, "model_context_window", lambda url, model: 262144)
     monkeypatch.setattr(model_context, "_ollama_ps_context", lambda url, model: None)
     monkeypatch.setattr(model_context, "is_local_endpoint", lambda url: True)
+    monkeypatch.setattr(llm_core, "settings_thinking_effort", lambda: "high")
     manager = SimpleNamespace(get_session=lambda sid: SimpleNamespace(
         model="qwen3.8:27b", endpoint_url="http://localhost:11434/api/chat"))
     session_routes.setup_session_routes(manager, {})
@@ -550,3 +551,4 @@ def test_session_runtime_reports_default_cap(monkeypatch):
     assert runtime["native"] is True
     assert runtime["context_limit"] == 49152
     assert runtime["default_context_limit"] == 49152
+    assert runtime["default_thinking"] == "high"

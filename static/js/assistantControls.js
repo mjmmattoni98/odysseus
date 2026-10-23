@@ -50,29 +50,77 @@ export async function setSearchMode(mode) {
   if (sessionId) await prepareTurn(sessionId);
 }
 
+const efforts = { auto: 'Auto', off: 'Off', low: 'Low', medium: 'Medium', high: 'High' };
+const tokens = value => Number(value).toLocaleString();
+
 // Ollama reloads a model whenever num_ctx changes between calls, and
 // background calls always use the default cap.
 export function contextReloadNote(value) {
   const fallback = Number(runtime.default_context_limit);
   if (!runtime.native || !fallback || Number(value) === fallback) return '';
-  return ` This differs from the default (${fallback.toLocaleString()} tokens): Ollama reloads the model when calls switch between the two sizes.`;
+  return `Differs from the default, so Ollama reloads the model when calls switch between ${tokens(value)} and ${tokens(fallback)} tokens.`;
 }
 
-function runtimeText(contextValue) {
-  return runtime.local_ollama
-    ? `${runtime.model}. ${runtime.loaded_context ? `Loaded context: ${runtime.loaded_context.toLocaleString()} tokens.` : 'Model is not loaded.'} ${runtime.maximum_context ? `Model maximum: ${runtime.maximum_context.toLocaleString()} tokens.` : ''} ${runtime.native ? `Context limit applies to this model in this conversation.${contextReloadNote(contextValue)}` : 'Ollama controls context and keep-alive for this connection. Set OLLAMA_CONTEXT_LENGTH and OLLAMA_KEEP_ALIVE on the server.'}`
-    : 'The selected model is saved with this conversation.';
+function contextWarning(value) {
+  const maximum = Number(runtime.maximum_context);
+  if (maximum && Number(value) > maximum) return `Above this model's maximum; requests use ${tokens(maximum)} tokens.`;
+  return contextReloadNote(value);
+}
+
+function runtimeNote() {
+  if (!runtime.model) return 'Thinking and context options for local models appear after your first message.';
+  if (!runtime.local_ollama) return 'Thinking and context limits apply to local Ollama models.';
+  if (!runtime.native) return 'Ollama controls context and keep-alive for this connection. Set OLLAMA_CONTEXT_LENGTH and OLLAMA_KEEP_ALIVE on the server.';
+  return '';
+}
+
+// Highlights the composer button while this chat differs from the defaults.
+function isCustomized() {
+  const limit = preferences.context_limits[runtime.model];
+  return Boolean(preferences.instructions.trim()) || preferences.thinking !== 'auto'
+    || Boolean(limit && runtime.default_context_limit && limit !== runtime.default_context_limit);
+}
+
+function renderInstructionsCount() {
+  el('assistant-instructions-count').textContent = `${el('assistant-instructions').value.length.toLocaleString()} / 10,000`;
+}
+
+function renderContext() {
+  const value = el('assistant-context').value;
+  const fallback = runtime.default_context_limit;
+  el('assistant-context-reset').hidden = !fallback || Number(value) === Number(fallback);
+  el('assistant-context-hint').textContent = [
+    fallback && `Default ${tokens(fallback)}`,
+    runtime.maximum_context && `model maximum ${tokens(runtime.maximum_context)}`,
+  ].filter(Boolean).join(' · ');
+  const warning = contextWarning(value);
+  el('assistant-context-warning').textContent = warning;
+  el('assistant-context-warning').hidden = !warning;
 }
 
 function render() {
   renderSearchMode();
-  if (!el('assistant-settings-btn')) return;
+  const button = el('assistant-settings-btn');
+  if (!button) return;
+  const label = isCustomized() ? 'Conversation settings (customized)' : 'Conversation settings';
+  button.classList.toggle('active', isCustomized());
+  button.title = label;
+  button.setAttribute('aria-label', label);
   el('assistant-thinking').value = preferences.thinking;
+  const automatic = el('assistant-thinking').options?.[0];
+  if (automatic) automatic.textContent = runtime.default_thinking ? `Settings default (${efforts[runtime.default_thinking]})` : 'Default (from Settings)';
   el('assistant-instructions').value = preferences.instructions;
+  renderInstructionsCount();
+  el('assistant-model-name').textContent = runtime.model || '';
+  el('assistant-model-status').textContent = runtime.local_ollama
+    ? (runtime.loaded_context ? `Loaded · ${tokens(runtime.loaded_context)} tokens` : 'Not loaded')
+    : '';
   el('assistant-thinking-row').hidden = runtime.supports_thinking !== true;
   el('assistant-context-row').hidden = !runtime.native;
   el('assistant-context').value = preferences.context_limits[runtime.model] || runtime.context_limit || runtime.default_context_limit || 32768;
-  el('assistant-runtime').textContent = runtimeText(el('assistant-context').value);
+  renderContext();
+  el('assistant-runtime').textContent = runtimeNote();
+  el('assistant-runtime').hidden = !runtimeNote();
 }
 
 export function loadSession(id) {
@@ -160,20 +208,15 @@ function init() {
     if (!webButton?.contains(event.target) && !webMenu?.contains(event.target)) closeWebMenu();
   });
   window.addEventListener('resize', closeWebMenu);
-  el('assistant-settings-btn')?.addEventListener('click', async () => {
-    await loading;
-    if (sessionId && !dirty) await loadSession(sessionId);
-    if (loadError) return;
-    render();
-    el('assistant-settings-modal').classList.remove('hidden');
-    el('assistant-instructions').focus();
-  });
-  el('assistant-context')?.addEventListener('input', event => {
-    el('assistant-runtime').textContent = runtimeText(event.target.value);
-  });
-  el('assistant-close')?.addEventListener('click', () => el('assistant-settings-modal').classList.add('hidden'));
-  el('assistant-save')?.addEventListener('click', async () => {
+  const settingsModal = el('assistant-settings-modal');
+  const closeSettings = () => {
+    settingsModal.classList.add('hidden');
+    el('assistant-settings-btn')?.focus();
+  };
+  const saveSettings = async () => {
     const context = el('assistant-context');
+    const save = el('assistant-save');
+    if (save.disabled) return;
     if (runtime.native && !context.reportValidity()) return;
     preferences = {
       ...preferences,
@@ -184,12 +227,44 @@ function init() {
     if (runtime.native && runtime.model) preferences.context_limits[runtime.model] = Number(context.value);
     dirty = true;
     revision++;
+    save.disabled = true;
+    save.textContent = 'Saving…';
     try {
       if (sessionId) await prepareTurn(sessionId);
       render();
-      el('assistant-settings-modal').classList.add('hidden');
+      closeSettings();
     } catch (error) { ui.showError(error.message); }
+    finally {
+      save.disabled = false;
+      save.textContent = 'Save';
+    }
+  };
+  el('assistant-settings-btn')?.addEventListener('click', async () => {
+    await loading;
+    if (sessionId && !dirty) await loadSession(sessionId);
+    if (loadError) return;
+    render();
+    settingsModal.classList.remove('hidden');
+    el('assistant-instructions').focus();
   });
+  el('assistant-instructions')?.addEventListener('input', renderInstructionsCount);
+  el('assistant-context')?.addEventListener('input', renderContext);
+  el('assistant-context-reset')?.addEventListener('click', () => {
+    el('assistant-context').value = runtime.default_context_limit;
+    renderContext();
+    el('assistant-context').focus();
+  });
+  // Ctrl/Cmd+Enter saves from anywhere in the dialog; plain Enter saves from
+  // the context field, where it would otherwise do nothing.
+  settingsModal?.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' || event.isComposing) return;
+    if (!(event.ctrlKey || event.metaKey || event.target === el('assistant-context'))) return;
+    event.preventDefault();
+    saveSettings();
+  });
+  el('assistant-close')?.addEventListener('click', closeSettings);
+  el('assistant-cancel')?.addEventListener('click', closeSettings);
+  el('assistant-save')?.addEventListener('click', saveSettings);
   render();
 }
 

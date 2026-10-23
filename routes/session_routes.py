@@ -1605,7 +1605,7 @@ def setup_session_routes(
         from src.assistant_preferences import load_preferences, default_context_limit
         from src.ollama_capabilities import supports_thinking, ollama_api_root, model_context_window
         from src.model_context import _ollama_ps_context, is_local_endpoint
-        from src.llm_core import _is_ollama_native_url
+        from src.llm_core import _is_ollama_native_url, settings_thinking_effort
         from starlette.concurrency import run_in_threadpool
 
         session = session_manager.get_session(sid)
@@ -1620,6 +1620,8 @@ def setup_session_routes(
             runtime.update({
                 "native": native,
                 "supports_thinking": await run_in_threadpool(supports_thinking, session.endpoint_url, session.model),
+                # What the conversation's "auto" thinking choice resolves to.
+                "default_thinking": settings_thinking_effort(),
                 "loaded_context": await run_in_threadpool(_ollama_ps_context, session.endpoint_url, session.model),
                 "maximum_context": await run_in_threadpool(model_context_window, session.endpoint_url, session.model),
                 "context_limit": options.context_limits.get(session.model, default_limit) if native else None,

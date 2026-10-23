@@ -1302,25 +1302,48 @@
     </div>
 
     <div id="assistant-settings-modal" class="modal hidden">
-      <div class="modal-content preset-modal-content" role="dialog" aria-modal="true" aria-labelledby="assistant-settings-title">
+      <div class="modal-content preset-modal-content" role="dialog" aria-modal="true" aria-labelledby="assistant-settings-title" aria-describedby="assistant-settings-scope">
         <div class="modal-header">
           <h4 id="assistant-settings-title">Conversation settings</h4>
           <button type="button" class="close-btn" id="assistant-close" aria-label="Close conversation settings">Close</button>
         </div>
-        <div class="modal-body preset-modal-body">
-          <div id="assistant-thinking-row">
-            <label for="assistant-thinking">Thinking for this conversation</label>
-            <select id="assistant-thinking"><option value="auto">Default (from Settings)</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select>
-          </div>
-          <div id="assistant-context-row" hidden>
-            <label for="assistant-context">Context limit for this model</label>
-            <input id="assistant-context" type="number" min="1024" max="262144" step="1" value="32768" required>
-          </div>
-          <p id="assistant-runtime"></p>
-          <label for="assistant-instructions">Your instructions</label>
-          <textarea id="assistant-instructions" rows="5" maxlength="10000" placeholder="Your preferences, constraints, and how you want answers presented"></textarea>
+        <div class="modal-body preset-modal-body assistant-settings-body">
+          <div class="admin-toggle-sub" id="assistant-settings-scope">Saved with this chat. Changes apply from your next message.</div>
+          <section class="assistant-settings-section">
+            <div class="assistant-settings-heading">
+              <label for="assistant-instructions">Instructions</label>
+              <span class="admin-toggle-sub" id="assistant-instructions-count">0 / 10,000</span>
+            </div>
+            <textarea id="assistant-instructions" class="settings-select" rows="5" maxlength="10000" aria-describedby="assistant-instructions-hint" placeholder="e.g. Be concise. Compare options by cost and give a recommendation."></textarea>
+            <div class="admin-toggle-sub" id="assistant-instructions-hint">Added to the system prompt for every reply in this chat.</div>
+          </section>
+          <section class="assistant-settings-section" id="assistant-model-section" aria-labelledby="assistant-model-heading">
+            <div class="assistant-settings-heading">
+              <span id="assistant-model-heading">Model</span>
+              <span class="assistant-model-name" id="assistant-model-name"></span>
+              <span class="admin-toggle-sub" id="assistant-model-status"></span>
+            </div>
+            <div class="settings-row" id="assistant-thinking-row">
+              <label class="settings-label" for="assistant-thinking">Thinking</label>
+              <select id="assistant-thinking" class="settings-select"><option value="auto">Default (from Settings)</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select>
+            </div>
+            <div class="settings-col" id="assistant-context-row" hidden>
+              <div class="settings-row">
+                <label class="settings-label" for="assistant-context">Context limit</label>
+                <input id="assistant-context" class="settings-select" type="number" min="1024" max="262144" step="1" value="32768" required inputmode="numeric" aria-describedby="assistant-context-hint assistant-context-warning">
+                <span class="admin-toggle-sub">tokens</span>
+                <button type="button" class="char-action-btn" id="assistant-context-reset" hidden>Use default</button>
+              </div>
+              <div class="admin-toggle-sub" id="assistant-context-hint"></div>
+              <div class="admin-toggle-sub assistant-settings-warning" id="assistant-context-warning" hidden></div>
+            </div>
+            <div class="admin-toggle-sub" id="assistant-runtime"></div>
+          </section>
         </div>
-        <div class="modal-footer"><button type="button" class="btn-primary" id="assistant-save">Save for this conversation</button></div>
+        <div class="modal-footer assistant-settings-footer">
+          <button type="button" class="confirm-btn confirm-btn-secondary" id="assistant-cancel">Cancel</button>
+          <button type="button" class="confirm-btn confirm-btn-primary" id="assistant-save" title="Save (Ctrl+Enter)">Save</button>
+        </div>
       </div>
     </div>
 

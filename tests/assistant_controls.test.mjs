@@ -123,3 +123,25 @@ test('failed mode saves prevent a turn from using stale server preferences', asy
   await assert.rejects(controls.setSearchMode('off'), /Could not save/);
   await assert.rejects(controls.prepareTurn('s'), /Could not save/);
 });
+
+test('the dialog explains the context cap and marks customized chats', async () => {
+  const document = settingsDocument();
+  const controls = await controller(document);
+  const get = id => document.getElementById(id);
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({
+    preferences: { ...DEFAULTS, context_limits: { m: 65536 } },
+    runtime: { model: 'm', local_ollama: true, native: true, maximum_context: 131072, default_context_limit: 32768 },
+  }) });
+  await controls.loadSession('s');
+  assert.equal(Number(get('assistant-context').value), 65536);
+  assert.match(get('assistant-context-hint').textContent, /^Default 32\D?768 · model maximum 131\D?072$/);
+  assert.match(get('assistant-context-warning').textContent, /Ollama reloads the model/);
+  assert.equal(get('assistant-settings-btn').classList.contains('active'), true);
+  get('assistant-context').value = '200000';
+  get('assistant-context').listeners.input();
+  assert.match(get('assistant-context-warning').textContent, /Above this model's maximum/);
+  get('assistant-context-reset').listeners.click();
+  assert.equal(Number(get('assistant-context').value), 32768);
+  assert.equal(get('assistant-context-warning').hidden, true);
+  assert.equal(get('assistant-context-reset').hidden, true);
+});
