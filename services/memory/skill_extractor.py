@@ -149,6 +149,7 @@ async def maybe_extract_skill(
 
     try:
         from src.llm_core import llm_call_async
+        from src.utility_effort import effort_for_call
 
         # Get recent messages
         history = session.get_context_messages()
@@ -207,6 +208,7 @@ async def maybe_extract_skill(
             # Yield to the user's next prompt on a local model; thinking is
             # kept because distilling a reusable procedure benefits from it.
             workload="utility",
+            reasoning_effort=effort_for_call(endpoint_url, model, owner, session),
         )
         logger.debug(
             "[skill-extract] LLM returned in %.1fs (len=%d, head=%r)",

@@ -6923,6 +6923,7 @@ _AGENT_RULES = """\
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
+- When the prompt contains "Selected notes and todos", treat that content as already-provided reference context. Use it directly when it answers the request; do not call `manage_notes` to list/search/view the same notes, and do not ask for permission merely to use the selected context. Call `manage_notes` only when the user requests a note change or the selected context is insufficient and a fresh lookup is needed.
 """
 
 _API_AGENT_RULES = """\
@@ -6934,6 +6935,7 @@ _API_AGENT_RULES = """\
 - Be concise unless the user asks for depth.
 - With no active workspace, do not guess a folder for "this/current workspace"; ask the user to set one with `/workspace <path>` or `/workspace pick`.
 - Store facts or preferences about the user with `manage_memory`, not contacts.
+- When the prompt contains "Selected notes and todos", treat that content as already-provided reference context. Use it directly when it answers the request; do not call `manage_notes` to list/search/view the same notes, and do not ask for permission merely to use the selected context. Call `manage_notes` only when the user requests a note change or the selected context is insufficient and a fresh lookup is needed.
 """
 
 _LINK_RULES = """\
@@ -6981,7 +6983,7 @@ _DOMAIN_RULES = {
 - After a successful serve, verify with `list_served_models`; if an external server is running but invisible, use `adopt_served_model`.""",
     "notes_calendar_tasks": """\
 ## Notes/calendar/tasks rules
-- Notes/todos/reminders use `manage_notes`, not memory.
+- Notes/todos/reminders use `manage_notes`, not memory. However, when the prompt contains "Selected notes and todos", those notes are already available as reference context: use them directly and do not list/search/view them again or ask permission to use them. Use `manage_notes` only for a requested change or when a fresh lookup is genuinely needed.
 - Calendar create/update/delete should call `manage_calendar` with `action=list_calendars` first.
 - Recurring/automatic/scheduled requests create a `manage_tasks` task; do not just perform the action once.""",
     "memory": """\
@@ -10356,9 +10358,10 @@ def _has_matching_skill_for_turn(
         ))))
         if max_items == 0:
             return False
+        published_only = not prefs.get("auto_approve_skills", True)
         min_confidence = (
-            2.0
-            if not prefs.get("auto_approve_skills", True)
+            0.0
+            if published_only
             else float(prefs.get(
                 "skill_min_confidence",
                 get_setting("skill_autosave_min_confidence", 0.85),
@@ -10375,6 +10378,7 @@ def _has_matching_skill_for_turn(
             threshold=0.25,
             max_items=max_items,
             min_confidence=min_confidence,
+            published_only=published_only,
         ))
     except Exception as exc:
         logger.debug("skill preflight failed (non-fatal): %s", exc)
@@ -14495,6 +14499,7 @@ def _build_system_prompt(
     slim: bool = False,
     tool_order: Optional[List[str]] = None,
     small_context: bool = False,
+    endpoint_url: Optional[str] = None,
     client_runtime_context: Optional[Dict[str, Any]] = None,
     preserve_conversation: bool = False,
 ) -> List[Dict]:
@@ -14604,6 +14609,7 @@ def _build_system_prompt(
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
             **_prompt_shape_kwargs(slim, tool_order, small_context),
+            endpoint_url=endpoint_url,
         )
     else:
         agent_prompt, _skill_index_block = _build_base_prompt(
@@ -14617,6 +14623,7 @@ def _build_system_prompt(
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
             **_prompt_shape_kwargs(slim, tool_order, small_context),
+            endpoint_url=endpoint_url,
         )
         if not active_document:
             _cached_base_prompt = agent_prompt
@@ -15034,8 +15041,9 @@ def _build_system_prompt(
                 # confidence threshold. Approve OFF → published-only (no draft
                 # passes). Approve ON → drafts at/above the chosen confidence
                 # (0 = "All"). Falls back to the global default setting.
-                if not _prefs.get("auto_approve_skills", True):
-                    _skill_min_conf = 2.0  # nothing draft clears it → published only
+                _skill_published_only = not _prefs.get("auto_approve_skills", True)
+                if _skill_published_only:
+                    _skill_min_conf = 0.0  # published_only decides eligibility
                 else:
                     try:
                         _skill_min_conf = float(_prefs.get(
@@ -15058,6 +15066,7 @@ def _build_system_prompt(
                         max_items=_skill_max_injected,
                         min_confidence=_skill_min_conf,
                         available_toolsets=relevant_tools,
+                        published_only=_skill_published_only,
                     ) if _skill_max_injected > 0 else []
                 else:
                     # Explicit client activation chooses which eligible skill
@@ -15309,6 +15318,7 @@ def _build_base_prompt(
     slim: bool = False,
     tool_order: Optional[List[str]] = None,
     small_context: bool = False,
+    endpoint_url: Optional[str] = None,
 ):
     """Build the agent prompt with only relevant tools included.
 
@@ -15387,7 +15397,11 @@ def _build_base_prompt(
             from src.constants import DATA_DIR
             _sm = SkillsManager(DATA_DIR)
             active_tools = list(set(TOOL_SECTIONS.keys()) - set(disabled or []))
-            skill_idx = _sm.index_for(owner=owner, active_toolsets=active_tools)
+            skill_idx = _sm.index_for(
+                owner=owner,
+                active_toolsets=active_tools,
+                local_model=bool(endpoint_url) and is_local_endpoint(endpoint_url),
+            )
             if skill_idx:
                 lines = ["## Available skills",
                          "Procedures the assistant should consult before doing domain work. "
@@ -25051,6 +25065,7 @@ async def stream_agent_loop(
                 **_prompt_shape_kwargs(
                     textual_tools and route_local, planned_names, route_small,
                 ),
+                endpoint_url=candidate_url,
             )
         prompt_overhead = max(0, estimate_tokens(route_messages) - estimate_tokens(compacted_source))
         if is_api:
@@ -25090,6 +25105,7 @@ async def stream_agent_loop(
                     active_email=active_email, workspace=workspace,
                     client_runtime_context=client_runtime_context,
                     **_prompt_shape_kwargs(textual_tools and route_local, planned_names, route_small),
+                    endpoint_url=candidate_url,
                 )
         if route_small:
             route_messages = _cap_presearch_context(route_messages, tool_output_char_cap(route_window))

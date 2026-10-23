@@ -314,6 +314,8 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             sess.endpoint_url, sess.model, sess.headers, owner=_owner(request)
         )
 
+        from src.utility_effort import effort_for_call
+
         try:
             suggestion_text = await llm_call_async(
                 t_url,
@@ -325,6 +327,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
                 # Short extraction call: a reasoning trace would eat the budget.
                 think=False,
                 response_schema=_MEMORY_SUGGESTIONS_SCHEMA,
+                reasoning_effort=effort_for_call(t_url, t_model, _owner(request), sess),
             )
             parsed = _parse_json_list(suggestion_text)
             if parsed is not None:
@@ -405,6 +408,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         endpoint_url = None
         model = None
         headers = {}
+        sess = None
 
         user = _owner(request)
 
@@ -509,6 +513,8 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             "Return ONLY valid JSON, no markdown fences."
         )
 
+        from src.utility_effort import effort_for_call
+
         try:
             raw = await llm_call_async(
                 endpoint_url,
@@ -521,6 +527,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
                 max_tokens=2000,
                 headers=headers,
                 response_schema=_MEMORY_IMPORT_SCHEMA,
+                reasoning_effort=effort_for_call(endpoint_url, model, user, sess),
             )
 
             # Parse JSON
