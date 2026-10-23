@@ -399,8 +399,11 @@ async def test_chat_stream_sends_headers_before_context_and_reports_stages(monke
     response = await endpoint(_RouteRequest("chat"))
     assert not started.is_set()  # the route returned before building context
     chunks = response.body_iterator.__aiter__()
+    # Auto web search (the default) first decides whether this turn searches.
+    decision = _events([await chunks.__anext__()])[0]
     first = _events([await chunks.__anext__()])[0]
     second = _events([await chunks.__anext__()])[0]
+    assert decision == {"type": "context_status", "data": {"stage": "search_decision", "label": "Checking whether web search is needed…"}}
     assert first == {"type": "context_status", "data": {"stage": "context", "label": "Preparing context…"}}
     assert second == {"type": "context_status", "data": {"stage": "web_search", "label": "Searching the web…"}}
     release.set()

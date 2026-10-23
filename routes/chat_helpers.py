@@ -1314,7 +1314,7 @@ async def build_chat_context(
     if search_mode == "auto" and not use_web_val and not incognito:
         from src.intelligent_search import previous_search_evidence
         from src.assistant_preferences import record_search_report
-        previous = previous_search_evidence(context_message, sess.history)
+        previous = previous_search_evidence(context_message, getattr(sess, "history", []) or [])
         if previous is not None:
             preface.append({"role": "system", "content": (
                 "The user is asking about the previous answer's search record. "

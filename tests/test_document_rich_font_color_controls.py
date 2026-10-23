@@ -128,6 +128,20 @@ def test_numeric_font_size_and_custom_colors_work_on_desktop_and_mobile():
           await page.locator(`[data-dd="${kind}"]`).focus();
           await page.keyboard.press('ArrowDown');
           await page.waitForSelector(`#doc-md-dd-menu[data-dd="${kind}"]`);
+          // A keyboard-opened menu focuses its first entry on the next frame;
+          // acting before then lets that focus land after the action.
+          await page.waitForFunction(
+            kind => document.querySelector(`#doc-md-dd-menu[data-dd="${kind}"]`)?.contains(document.activeElement),
+            kind,
+            { timeout: 5000 },
+          );
+        }
+
+        // The toolbar syncs on an animation frame, which a loaded machine can
+        // delay well past a fixed pause. Wait for the state, then let the
+        // assertions below report whatever was actually reached.
+        async function settle(predicate) {
+          await page.waitForFunction(predicate, null, { timeout: 5000 }).catch(() => {});
         }
 
         await selectParagraph(0);
@@ -141,7 +155,9 @@ def test_numeric_font_size_and_custom_colors_work_on_desktop_and_mobile():
           slider.value = '5';
           slider.dispatchEvent(new Event('input', { bubbles: true }));
         });
-        await page.waitForTimeout(60);
+        await settle(() =>
+          document.querySelector('.rich-font-size-icon').textContent === '24'
+          && document.querySelector('.rich-toolbar-slider-value').value === '24');
         const sizeState = await page.evaluate(() => ({
           html: document.querySelector('#doc-email-richbody p').innerHTML,
           icon: document.querySelector('.rich-font-size-icon').textContent,
@@ -160,7 +176,10 @@ def test_numeric_font_size_and_custom_colors_work_on_desktop_and_mobile():
         }));
         await page.locator('.rich-toolbar-color-input').click();
         await page.locator('.cp-hex').fill('#123456');
-        await page.waitForTimeout(60);
+        // The picker also positions itself on the frame after it opens.
+        await settle(() =>
+          document.querySelectorAll('#doc-email-richbody p')[1].innerHTML.includes('#123456')
+          && document.querySelector('.cp-popover')?.style.left !== '');
         const colorState = await page.evaluate(() => ({
           html: document.querySelectorAll('#doc-email-richbody p')[1].innerHTML,
           menuOpen: Boolean(document.querySelector('#doc-md-dd-menu[data-dd="color"]')),
@@ -176,7 +195,7 @@ def test_numeric_font_size_and_custom_colors_work_on_desktop_and_mobile():
         await openMenu('highlight');
         await page.locator('.rich-toolbar-color-input').click();
         await page.locator('.cp-hex').fill('#abcdef');
-        await page.waitForTimeout(60);
+        await settle(() => document.querySelectorAll('#doc-email-richbody p')[2].innerHTML.includes('background-color'));
         const highlightState = await page.evaluate(() => ({
           html: document.querySelectorAll('#doc-email-richbody p')[2].innerHTML,
           stored: document.querySelector('#doc-editor-textarea').value,

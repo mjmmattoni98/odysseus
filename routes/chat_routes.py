@@ -1378,6 +1378,7 @@ async def _tool_approval_resolution_stream(decision: str) -> AsyncGenerator[str,
 
 
 _CONTEXT_STATUS_LABELS = {
+    "search_decision": "Checking whether web search is needed…",
     "context": "Preparing context…",
     "memory": "Recalling memories…",
     "documents": "Searching your documents…",
@@ -3148,7 +3149,7 @@ def setup_chat_routes(
             intelligent_search_enabled = False
             if not do_research and not tool_approval_continuation:
                 if assistant_options.search_mode == "auto":
-                    yield f"data: {json.dumps({'type': 'context_status', 'data': {'label': 'Checking whether web search is needed…'}})}\n\n"
+                    yield _context_status_event("search_decision")
                 search_decision = await decide_search_for_turn(
                     assistant_options, sess, message, owner=owner, use_web=use_web,
                     allow_web_search=allow_web_search,

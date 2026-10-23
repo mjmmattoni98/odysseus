@@ -65,6 +65,23 @@ def test_concurrent_conversations_keep_thinking_and_search_reports_separate(monk
     asyncio.run(run())
 
 
+def test_a_turn_streamed_by_one_task_can_be_closed_by_another():
+    # A streamed reply that is abandoned midway is closed later from another
+    # task (a disconnect, or the loop's async-generator finalizer), whose
+    # context never saw the turn's settings.
+    async def stream():
+        with assistant_turn(AssistantPreferences(thinking="high"), "http://localhost:11434"):
+            yield current_preferences().thinking
+            yield "unreachable"
+
+    async def run():
+        reply = stream()
+        assert await reply.__anext__() == "high"
+        await asyncio.create_task(reply.aclose())
+
+    asyncio.run(run())
+
+
 def test_local_context_cap_applies_to_payload_and_is_model_specific(monkeypatch):
     monkeypatch.setattr(llm_core, "_ollama_think_value", lambda *args: None)
     monkeypatch.setattr(llm_core, "is_local_endpoint", lambda *args: True)

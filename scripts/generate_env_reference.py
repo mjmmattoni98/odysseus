@@ -737,6 +737,12 @@ VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
         "Forces the search provider, overriding the Settings value. Empty keeps the "
         "UI authoritative, which is what a normal install wants.",
     ),
+    "ODYSSEUS_SEARCH_DECISION_URL": (
+        "Search", USER,
+        "Local Ollama server that decides whether an Auto web-search turn searches. "
+        "Empty uses the chat's own Ollama server, then an owner-visible Ollama "
+        "endpoint, then OLLAMA_BASE_URL.",
+    ),
 
     # -- Memory and skills --------------------------------------------------
     "ODYSSEUS_SKILL_SEMANTIC_RETRIEVAL": (

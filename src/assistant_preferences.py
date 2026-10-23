@@ -56,9 +56,14 @@ def assistant_turn(preferences, endpoint_url="", reports=None, sources=None):
     try:
         yield
     finally:
-        _turn.reset(token)
-        _search_reports.reset(report_token)
-        _sources.reset(source_token)
+        for var, var_token in ((_turn, token), (_search_reports, report_token), (_sources, source_token)):
+            try:
+                var.reset(var_token)
+            except ValueError:
+                # A streamed turn closed from another task (a disconnect, or
+                # the loop's async-generator finalizer): that context never
+                # saw these values, so there is nothing to restore in it.
+                pass
 
 
 def search_reports():
