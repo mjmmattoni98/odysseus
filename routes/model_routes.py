@@ -903,6 +903,15 @@ def _probe_ollama_model_capabilities(base: str, model_id: str, with_tools: bool 
     return {"status": "ok", "latency_ms": latency, "capabilities": caps, "method": "capabilities"}
 
 
+def _image_model_probe_result(model_id: str, available_models: List[str], with_tools: bool = False) -> dict:
+    """Check advertised image availability without generating or testing chat."""
+    if model_id not in available_models:
+        return {"status": "fail", "latency_ms": 0, "error": "Image model is not listed by the endpoint"}
+    if with_tools:
+        return {"status": "fail", "latency_ms": 0, "error": "Image endpoints do not advertise chat tool calling"}
+    return {"status": "ok", "latency_ms": 0, "skipped": True, "method": "discovery"}
+
+
 def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 10, with_tools: bool = False) -> dict:
     """Send a realistic completion request to a single model. Returns {status, latency_ms, error?}.
 
@@ -2157,7 +2166,8 @@ def setup_model_routes(model_discovery):
                 if ep_id and ep_id not in endpoints_cache:
                     ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
                     if ep and _chatgpt_endpoint_visible(ep, request):
-                        endpoints_cache[ep_id] = {"base_url": ep.base_url, "api_key": _resolve_probe_key(ep)}
+                        endpoints_cache[ep_id] = {"base_url": ep.base_url, "api_key": _resolve_probe_key(ep),
+                                                  "model_type": getattr(ep, "model_type", "llm")}
                 ep_data = endpoints_cache.get(ep_id)
                 if not ep_data:
                     # Try to find by base_url from the model's endpoint field
@@ -2170,7 +2180,11 @@ def setup_model_routes(model_discovery):
 
                 base = _normalize_base(ep_data["base_url"])
                 _with_tools = item.get("with_tools", False)
-                result = _probe_single_model(base, ep_data.get("api_key"), model_id, timeout=8, with_tools=_with_tools)
+                if ep_data.get("model_type") == "image":
+                    available = _probe_endpoint(base, ep_data.get("api_key"), timeout=8)
+                    result = _image_model_probe_result(model_id, available, with_tools=_with_tools)
+                else:
+                    result = _probe_single_model(base, ep_data.get("api_key"), model_id, timeout=8, with_tools=_with_tools)
                 result["model"] = model_id
                 result["endpoint_id"] = ep_id
                 results.append(result)
@@ -2199,6 +2213,7 @@ def setup_model_routes(model_discovery):
                     "name": ep.name,
                     "base_url": ep.base_url,
                     "api_key": _resolve_probe_key(ep),
+                    "model_type": getattr(ep, "model_type", "llm"),
                 })
         finally:
             db.close()
@@ -2228,13 +2243,15 @@ def setup_model_routes(model_discovery):
                     yield f"data: {json.dumps({'type': 'probe_start', 'endpoint': ep['name'], 'model_count': 0, 'error': 'No models found or endpoint offline'})}\n\n"
                     continue
 
-                models = [m for m in all_models if _is_chat_model(m)]
+                is_image = ep.get("model_type") == "image"
+                models = all_models if is_image else [m for m in all_models if _is_chat_model(m)]
                 skipped = len(all_models) - len(models)
                 yield f"data: {json.dumps({'type': 'probe_start', 'endpoint': ep['name'], 'model_count': len(models), 'skipped': skipped})}\n\n"
 
                 for model_id in models:
                     total += 1
-                    result = _probe_single_model(base, ep.get("api_key"), model_id, timeout=8)
+                    result = (_image_model_probe_result(model_id, all_models) if is_image
+                              else _probe_single_model(base, ep.get("api_key"), model_id, timeout=8))
                     result["type"] = "probe_result"
                     result["endpoint"] = ep["name"]
                     result["model"] = model_id
@@ -2661,13 +2678,15 @@ def setup_model_routes(model_discovery):
             ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
             if not ep or not _chatgpt_endpoint_visible(ep, request):
                 raise HTTPException(404, "Endpoint not found")
-            ep_data = {"id": ep.id, "name": ep.name, "base_url": ep.base_url, "api_key": _resolve_probe_key(ep)}
+            ep_data = {"id": ep.id, "name": ep.name, "base_url": ep.base_url, "api_key": _resolve_probe_key(ep),
+                       "model_type": getattr(ep, "model_type", "llm")}
         finally:
             db.close()
 
         base = _normalize_base(ep_data["base_url"])
         all_models = _probe_endpoint(base, ep_data["api_key"])
-        chat_models = [m for m in all_models if _is_chat_model(m)]
+        is_image = ep_data.get("model_type") == "image"
+        chat_models = all_models if is_image else [m for m in all_models if _is_chat_model(m)]
         skipped = len(all_models) - len(chat_models)
 
         def _stream():
@@ -2675,7 +2694,8 @@ def setup_model_routes(model_discovery):
             failed = []
             ok_count = 0
             for mid in chat_models:
-                result = _probe_single_model(base, ep_data["api_key"], mid, timeout=8)
+                result = (_image_model_probe_result(mid, all_models) if is_image
+                          else _probe_single_model(base, ep_data["api_key"], mid, timeout=8))
                 result["model"] = mid
                 result["type"] = "probe_result"
                 result["endpoint"] = ep_data["name"]

@@ -61,10 +61,12 @@ Runtime behavior:
   it is registered through the normal image endpoint settings and does not add
   ROCm dependencies or devices to the main app. Setup and a real Gallery
   verification command are in `docs/local-image-generation.md`;
-- `docker/image.flux-amd.yml` adds a separate FLUX.2 Klein 4B image endpoint
-  with its own four-step/guidance-one settings. It reuses the ROCm image and
-  persistent model cache. Generation and single-reference instruction editing
-  use the existing image routes; editing honors the configured guidance scale;
+- the AMD sidecar serves only Z-Image-Turbo by default, loading weights on
+  inference and unloading them after `IMAGE_IDLE_TIMEOUT` seconds (300 by
+  default). Health/model discovery and image endpoint probes do not run
+  inference or load weights. Active/queued requests prevent idle unloading.
+  The listener stays available while weights are unloaded. Cookbook's default
+  `--idle-timeout 0` behavior remains eager/resident;
 - MLX image serves use `scripts/mlx_image_server.py`, which pins generation/edit dispatch to the model chosen at process start and ignores OpenAI-compatible per-request model selectors;
 - vLLM recipe routes fetch and cache model recipe manifests/YAML from `vllm-project/recipes`, normalize base args/env/dependencies/tool-calling/reasoning variants, and expose compatible strategy metadata for serve setup;
 - Hugging Face download/setup paths can detect and persist encrypted HF tokens for later Cookbook/agent use;

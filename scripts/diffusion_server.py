@@ -6,6 +6,10 @@ Odysseus's image generation tool.
 
 Usage:
     python3 scripts/diffusion_server.py --model /path/to/model --port 8100
+
+With ``--idle-timeout SECONDS`` the server behaves like an Ollama keep_alive:
+discovery/health never load weights, the first inference request loads them,
+and they are released after that many seconds without inference requests.
 """
 import os
 import sys
@@ -22,19 +26,24 @@ sys.modules["xformers.ops.fmha"] = type(sys)("xformers.ops.fmha")
 
 import argparse
 import base64
+import ctypes
+import functools
+import gc
 import io
 import json
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel
 
@@ -42,16 +51,175 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("diffusion_server")
 
 _pipe = None
+_inpaint_pipe = None  # derived pipelines; cleared together with _pipe
+_img2img_pipe = None
 _model_id = ""
 DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 _args = None
 _PROGRESS = {}
 
+# Model lifecycle. Inference requests hold a lease (``_active_requests``) for
+# their whole duration, including time spent queued behind ``_run_lock``. The
+# idle unloader only runs when no lease is held, so it can never free weights
+# under an active or queued request.
+_state_lock = threading.Lock()   # guards _active_requests / _last_activity
+_run_lock = threading.Lock()     # serialises load and pipeline calls
+_active_requests = 0
+_last_activity = time.monotonic()
+_idle_stop = threading.Event()
+
+
+def _idle_timeout() -> float:
+    """Seconds of inactivity before unloading; 0 keeps the model resident."""
+    return max(0.0, float(getattr(_args, "idle_timeout", 0) or 0))
+
+
+def _model_loaded() -> bool:
+    return any(p is not None for p in (_pipe, _inpaint_pipe, _img2img_pipe))
+
+
+def _prefer_mmap_for_large_allocations():
+    """Keep large host buffers in their own mappings so freeing returns them.
+
+    glibc raises its mmap threshold after large frees, after which weights land
+    in the brk heap. Freed heap ranges then stay resident: with transparent
+    huge pages, khugepaged refilled them seconds after malloc_trim, leaving
+    ~9 GiB of an unloaded Z-Image in RSS. Pinning glibc's default 128 KiB
+    threshold disables that adjustment.
+    """
+    try:
+        ctypes.CDLL("libc.so.6").mallopt(-3, 128 * 1024)  # M_MMAP_THRESHOLD
+    except Exception as exc:
+        logger.warning("Could not pin malloc mmap threshold: %s", exc)
+
+
+def _detach_pipelines():
+    """Clear the pipeline globals and their offload hooks.
+
+    Kept separate so no local still references a pipeline when the caller runs
+    gc.collect(): pipelines are reference cycles, and an idle server may not
+    run another collection for a long time.
+    """
+    global _pipe, _inpaint_pipe, _img2img_pipe
+    pipes = {id(p): p for p in (_pipe, _inpaint_pipe, _img2img_pipe) if p is not None}
+    _pipe = _inpaint_pipe = _img2img_pipe = None
+    for pipe in pipes.values():
+        # Accelerate's CPU-offload hooks keep their own module references.
+        try:
+            pipe.remove_all_hooks()
+        except Exception:
+            pass
+
+
+def _release_model_memory():
+    """Drop every pipeline reference, then return RAM and VRAM to the system."""
+    _detach_pipelines()
+    # Finalizers (offload hooks, tensors) can free further cycles; one pass
+    # left ~7 GiB of Z-Image host memory unreleased on ROCm.
+    for _ in range(4):
+        if not gc.collect():
+            break
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception as exc:
+        logger.debug("GPU cache release failed: %s", exc)
+    try:
+        # Large freed tensors can stay in glibc arenas without this.
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _unload_if_idle(now: float | None = None) -> bool:
+    """Unload when the idle timeout has elapsed with no active or queued request."""
+    timeout = _idle_timeout()
+    if timeout <= 0:
+        return False
+    with _state_lock:
+        if not _model_loaded() or _active_requests:
+            return False
+        idle_for = (time.monotonic() if now is None else now) - _last_activity
+        if idle_for < timeout:
+            return False
+        if not _run_lock.acquire(blocking=False):
+            return False
+        try:
+            _release_model_memory()
+        finally:
+            _run_lock.release()
+    logger.info("Model unloaded after %.0fs idle: %s", idle_for, _model_id)
+    return True
+
+
+def _idle_watch_loop():
+    interval = max(0.05, min(5.0, _idle_timeout() / 10))
+    while not _idle_stop.wait(interval):
+        try:
+            _unload_if_idle()
+        except Exception:
+            logger.exception("Idle unload check failed")
+
+
+@contextmanager
+def _model_in_use():
+    """Lease the model for one request, loading it on first use."""
+    global _active_requests, _last_activity
+    with _state_lock:
+        _active_requests += 1
+        _last_activity = time.monotonic()
+    try:
+        with _run_lock:
+            if _pipe is None:
+                started = time.monotonic()
+                error = None
+                try:
+                    load_model()
+                except Exception as exc:
+                    logger.exception("Model load failed")
+                    error = f"Model failed to load: {exc}"
+                if error is not None:
+                    # Outside the except block, so the traceback no longer pins
+                    # partially loaded components. The next request retries.
+                    _release_model_memory()
+                    raise HTTPException(status_code=503, detail=error)
+                logger.info("Model ready in %.1fs", time.monotonic() - started)
+            yield _pipe
+    finally:
+        with _state_lock:
+            _active_requests -= 1
+            _last_activity = time.monotonic()
+
+
+def _uses_model(fn):
+    """Run a synchronous handler with the model loaded and leased."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _model_in_use():
+            return fn(*args, **kwargs)
+    return wrapper
+
 
 @asynccontextmanager
 async def lifespan(application):
-    load_model()
+    global _model_id
+    if _args is not None and not _model_id:
+        _model_id = Path(_args.model).name
+    watcher = None
+    if _idle_timeout() > 0:
+        _prefer_mmap_for_large_allocations()
+        logger.info("Serving %s on demand; weights unload after %.0fs idle", _model_id, _idle_timeout())
+        _idle_stop.clear()
+        watcher = threading.Thread(target=_idle_watch_loop, name="model-idle-unload", daemon=True)
+        watcher.start()
+    else:
+        load_model()
     yield
+    _idle_stop.set()
+    if watcher is not None:
+        watcher.join(timeout=10)
 
 
 app = FastAPI(title="Diffusion Server", lifespan=lifespan)
@@ -688,10 +856,8 @@ def list_models():
 
 
 @app.post("/v1/images/generations")
+@_uses_model
 def generate_image(req: ImageRequest):
-    if _pipe is None:
-        return {"error": "Model not loaded"}
-
     width, height = _parse_size(req.size)
     steps = _quality_steps(req.quality)
     request_id = _start_progress(req.request_id, steps * max(1, int(req.n or 1)), req.prompt, "generation")
@@ -770,8 +936,14 @@ async def edit_image(
     response_format: str = Form("b64_json"),
     request_id: str = Form(""),
 ):
-    if _pipe is None:
-        return {"error": "Model not loaded"}
+    # Read the upload on the event loop, then load/infer in a worker thread so
+    # discovery and progress requests stay responsive during a cold load.
+    raw = await image.read()
+    return await run_in_threadpool(_edit_image_sync, prompt, raw, n, size, quality, request_id)
+
+
+@_uses_model
+def _edit_image_sync(prompt: str, raw: bytes, n: int, size: str, quality: str, request_id: str):
     accepts_image = _pipeline_accepts_arg("image")
     accepts_input_images = _pipeline_accepts_arg("input_images")
     if not accepts_image and not accepts_input_images:
@@ -785,7 +957,6 @@ async def edit_image(
     width, height = _parse_size(size)
     steps = _quality_steps(quality)
     request_id = _start_progress(request_id, steps * max(1, min(int(n or 1), 4)), prompt, "edit")
-    raw = await image.read()
     init_image = PILImage.open(io.BytesIO(raw)).convert("RGB")
     if width > 0 and height > 0:
         init_image = ImageOps.fit(init_image, (width, height), method=PILImage.LANCZOS, centering=(0.5, 0.5))
@@ -882,9 +1053,6 @@ class InpaintRequest(BaseModel):
     feather: int = 8  # mask edge feathering in pixels
 
 
-_inpaint_pipe = None
-_img2img_pipe = None
-
 def _get_inpaint_pipe():
     """Lazy-load an inpaint or img2img pipeline from the same model."""
     global _inpaint_pipe, _img2img_pipe
@@ -972,10 +1140,9 @@ def _get_inpaint_pipe():
 
 
 @app.post("/v1/images/inpaint")
+@_uses_model
 def inpaint_image(req: InpaintRequest):
     """Inpaint masked region. Tries: native inpaint → img2img+composite → txt2img+composite."""
-    if _pipe is None:
-        return {"error": "Model not loaded"}
 
     from PIL import Image as PILImage
 
@@ -1305,6 +1472,7 @@ def _decode_mask_b64(b64_str, target_size):
 
 
 @app.post("/v1/images/harmonize")
+@_uses_model
 def harmonize_image(req: HarmonizeRequest):
     """Two-stage layer harmonization.
 
@@ -1320,8 +1488,6 @@ def harmonize_image(req: HarmonizeRequest):
     Backwards compat: if only `mask` is provided (no body/seam), it's
     treated as body_mask. `strength` (old field) maps to `color_match`.
     """
-    if _pipe is None:
-        return {"error": "Model not loaded"}
 
     from PIL import Image as PILImage
 
@@ -1460,7 +1626,13 @@ def _legacy_whole_image_harmonize(req, source_full):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": _model_id}
+    return {
+        "status": "ok",
+        "model": _model_id,
+        "loaded": _model_loaded(),
+        "active_requests": _active_requests,
+        "idle_timeout": _idle_timeout(),
+    }
 
 
 if __name__ == "__main__":
@@ -1482,6 +1654,9 @@ if __name__ == "__main__":
     parser.add_argument("--attention-slicing", action="store_true", help="Enable attention slicing")
     parser.add_argument("--vae-slicing", action="store_true", help="Enable VAE slicing")
     parser.add_argument("--harmonize-gpu", type=int, default=None, help="GPU index for harmonize/img2img (default: same as main)")
+    parser.add_argument("--idle-timeout", type=float, default=0,
+        help="Load weights on the first inference request and unload them after "
+             "this many idle seconds. 0 (default) loads at startup and keeps them.")
     parser.add_argument("--allowed-host", action="append", default=[],
         help="Additional Host header value to accept (DNS-rebinding allowlist). "
              "Can be repeated. Loopback values are always included.")
@@ -1503,4 +1678,5 @@ if __name__ == "__main__":
                 final_hosts, final_origins or "(none — default-deny)")
 
     app.state.model_path = _args.model
+    _model_id = Path(_args.model).name
     uvicorn.run(app, host=_args.host, port=_args.port)

@@ -1,5 +1,7 @@
 # Optional image inference service. See docs/local-image-generation.md.
 # Start only this service; the main Odysseus image needs no GPU dependencies.
+# The listener stays up; Z-Image weights load on the first image request and
+# are released after IMAGE_IDLE_TIMEOUT seconds without one (like Ollama).
 services:
   image-generation:
     image: odysseus-image:rocm7.2
@@ -32,11 +34,14 @@ services:
       - "0"
       - --cpu-offload
       - --vae-slicing
+      - --idle-timeout
+      - "${IMAGE_IDLE_TIMEOUT:-300}"
     # No host-published port: only Odysseus's Compose network can reach it.
+    # /health and /v1/models never load model weights.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8110/v1/models', timeout=5).read()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8110/health', timeout=5).read()"]
       interval: 30s
       timeout: 10s
-      start_period: 30m
+      start_period: 2m
       retries: 3
     restart: unless-stopped

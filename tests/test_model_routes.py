@@ -1173,6 +1173,47 @@ def test_reprobe_preserves_pinned_models(monkeypatch):
     assert json.loads(ep.cached_models) == ["m1"]
 
 
+@pytest.mark.parametrize("path", ["/api/probe-selected", "/api/probe", "/api/model-endpoints/{ep_id}/probe"])
+def test_image_probes_only_check_discovery_and_do_not_hide_model(monkeypatch, path):
+    ep = _make_endpoint(model_type="image", hidden_models=json.dumps(["Z-Image-Turbo"]),
+                        pinned_models=json.dumps(["Z-Image-Turbo"]))
+    db = _PinnedFakeDb([ep])
+    monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+    monkeypatch.setattr(model_routes, "_probe_endpoint", lambda *a, **k: ["Z-Image-Turbo"])
+    monkeypatch.setattr(model_routes, "_is_chat_model", lambda model: False)
+    monkeypatch.setattr(model_routes, "_probe_single_model", lambda *a, **k: pytest.fail("Image probe attempted chat"))
+    endpoint = _get_route(path, "POST" if path == "/api/probe-selected" else "GET")
+    request = _PinnedFakeRequest()
+    if path == "/api/probe-selected":
+        result = endpoint(request, {"models": [{"endpoint_id": ep.id, "model": "Z-Image-Turbo"}]})
+        results = result["results"]
+    else:
+        response = endpoint(request, endpoint_id=ep.id) if path == "/api/probe" else endpoint(ep.id, request)
+
+        async def drain():
+            events = []
+            async for chunk in response.body_iterator:
+                text = chunk.decode() if isinstance(chunk, bytes) else chunk
+                events.extend(json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: "))
+            return events
+
+        events = asyncio.run(drain())
+        results = [event for event in events if event.get("type") == "probe_result"]
+        if path.endswith("/{ep_id}/probe"):
+            assert ep.hidden_models is None
+            assert json.loads(ep.cached_models) == ["Z-Image-Turbo"]
+    assert len(results) == 1
+    assert results[0]["status"] == "ok"
+    assert results[0]["method"] == "discovery" and results[0]["skipped"] is True
+    assert json.loads(ep.pinned_models) == ["Z-Image-Turbo"]
+
+
+def test_image_discovery_does_not_accept_missing_models_or_claim_chat_tools():
+    assert model_routes._image_model_probe_result("missing", ["Z-Image-Turbo"])["status"] == "fail"
+    assert model_routes._image_model_probe_result("Z-Image-Turbo", ["Z-Image-Turbo"], with_tools=True)["status"] == "fail"
+
+
 def test_reprobe_chatgpt_subscription_does_not_hide_models(monkeypatch):
     # The whole point of the _probe_single_model short-circuit is that re-probing
     # a chatgpt-subscription endpoint must NOT mark every (un-probeable) model as
