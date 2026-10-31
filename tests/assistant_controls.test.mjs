@@ -2,13 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 
-globalThis.window = { addEventListener() {}, innerWidth: 1280, innerHeight: 800 };
-
 const DEFAULTS = { search_mode: 'auto', thinking: 'auto', instructions: '', context_limits: {} };
 
 // Exercise the actual settings controller with deferred network responses.
 async function controller(document = { readyState: 'loading', addEventListener() {}, getElementById: () => null }) {
   globalThis.document = document;
+  globalThis.window = Object.assign(new EventTarget(), { innerWidth: 1280, innerHeight: 800 });
   const source = (await readFile(new URL('../static/js/assistantControls.js', import.meta.url), 'utf8'))
     .replace(/import ui from '\.\/ui\.js(?:\?[^']*)?';/, 'const ui = { showError() {} };');
   return import(`data:text/javascript,${encodeURIComponent(source)}#${Math.random()}`);
@@ -60,7 +59,7 @@ function settingsDocument() {
         },
         addEventListener(name, handler) { this.listeners[name] = handler; },
         setAttribute(name, value) { this.attributes[name] = value; },
-        focus() { this.focused = true; }, reportValidity: () => true,
+        focus(options) { this.focused = true; this.focusOptions = options; }, reportValidity: () => true,
         getBoundingClientRect: () => ({ left: 100, top: 500 }), contains: () => false,
         querySelectorAll: () => id === 'web-search-menu' ? options : [],
         querySelector: () => options.find(option => option.attributes['aria-checked'] === 'true'),
@@ -112,6 +111,31 @@ test('the menu selects one mode and keeps it when conversation settings are save
   await document.getElementById('assistant-save').listeners.click();
   assert.equal((await controls.prepareTurn('s')).search_mode, 'off');
   assert.equal(document.getElementById('web-search-menu').classList.contains('hidden'), true);
+});
+
+test('the Web menu stays open and follows its button while the mobile keyboard closes', async () => {
+  const document = settingsDocument();
+  await controller(document);
+  const button = document.getElementById('web-toggle-btn');
+  const menu = document.getElementById('web-search-menu');
+  window.innerWidth = 390;
+  window.innerHeight = 500;
+  button.getBoundingClientRect = () => ({ left: 250, top: window.innerHeight - 70 });
+  button.listeners.click();
+  assert.equal(menu.classList.contains('hidden'), false);
+  assert.deepEqual(document.options[1].focusOptions, { preventScroll: true });
+  for (const height of [560, 650, 750, 844]) {
+    window.innerHeight = height;
+    window.dispatchEvent(new Event('resize'));
+    assert.equal(menu.classList.contains('hidden'), false, 'keyboard resize must not dismiss the menu');
+    assert.equal(button.attributes['aria-expanded'], 'true');
+    assert.equal(menu.style.bottom, '78px', 'menu must stay above the moving button');
+  }
+  assert.equal(menu.style.left, '94px', 'menu must fit the mobile width');
+  button.listeners.click();
+  assert.equal(menu.classList.contains('hidden'), true, 'tapping the button again still closes the menu');
+  window.dispatchEvent(new Event('resize'));
+  assert.equal(menu.classList.contains('hidden'), true, 'resizing must not reopen a closed menu');
 });
 
 test('failed mode saves prevent a turn from using stale server preferences', async () => {

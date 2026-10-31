@@ -177,13 +177,16 @@ function init() {
     webMenu?.classList.add('hidden');
     webButton?.setAttribute('aria-expanded', 'false');
   };
-  const openWebMenu = () => {
+  const positionWebMenu = () => {
     const rect = webButton.getBoundingClientRect();
     webMenu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 296))}px`;
     webMenu.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+  };
+  const openWebMenu = () => {
+    positionWebMenu();
     webMenu.classList.remove('hidden');
     webButton.setAttribute('aria-expanded', 'true');
-    webMenu.querySelector('[aria-checked="true"]')?.focus();
+    webMenu.querySelector('[aria-checked="true"]')?.focus({ preventScroll: true });
   };
   webButton?.addEventListener('click', () => webMenu.classList.contains('hidden') ? openWebMenu() : closeWebMenu());
   webButton?.addEventListener('keydown', event => {
@@ -207,7 +210,11 @@ function init() {
   document.addEventListener('click', event => {
     if (!webButton?.contains(event.target) && !webMenu?.contains(event.target)) closeWebMenu();
   });
-  window.addEventListener('resize', closeWebMenu);
+  window.addEventListener('resize', () => {
+    // Dismissing the mobile keyboard resizes the viewport after opening.
+    // Keep the menu attached to its button throughout that animation.
+    if (webMenu && !webMenu.classList.contains('hidden')) positionWebMenu();
+  });
   const settingsModal = el('assistant-settings-modal');
   const closeSettings = () => {
     settingsModal.classList.add('hidden');
