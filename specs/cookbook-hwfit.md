@@ -55,6 +55,16 @@ Runtime behavior:
 - Ollama serves register as native endpoints (`http://host:port`, no `/v1`, `endpoint_kind="ollama"`); an existing row for the same Ollama server (native or `/v1`) is reused, not duplicated or renamed. The agent tool's `_ensure_served_endpoint` does the same and reads `--port N`, `--port=N` and `OLLAMA_HOST=host:port`;
 - before `ollama serve`, the backend probes `/api/version` on the target's Ollama port (local: `127.0.0.1` and, in Docker, `host.docker.internal`; remote: `http://<host>:port`, then the remote loopback over SSH). A running daemon is reused — the task attaches to it, prints the reuse notice plus the `Ollama API ready on port N: <url>` marker, returns `reused_ollama`, and Stop unloads the model without removing the endpoint. A remote daemon that only listens on its loopback is reported as an error instead of starting a second daemon; a daemon is still started when none answers;
 - diffusion-server serves are registered as image endpoints;
+- optional AMD image inference can also run outside Cookbook in the
+  `docker/image.amd.yml` sidecar, using the same diffusion server and persistent
+  Hugging Face cache. Its internal endpoint is `http://image-generation:8110/v1`;
+  it is registered through the normal image endpoint settings and does not add
+  ROCm dependencies or devices to the main app. Setup and a real Gallery
+  verification command are in `docs/local-image-generation.md`;
+- `docker/image.flux-amd.yml` adds a separate FLUX.2 Klein 4B image endpoint
+  with its own four-step/guidance-one settings. It reuses the ROCm image and
+  persistent model cache. Generation and single-reference instruction editing
+  use the existing image routes; editing honors the configured guidance scale;
 - MLX image serves use `scripts/mlx_image_server.py`, which pins generation/edit dispatch to the model chosen at process start and ignores OpenAI-compatible per-request model selectors;
 - vLLM recipe routes fetch and cache model recipe manifests/YAML from `vllm-project/recipes`, normalize base args/env/dependencies/tool-calling/reasoning variants, and expose compatible strategy metadata for serve setup;
 - Hugging Face download/setup paths can detect and persist encrypted HF tokens for later Cookbook/agent use;

@@ -822,7 +822,7 @@ async def edit_image(
                     width=width,
                     height=height,
                     num_inference_steps=steps,
-                    guidance_scale=3.5,
+                    guidance_scale=_guidance_scale(),
                     true_cfg_scale=4.0,
                     negative_prompt=_default_negative_prompt(),
                     output_type="pil",
@@ -849,7 +849,7 @@ async def edit_image(
                     image=init_image,
                     prompt=prompt,
                     num_inference_steps=steps,
-                    guidance_scale=3.5,
+                    guidance_scale=_guidance_scale(),
                     negative_prompt=_default_negative_prompt(),
                     output_type="pil",
                 )
