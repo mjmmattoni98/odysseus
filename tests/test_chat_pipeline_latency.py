@@ -494,6 +494,11 @@ async def test_auto_title_is_a_small_utility_call_without_thinking(monkeypatch, 
 
     monkeypatch.setattr(llm_core, "llm_call_async", fake_call)
     monkeypatch.setattr(task_endpoint, "resolve_task_endpoint", lambda u, m, h, owner=None: (u, m, h))
+    import src.endpoint_resolver as resolver
+    monkeypatch.setattr(resolver, "resolve_owner_registered_endpoint",
+                        lambda db, url, owner: SimpleNamespace(base_url=url, api_key=None))
+    monkeypatch.setattr(resolver, "resolve_endpoint_runtime",
+                        lambda endpoint, owner=None: (endpoint.base_url, endpoint.api_key))
     renamed = []
     sess = SimpleNamespace(
         id="s1", owner="alice", endpoint_url=url, model="qwen3:27b", headers={},

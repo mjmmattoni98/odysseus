@@ -241,7 +241,10 @@ class ModelDiscovery:
             data = r.json()
             # Some OpenAI-compatible servers return a bare list, not {"data": [...]}.
             items = data if isinstance(data, list) else ((data or {}).get("data") or [])
-            ids = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
+            ids = [
+                m["id"] for m in items
+                if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]
+            ]
             if ids:
                 provider = self._fingerprint_provider(host, port)
                 if provider == "ollama":

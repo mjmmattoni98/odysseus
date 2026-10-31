@@ -4,6 +4,7 @@ import { addFinishBadge, syncVoteControls } from './vote.js?v=20260828resendcald
 import { consumePaneStream, createPaneStreamReader, paneResponseState, PANE_PENDING } from './streamOutcome.js';
 import { createTerminalStreamError } from '../chatStreamErrors.js';
 import { getModelCost, renderAskUserCard, safeDisplayImageSrc } from '../chatRenderer.js?v=20261015noprofiles1';
+import { consumeCompareEvents } from './sse.js';
 import markdownModule from '../markdown.js';
 import spinnerModule from '../spinner.js';
 import uiModule from '../ui.js?v=20260916largetoolscroll1';
@@ -536,28 +537,10 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
       });
     }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    streamRead:
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      _resetIdleTimeout();  // any chunk = stream is alive
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const json = streamReader.read(line);
-        if (streamReader.ended) {
-          // Provider error (`event: error`): stop reading and fail the pane.
-          reader.cancel().catch(() => {});
-          break streamRead;
-        }
-        if (!json) continue;
+    await consumeCompareEvents(response,
+      (json) => {
+        streamReader.read(`data: ${JSON.stringify(json)}`);
+        if (streamReader.error) throw streamReader.error;
         try {
           if (json.type === 'metrics') {
             metrics = json.data;
@@ -740,7 +723,7 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
             if (hist) hist.scrollTop = hist.scrollHeight;
           } else if (json.delta) {
             // Skip text deltas if we already rendered an image
-            if (aiMsgEl._imageData) continue;
+            if (aiMsgEl._imageData) return;
             // Capture TTFT on very first text delta
             if (!accumulated && !_ttft) _ttft = performance.now() - _timerStart;
             // On first delta, destroy spinner and prepare text area
@@ -769,8 +752,7 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
             _scheduleLiveRender(target);
           }
         } catch (e) { console.warn('Compare stream render error:', e); }
-      }
-    }
+      }, _resetIdleTimeout);
 
     // A named provider error, or a clean close that produced nothing, is a
     // failed response, not a finished one.
@@ -973,6 +955,7 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
       }
     } else {
       console.error('Compare stream error:', error);
+      awaitingChoice = false;
       for (const key of ['_spinner', '_imgSpinner']) {
         if (aiMsgEl[key]) {
           if (aiMsgEl[key].element) aiMsgEl[key].destroy();
@@ -984,9 +967,13 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
         currentToolBlock._waveInterval = null;
       }
       // Keep any partial answer visible above the error.
-      _renderPaneFailure(aiBody, error.message, streamReader.sawOutput);
+      _renderPaneFailure(aiBody, state._blindMode ? 'Model request failed. Try again.' : error.message, streamReader.sawOutput);
     }
   } finally {
+    if (aiMsgEl._spinner) {
+      aiMsgEl._spinner.destroy();
+      aiMsgEl._spinner = null;
+    }
     clearTimeout(timeoutId);
     _timerDone = true;
     cancelAnimationFrame(_rafId);
