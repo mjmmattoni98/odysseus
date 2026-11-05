@@ -1917,10 +1917,17 @@ async def execute_tool_block(
             )
 
     if isinstance(security_context, ToolRunSecurityContext) and not approval_claimed:
-        decision = security_context.decision_for(
-            getattr(block, "tool_type", None),
-            getattr(block, "content", None),
-        )
+        if isinstance(authority, RequestAuthority):
+            with bind_request_authority(authority):
+                decision = security_context.decision_for(
+                    getattr(block, "tool_type", None),
+                    getattr(block, "content", None),
+                )
+        else:
+            decision = security_context.decision_for(
+                getattr(block, "tool_type", None),
+                getattr(block, "content", None),
+            )
         if not decision.allowed:
             logger.warning(
                 "External-context policy blocked tool=%r",
@@ -2559,6 +2566,17 @@ def format_tool_result(description: str, result: Dict, max_chars: Optional[int] 
     ``max_chars`` scales the result to a small model's context window (see
     src.context_budget.tool_output_char_cap); None keeps the tools' own caps.
     """
+    if (
+        description.startswith("manage_documents:")
+        and isinstance(result.get("document"), dict)
+        and "response" in result
+    ):
+        # Document reads already budget their complete page, anchor and
+        # next_offset notice. A heading or a second JSON copy of the content
+        # would exhaust that budget and obscure the continuation again.
+        limit = min(max_chars, MAX_OUTPUT_CHARS) if max_chars else MAX_OUTPUT_CHARS
+        return _truncate(result["response"], limit)
+
     parts = [f"### {description}"]
 
     if "stdout" in result:

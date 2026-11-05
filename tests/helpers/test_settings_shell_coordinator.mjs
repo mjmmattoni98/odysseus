@@ -21,10 +21,12 @@ const REAL_MODULES = new Set([
   path.join(JS, 'settings/navigation.js'),
   path.join(JS, 'settings/lifecycle.js'),
   path.join(JS, 'settings/localModels.js'),
+  path.join(JS, 'modalVisibility.js'),
   path.join(JS, 'settings/api.js'),
   path.join(JS, 'settings/speech.js'),
   path.join(JS, 'settings/writingStyle.js'),
   path.join(JS, 'settings/imageModels.js'),
+  path.join(JS, 'settings/imagePreferences.js'),
   path.join(JS, 'settings/agent.js'),
   path.join(JS, 'settings/shell.js'),
   path.join(JS, 'settings/peek.js'),
@@ -870,6 +872,7 @@ const STUBS = new Map([
       clearDockSide() {},
     },
   ],
+  [path.join(JS, 'modalManager.js'), { toggle() { return false; } }],
 ]);
 
 

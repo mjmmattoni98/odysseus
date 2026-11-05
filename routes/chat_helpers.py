@@ -1388,6 +1388,7 @@ async def build_chat_context(
         message=_ctx_msg,
         session=sess,
         use_web=use_web_val and not skip_web,
+        use_rag=use_rag_val,
         use_memory=mem_enabled,
         time_filter=time_filter,
         preset_system_prompt=preset.system_prompt,
@@ -1398,8 +1399,6 @@ async def build_chat_context(
         incognito=incognito,
         use_skills=skills_enabled,
     )
-    if use_rag is not None or is_research_spinoff or casual_low_signal:
-        _preface_kwargs["use_rag"] = use_rag_val
     if progress is not None:
         _preface_kwargs["progress"] = progress
     record_memory_uses = getattr(chat_processor, "record_memory_uses", None)
